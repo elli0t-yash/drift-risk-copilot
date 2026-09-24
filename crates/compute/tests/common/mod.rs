@@ -103,6 +103,52 @@ pub fn synthetic_single_stock(
     }
 }
 
+/// Builds a `MarketData` directly from caller-specified per-stock log
+/// return series (all series must have equal length `n_obs`). Factor
+/// returns are filled with zeros (of the same length) since this is meant
+/// for tests that only exercise stock-return-driven logic (e.g.
+/// CvarRebalance, which uses raw historical stock returns, not the factor
+/// model).
+pub fn market_data_from_log_returns(stocks: &[(&str, Vec<f64>)]) -> MarketData {
+    let n_obs = stocks[0].1.len();
+    assert!(
+        stocks.iter().all(|(_, r)| r.len() == n_obs),
+        "all stock return series must have equal length"
+    );
+    let dates = business_days(n_obs + 1);
+
+    let mut stock_returns = BTreeMap::new();
+    let mut per_series = Vec::new();
+    for (ticker, returns) in stocks {
+        stock_returns.insert(ticker.to_string(), returns.clone());
+        per_series.push(SeriesQuality {
+            ticker: ticker.to_string(),
+            raw_observations: n_obs + 1,
+            forward_filled_days: 0,
+            dropped_days: 0,
+        });
+    }
+
+    let mut factor_returns = BTreeMap::new();
+    for name in FACTOR_NAMES {
+        factor_returns.insert(name.to_string(), vec![0.0; n_obs]);
+    }
+
+    let quality = DataQuality {
+        date_range_start: dates[0],
+        date_range_end: *dates.last().unwrap(),
+        trading_days: dates.len(),
+        per_series,
+    };
+
+    MarketData {
+        dates,
+        stock_returns,
+        factor_returns,
+        quality,
+    }
+}
+
 /// Extends `synthetic_single_stock`'s factor data with additional stocks,
 /// each following `intercept + betas . factors + noise` with its own beta
 /// vector (used for multi-stock portfolio tests).

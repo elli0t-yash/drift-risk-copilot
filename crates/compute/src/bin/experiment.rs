@@ -1,15 +1,15 @@
 use std::path::PathBuf;
 
 use clap::Parser;
+use compute::cvar::run_cvar_rebalance;
 use compute::data::load_market_data;
-use compute::experiments::{
-    run_factor_shock, run_risk_decomposition, Experiment,
-};
+use compute::experiments::{run_factor_shock, run_risk_decomposition, Experiment};
 use compute::model::fit_factor_model;
 use compute::trace::DataWindow;
 
-/// Runs a single experiment (FactorShock or RiskDecomposition) described by
-/// a JSON file and prints its Evidence Trace to stdout.
+/// Runs a single experiment (FactorShock, RiskDecomposition, or
+/// CvarRebalance) described by a JSON file and prints its Evidence Trace to
+/// stdout.
 #[derive(Parser, Debug)]
 struct Args {
     /// Path to a JSON file containing a tagged `Experiment` value.
@@ -30,13 +30,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raw = std::fs::read_to_string(&args.input)?;
     let experiment: Experiment = serde_json::from_str(&raw)?;
 
+    if let Experiment::CvarRebalance(input) = &experiment {
+        let tickers = input.portfolio.tickers();
+        let data = load_market_data(&args.cache_dir, &tickers, args.refresh, input.frequency)?;
+        let (_, trace) = run_cvar_rebalance(&data.quality, &data, input)?;
+        println!("{}", serde_json::to_string_pretty(&trace)?);
+        return Ok(());
+    }
+
     let (portfolio, window, frequency) = match &experiment {
         Experiment::FactorShock(i) => (&i.portfolio, i.resolved_window(), i.frequency),
         Experiment::RiskDecomposition(i) => (&i.portfolio, i.resolved_window(), i.frequency),
-        Experiment::CvarRebalance(_) => {
-            eprintln!("CvarRebalance is a design note only in this checkpoint; not implemented.");
-            std::process::exit(1);
-        }
+        Experiment::CvarRebalance(_) => unreachable!("handled above"),
     };
 
     let tickers = portfolio.tickers();
@@ -59,7 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (_, trace) = run_risk_decomposition(&data.quality, data_window, &model, input)?;
             trace
         }
-        Experiment::CvarRebalance(_) => unreachable!(),
+        Experiment::CvarRebalance(_) => unreachable!("handled above"),
     };
 
     println!("{}", serde_json::to_string_pretty(&trace)?);

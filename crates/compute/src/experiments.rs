@@ -615,23 +615,7 @@ pub fn run_risk_decomposition(
 }
 
 // ---------------------------------------------------------------------
-// (c) CvarRebalance — design note only, not implemented this checkpoint.
+// (c) CvarRebalance — see crate::cvar.
 // ---------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct CvarRebalanceInput {
-    pub portfolio: Portfolio,
-    pub confidence_level: f64,
-    pub per_name_cap: f64,
-    pub turnover_limit: f64,
-    pub commission_bps: f64,
-}
-
-/// Not implemented. See the design note in the checkpoint report / crate
-/// README for the proposed Rockafellar-Uryasev LP formulation, scenario
-/// source, solver choice, and infeasibility reporting.
-pub fn run_cvar_rebalance(_input: &CvarRebalanceInput) -> Result<()> {
-    Err(ComputeError::Model(
-        "CvarRebalance is a design note only in this checkpoint; not implemented".to_string(),
-    ))
-}
+pub use crate::cvar::CvarRebalanceInput;

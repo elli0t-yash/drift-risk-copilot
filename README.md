@@ -13,10 +13,11 @@ crates/
   compute/   # data layer, factor model, experiments, evidence trace (this checkpoint)
     src/data.rs         Yahoo fetch + cache + NSE calendar alignment + log returns
     src/model.rs         OLS factor fits, Ledoit-Wolf shrinkage, stock covariance
-    src/experiments.rs    FactorShock, RiskDecomposition (implemented); CvarRebalance (design note)
+    src/experiments.rs    FactorShock, RiskDecomposition
+    src/cvar.rs            CvarRebalance: Rockafellar-Uryasev LP via good_lp + clarabel
     src/trace.rs          EvidenceTrace and its sub-structs
     src/bin/experiment.rs CLI: runs one experiment from a JSON file
-    examples/              FactorShock / RiskDecomposition inputs for a 10-stock Nifty portfolio
+    examples/              FactorShock / RiskDecomposition / CvarRebalance inputs, 10-stock Nifty portfolio
     tests/                  Synthetic-data unit/integration tests (no network required)
   agent/     # stub — LLM-facing layer, not yet built
   server/    # stub — HTTP API, not yet built
@@ -28,6 +29,7 @@ data/cache/  # cached raw price CSVs (gitignored; fetched on first run)
 ```
 cargo run -p compute --bin experiment -- crates/compute/examples/factor_shock_nifty10.json
 cargo run -p compute --bin experiment -- crates/compute/examples/risk_decomposition_nifty10.json
+cargo run -p compute --bin experiment -- crates/compute/examples/cvar_rebalance_nifty10.json
 ```
 
 Add `--refresh` to refetch price series instead of reading `data/cache/`.
@@ -185,6 +187,7 @@ no network access required.
 | `reqwest` (blocking) | HTTP client for Yahoo Finance's chart endpoint. |
 | `csv` | Reading/writing the on-disk price cache. |
 | `clap` (derive) | CLI argument parsing (`--refresh`, `--cache-dir`) for the `experiment` binary — not in the original justified list, added because the spec requires a `--refresh` flag and hand-rolled arg parsing would be worse than a one-line derive. |
+| `good_lp` (`clarabel` backend only, `default-features = false`) | The Rockafellar-Uryasev LP for `CvarRebalance`. `clarabel` is a pure-Rust interior-point solver (no C/C++ toolchain or system solver binary needed), matching the design note's preference for build simplicity over a HiGHS/CBC binding. |
 
 ## Judgment calls
 
@@ -220,54 +223,97 @@ no network access required.
   portfolio_pnl_inr`), which hold exactly because the shock model is linear
   with no intercept term (noted explicitly in every trace's `outputs.note`).
 
-## CvarRebalance — design note (not implemented this checkpoint)
+## CvarRebalance
 
-**Formulation.** Rockafellar-Uryasev (2000) CVaR minimization as a linear
-program over `S` historical (or simulated) return scenarios `r_s`, decision
-weights `w`, and an auxiliary VaR variable `zeta`:
+Implemented in `src/cvar.rs` via `good_lp` + the `clarabel` backend (pure
+Rust, no external solver binary), per the design note above with these
+amendments:
+
+**Formulation.** Rockafellar-Uryasev CVaR minimization, but with the
+`1/(S(1-beta))` coefficient replaced by `1/k` where `k =
+round(S*(1-beta))` is an **integer tail scenario count** rather than the
+continuous `S(1-beta)`. For equally-weighted historical scenarios this
+makes the LP exactly equivalent to "minimize the average of the k worst
+historical losses" — at optimum, `zeta*` is exactly the k-th worst loss
+(VaR) and the objective is exactly the mean of the k worst losses (CVaR),
+which is what lets the "LP objective == directly-computed CVaR" invariant
+below hold to solver tolerance (~1e-10) rather than only approximately.
 
 ```
-minimize   zeta + (1 / (S * (1 - alpha))) * sum_s u_s
-subject to u_s >= -(r_s . w) - zeta,   u_s >= 0,   for all s
+minimize   zeta + (1/k) * sum_s u_s
+subject to u_s >= -(r_s . w) - zeta,   u_s >= 0,        for all s
            sum_i w_i = 1
-           0 <= w_i <= cap_i                          (long-only + per-name cap)
-           sum_i |w_i - w0_i| <= tau                   (turnover limit, linearized)
+           0 <= w_i <= per_name_cap                      (long-only + per-name cap)
+           w_i = w0_i + buy_i - sell_i,  buy_i, sell_i >= 0
+           sum_i (buy_i + sell_i) <= turnover_limit       (turnover, linearized)
 ```
 
-The turnover constraint is linearized in the standard way: introduce
-`w_i = w0_i + p_i - n_i` with `p_i, n_i >= 0`, and replace `|w_i - w0_i|`
-with `p_i + n_i` in the turnover sum. Commission cost, `turnover * value *
-commission_bps`, is either (a) subtracted from a separate expected-return
-constraint if one is added later, or (b) reported alongside the CVaR
-objective as a secondary output — it does not need to enter the LP objective
-for a pure risk-minimization rebalance, only for a risk/cost-tradeoff
-variant.
+**Scenarios.** Simple returns (`exp(log) - 1`) of the holdings' own
+historical log returns (`data::MarketData.stock_returns`) — raw historical,
+not factor-model-simulated, per the design note's recommendation. Full
+available history by default; `window` (periods) is configurable.
 
-**Scenario source.** Propose **raw historical asset returns** (the same
-trailing window as the factor model, e.g. 252 days) rather than
-factor-model-simulated scenarios, for this checkpoint's follow-on:
-historical scenarios need no distributional assumption on residuals and
-directly reflect realized joint tail behavior (including the factor-model's
-own unexplained co-movements, which a Gaussian factor-model resample would
-understate). A factor-model-simulated variant (sampling factor shocks from
-`F`, mapping through `B`, adding simulated idiosyncratic noise from `D`) is
-a reasonable v2 for scenario augmentation when the historical window is
-short, but should be a separate, explicitly-labeled scenario source in the
-trace (`data_quality`/`model_params` would need a `scenario_source` field),
-not silently blended with historical scenarios.
+**Historical VaR/CVaR, computed independently of the LP.** For a weight
+vector `w` (before or after), `historical_stats` sorts the `k` worst
+scenario losses `Loss_s = -(r_s . w)` directly from the scenario matrix and
+reports `historical_var` (the k-th worst loss) and `historical_cvar` (their
+mean) — a fresh computation from data + weights, not a copy of the solver's
+reported objective, so `lp_objective_cvar` and `stats_after.historical_cvar`
+are independent cross-checks of each other (see invariants below).
 
-**Solver.** `good_lp` with the `clarabel` backend (pure Rust, no system
-dependency on an external solver binary, keeps the whole compute layer
-statically linkable) is preferred over `good_lp` + `highs` (C++ binding) or
-a hand-rolled simplex, for build simplicity and to avoid adding a
-non-Rust toolchain dependency to CI.
+**Pre-solve feasibility check** (before ever calling the solver):
+1. `per_name_cap * n_stocks >= 1` — otherwise long-only weights can never
+   sum to 1.
+2. A necessary lower bound on turnover: names already over `per_name_cap`
+   must sell down to it, and — since weights must still sum to 1 — that
+   sold capital must be bought back elsewhere, so turnover is at least
+   `2 * sum_i max(0, w0_i - per_name_cap)`. If that exceeds `turnover_limit`,
+   report infeasible without solving. (This is a *necessary*, not
+   *sufficient*, condition; the LP solve remains the authoritative
+   feasibility check for anything this doesn't catch.)
 
-**Infeasibility reporting.** If the LP is infeasible (e.g. `per_name_cap`
-too tight to reach `sum(w) = 1` under the turnover budget from `w0`), the
-trace should report `outputs.status: "infeasible"` plus a `diagnostics`
-field naming which constraint group was detected as binding/unsatisfiable
-(cap sum vs. required weight, or turnover budget vs. distance from `w0` to
-the feasible cap region) — computed by a small pre-solve feasibility check
-(e.g., is `sum(min(cap_i, w0_i + tau_i_share))` >= 1) rather than by parsing
-solver-specific infeasibility certificates, so the message stays
-solver-agnostic if the backend changes later.
+Either pre-solve failure, or the solver itself returning
+`ResolutionError::Infeasible` / any other non-optimal status, produces a
+structured result rather than a thrown error: `CvarRebalanceOutput.status`
+(`"optimal"` | `"infeasible"` | `"solver_error"`) plus `diagnostics: Option<String>`,
+both inside a normal `Ok(...)` `EvidenceTrace` — so a caller always gets a
+citable trace, even for a failed rebalance, with the failing check recorded
+as a `passed: false` invariant.
+
+**Invariants:** weights sum to 1 (1e-9), turnover <= `turnover_limit` +
+1e-6, and LP objective == directly-computed historical CVaR of the solution
+(1e-6) — all three checked in `run_cvar_rebalance` and included in every
+`EvidenceTrace.invariants`.
+
+### Sample trace (10-stock example, cap 20%, turnover 30%, beta 0.95)
+
+```
+scenario_count: 1232, tail_scenario_count: 62
+stats_before: { historical_var: 0.0136, historical_cvar: 0.0204 }
+stats_after:  { historical_var: 0.0128, historical_cvar: 0.0187 }
+lp_objective_cvar: 0.018721952952451708   (matches historical_cvar to 1.4e-14)
+turnover: 0.300 (binding at the limit)
+commission_cost_inr: 3000.0  (0.30 * 1e7 * 10bps)
+weights_after: TMPV.NS -> ~0 (cut essentially to zero), ITC.NS -> 0.181,
+               BHARTIARTL.NS -> 0.139 (both bid up), others near-unchanged
+invariants: all 3 passed
+```
+
+Full trace: `cargo run -p compute --bin experiment -- crates/compute/examples/cvar_rebalance_nifty10.json`.
+
+### Judgment calls specific to CvarRebalance
+
+- **`commission_bps` default:** 10 bps (0.10%), a reasonable blended
+  estimate for Indian equity delivery trades (brokerage + STT + other
+  statutory charges); always caller-overridable, no default was specified
+  in the brief.
+- **`per_name_cap` applies uniformly to every name**, including in the
+  `n * cap >= 1` feasibility check — with few holdings and a tight cap,
+  this can force residual weight onto a name the optimizer would otherwise
+  zero out (confirmed in `heavy_tail_asset_is_cut_to_near_zero_when_turnover_allows`,
+  where the cap had to be raised to 1.0 to let the test isolate the
+  CVaR-driven effect from the cap-driven one).
+- **`model_params.factor_names`/`shrinkage_intensity` don't apply** to this
+  experiment (no factor model is fit); left as an empty vec / 0.0 rather
+  than adding an experiment-specific trace variant, with an explicit note
+  in `outputs.note` saying so.

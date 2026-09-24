@@ -22,5 +22,6 @@ thiserror.workspace = true
 reqwest.workspace = true
 csv.workspace = true
 clap.workspace = true
+good_lp = { version = "1.15.3", default-features = false, features = ["clarabel"] }
 
 [dev-dependencies]
