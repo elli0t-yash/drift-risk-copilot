@@ -9,7 +9,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/models";
-const MODEL: &str = "gemini-2.0-flash";
+// The checkpoint spec that introduced this client named gemini-2.0-flash.
+// Confirmed live (2026-09-24) that model has been retired: the API now
+// returns 404 NOT_FOUND for it, with the response body itself pointing to
+// gemini-3.8-flash as the replacement ("This model models/gemini-2.0-flash
+// is no longer available... use models/gemini-3.8-flash").
+const MODEL: &str = "gemini-3.8-flash";
 const MAX_ATTEMPTS: u32 = 3;
 
 #[derive(Debug, Error)]
