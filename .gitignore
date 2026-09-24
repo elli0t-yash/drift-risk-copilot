@@ -1,0 +1,4 @@
+/target
+data/cache/*
+!data/cache/.gitkeep
+crates/compute/data/
