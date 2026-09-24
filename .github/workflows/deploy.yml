@@ -42,8 +42,18 @@ jobs:
         run: |
           set -euo pipefail
           IMAGE="gcr.io/${{ vars.GCP_PROJECT_ID }}/drift-risk-copilot"
+          # Explicit staging bucket with clean uniform-bucket-level IAM,
+          # rather than gcloud's default <project>_cloudbuild bucket: that
+          # default bucket predates uniform bucket-level access and only
+          # grants legacy ACLs to the project owners/editors/viewers
+          # groups, which github-deployer isn't a member of (granting it
+          # storage.admin directly on that legacy bucket did not resolve
+          # a "forbidden from accessing the bucket" error -- worth
+          # revisiting if GCP support clarifies why, but this sidesteps it
+          # cleanly).
           gcloud builds submit \
             --project="${{ vars.GCP_PROJECT_ID }}" \
+            --gcs-source-staging-dir="gs://${{ vars.GCP_PROJECT_ID }}-ci-source/cloudbuild-source" \
             --tag "${IMAGE}:${{ github.sha }}" \
             .
           gcloud container images add-tag \
