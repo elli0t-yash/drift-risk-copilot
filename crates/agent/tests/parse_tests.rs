@@ -1,6 +1,7 @@
 mod support;
 
 use agent::parse::{parse_experiment, ParseError};
+use agent::schema::{CVAR_REBALANCE_FUNCTION, FACTOR_SHOCK_FUNCTION, RISK_DECOMPOSITION_FUNCTION};
 use compute::experiments::{Experiment, Holding, Portfolio};
 use support::{function_call_response, text_response, MockGeminiClient};
 
@@ -23,11 +24,10 @@ fn two_stock_portfolio() -> Portfolio {
 #[tokio::test]
 async fn parses_factor_shock_function_call() {
     let args = serde_json::json!({
-        "type": "FactorShock",
         "shocks_pct": { "MARKET": -12.0, "BRENT": 20.0 },
         "propagate": true,
     });
-    let client = MockGeminiClient::new(vec![function_call_response(args)]);
+    let client = MockGeminiClient::new(vec![function_call_response(FACTOR_SHOCK_FUNCTION, args)]);
 
     let portfolio = two_stock_portfolio();
     let experiment = parse_experiment(&client, "what if the market drops 12%", portfolio.clone())
@@ -47,8 +47,9 @@ async fn parses_factor_shock_function_call() {
 
 #[tokio::test]
 async fn parses_risk_decomposition_function_call() {
-    let args = serde_json::json!({ "type": "RiskDecomposition" });
-    let client = MockGeminiClient::new(vec![function_call_response(args)]);
+    let args = serde_json::json!({});
+    let client =
+        MockGeminiClient::new(vec![function_call_response(RISK_DECOMPOSITION_FUNCTION, args)]);
 
     let portfolio = two_stock_portfolio();
     let experiment = parse_experiment(&client, "what's my portfolio risk?", portfolio.clone())
@@ -66,12 +67,11 @@ async fn parses_risk_decomposition_function_call() {
 #[tokio::test]
 async fn parses_cvar_rebalance_function_call() {
     let args = serde_json::json!({
-        "type": "CvarRebalance",
         "per_name_cap": 0.2,
         "turnover_limit": 0.3,
         "confidence_level": 0.95,
     });
-    let client = MockGeminiClient::new(vec![function_call_response(args)]);
+    let client = MockGeminiClient::new(vec![function_call_response(CVAR_REBALANCE_FUNCTION, args)]);
 
     let portfolio = two_stock_portfolio();
     let experiment = parse_experiment(&client, "rebalance to cut tail risk", portfolio.clone())
@@ -94,10 +94,10 @@ async fn parses_cvar_rebalance_function_call() {
 #[tokio::test]
 async fn caller_portfolio_overrides_any_portfolio_in_the_function_call_args() {
     let args = serde_json::json!({
-        "type": "RiskDecomposition",
         "portfolio": { "holdings": [{"ticker": "MADE_UP.NS", "weight": 1.0}], "total_value_inr": 1.0 },
     });
-    let client = MockGeminiClient::new(vec![function_call_response(args)]);
+    let client =
+        MockGeminiClient::new(vec![function_call_response(RISK_DECOMPOSITION_FUNCTION, args)]);
 
     let portfolio = two_stock_portfolio();
     let experiment = parse_experiment(&client, "risk please", portfolio.clone())

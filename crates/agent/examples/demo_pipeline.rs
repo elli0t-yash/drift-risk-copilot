@@ -29,7 +29,7 @@ impl GeminiClient for ScriptedClient {
     }
 }
 
-fn function_call(args: serde_json::Value) -> GeminiResponse {
+fn function_call(name: &str, args: serde_json::Value) -> GeminiResponse {
     GeminiResponse {
         candidates: vec![Candidate {
             content: Content {
@@ -37,7 +37,7 @@ fn function_call(args: serde_json::Value) -> GeminiResponse {
                 parts: vec![Part {
                     text: None,
                     function_call: Some(FunctionCall {
-                        name: "run_experiment".to_string(),
+                        name: name.to_string(),
                         args,
                     }),
                 }],
@@ -87,11 +87,16 @@ MARKET, BRENT and the other factors. The loss is dominated by the MARKET shock, 
 portfolio's substantial equity beta exposure.";
 
     let client = ScriptedClient {
-        responses: Mutex::new(vec![text(narration_text), function_call(serde_json::json!({
-            "type": "FactorShock",
-            "shocks_pct": { "MARKET": -12.0, "BRENT": 20.0 },
-            "propagate": true,
-        }))]),
+        responses: Mutex::new(vec![
+            text(narration_text),
+            function_call(
+                agent::schema::FACTOR_SHOCK_FUNCTION,
+                serde_json::json!({
+                    "shocks_pct": { "MARKET": -12.0, "BRENT": 20.0 },
+                    "propagate": true,
+                }),
+            ),
+        ]),
     };
 
     let result = agent::pipeline::run(&client, "what if the market drops 12% and brent jumps 20%?", portfolio)

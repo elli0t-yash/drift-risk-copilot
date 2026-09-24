@@ -13,4 +13,4 @@ pub use grounding::{grounded_narrate, GroundedNarration};
 pub use narrate::{narrate, NarrateError};
 pub use parse::{parse_experiment, ParseError};
 pub use pipeline::{run, PipelineError, PipelineResult};
-pub use schema::experiment_function_declaration;
+pub use schema::experiment_function_declarations;

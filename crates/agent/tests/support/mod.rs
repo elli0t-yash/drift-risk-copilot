@@ -41,8 +41,10 @@ impl GeminiClient for MockGeminiClient {
 }
 
 /// Builds a `GeminiResponse` with one candidate whose single part is a
-/// `run_experiment` function call with the given args.
-pub fn function_call_response(args: serde_json::Value) -> GeminiResponse {
+/// function call (`name`) with the given `args`. `name` should be one of
+/// `agent::schema::{FACTOR_SHOCK_FUNCTION, RISK_DECOMPOSITION_FUNCTION,
+/// CVAR_REBALANCE_FUNCTION}`.
+pub fn function_call_response(name: &str, args: serde_json::Value) -> GeminiResponse {
     GeminiResponse {
         candidates: vec![Candidate {
             content: Content {
@@ -50,7 +52,7 @@ pub fn function_call_response(args: serde_json::Value) -> GeminiResponse {
                 parts: vec![Part {
                     text: None,
                     function_call: Some(FunctionCall {
-                        name: "run_experiment".to_string(),
+                        name: name.to_string(),
                         args,
                     }),
                 }],

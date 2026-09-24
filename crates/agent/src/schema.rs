@@ -1,33 +1,84 @@
-//! Produces the `run_experiment` function declaration Gemini uses for
-//! structured extraction, derived from `compute::experiments::Experiment`'s
-//! `schemars` JSON Schema.
+//! Produces the function declarations Gemini uses for structured
+//! extraction, derived from `compute::experiments`' `schemars` JSON
+//! Schemas.
+//!
+//! One function per experiment type (`run_factor_shock`,
+//! `run_risk_decomposition`, `run_cvar_rebalance`), not one `run_experiment`
+//! function with a `oneOf`-tagged-union parameter schema. The latter was
+//! the original design and is what `compute::experiments::Experiment`'s own
+//! `#[serde(tag = "type")]` shape naturally maps to, but it does not work
+//! in practice: confirmed live against Gemini that the model reliably
+//! omits the `"type"` discriminator field from a `oneOf` branch's
+//! `functionCall.args`, e.g. `"missing field \`type\`"` on every real
+//! extraction attempt. Separate functions sidestep the problem entirely —
+//! the function *name* Gemini chooses to call is the discriminator, which
+//! is exactly what function-calling models are built to get right, instead
+//! of also having to correctly populate an artificial enum-valued field
+//! inside a `oneOf` schema.
 
 use std::collections::HashMap;
 
-use compute::experiments::Experiment;
+use compute::experiments::{CvarRebalanceInput, FactorShockInput, RiskDecompositionInput};
 use serde_json::Value;
 
 use crate::gemini::FunctionDeclaration;
 
-const FUNCTION_NAME: &str = "run_experiment";
-const FUNCTION_DESCRIPTION: &str = "Parse the user's request into a structured experiment. \
-    Portfolio holdings and weights are provided separately; only extract the experiment type \
-    and its parameters from the user's text.";
+pub const FACTOR_SHOCK_FUNCTION: &str = "run_factor_shock";
+pub const RISK_DECOMPOSITION_FUNCTION: &str = "run_risk_decomposition";
+pub const CVAR_REBALANCE_FUNCTION: &str = "run_cvar_rebalance";
 
 /// Fields the caller supplies out-of-band (portfolio holdings/weights) and
 /// that are therefore stripped from the schema shown to Gemini, so a small
 /// model isn't nudged into inventing a `portfolio` object from prose that
 /// never mentions tickers or weights. `parse::parse_experiment` always
 /// overwrites this field with the caller's real portfolio before
-/// deserializing the function-call args into an `Experiment`, regardless of
-/// whether Gemini included it.
+/// deserializing the function-call args, regardless of whether Gemini
+/// included it.
 const CALLER_SUPPLIED_FIELDS: &[&str] = &["portfolio"];
 
-/// The JSON Schema for `Experiment`, with caller-supplied fields removed
-/// from every variant's `properties`/`required`, and reshaped to fit
-/// Gemini's function-calling schema subset (see `sanitize_for_gemini`).
-pub fn experiment_json_schema() -> serde_json::Value {
-    let schema = schemars::schema_for!(Experiment);
+/// The three function declarations passed to Gemini for NL -> Experiment
+/// parsing (see the module doc for why three, not one `oneOf`-typed one).
+pub fn experiment_function_declarations() -> Vec<FunctionDeclaration> {
+    vec![
+        FunctionDeclaration {
+            name: FACTOR_SHOCK_FUNCTION.to_string(),
+            description: "Parse the user's request into FactorShock parameters: shocks \
+                (as simple percent returns, e.g. -12.0 for -12%) applied to one or more of \
+                MARKET, USDINR, BRENT, GOLD_USD, RATES_PROXY, and whether to propagate the \
+                shock to unspecified factors. Portfolio holdings and weights are provided \
+                separately; only extract the shock parameters from the user's text. Use this \
+                when the user asks what happens to their portfolio under a hypothetical market \
+                move (a crash, a rate move, a commodity move, etc.)."
+                .to_string(),
+            parameters: sanitized_schema::<FactorShockInput>(),
+        },
+        FunctionDeclaration {
+            name: RISK_DECOMPOSITION_FUNCTION.to_string(),
+            description: "Parse the user's request into RiskDecomposition parameters. \
+                Portfolio holdings and weights are provided separately; only extract the \
+                (optional) frequency/window parameters from the user's text, if any are \
+                mentioned. Use this when the user asks about their current risk level, \
+                volatility, or where their risk is concentrated (by stock or by factor) \
+                without describing a hypothetical shock or a rebalance."
+                .to_string(),
+            parameters: sanitized_schema::<RiskDecompositionInput>(),
+        },
+        FunctionDeclaration {
+            name: CVAR_REBALANCE_FUNCTION.to_string(),
+            description: "Parse the user's request into CvarRebalance parameters: \
+                confidence_level (default 0.95), per_name_cap, turnover_limit, and \
+                commission_bps. Portfolio holdings and weights are provided separately; only \
+                extract these parameters from the user's text. Use this when the user asks to \
+                reduce tail risk, rebalance, or cut CVaR, especially if they mention a turnover \
+                or risk budget."
+                .to_string(),
+            parameters: sanitized_schema::<CvarRebalanceInput>(),
+        },
+    ]
+}
+
+fn sanitized_schema<T: schemars::JsonSchema>() -> serde_json::Value {
+    let schema = schemars::schema_for!(T);
     let mut value = serde_json::to_value(schema).expect("schemars output is always valid JSON");
     strip_fields(&mut value, CALLER_SUPPLIED_FIELDS);
     sanitize_for_gemini(value)
@@ -156,16 +207,6 @@ fn strip_fields(value: &mut serde_json::Value, fields: &[&str]) {
     }
 }
 
-/// The single function declaration passed to Gemini for NL -> Experiment
-/// parsing.
-pub fn experiment_function_declaration() -> FunctionDeclaration {
-    FunctionDeclaration {
-        name: FUNCTION_NAME.to_string(),
-        description: FUNCTION_DESCRIPTION.to_string(),
-        parameters: experiment_json_schema(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,11 +215,38 @@ mod tests {
     /// rejected the unsanitized schemars output with a 400 (`$schema`,
     /// `definitions`, `$ref`, `additionalProperties` unrecognized; `type`
     /// as a list not accepted). Asserts none of those survive anywhere in
-    /// the schema actually sent to Gemini.
+    /// any of the three function declarations' schemas.
     #[test]
-    fn sanitized_schema_has_no_gemini_incompatible_keywords() {
-        let schema = experiment_json_schema();
-        assert_no_incompatible_keywords(&schema);
+    fn sanitized_schemas_have_no_gemini_incompatible_keywords() {
+        for decl in experiment_function_declarations() {
+            assert_no_incompatible_keywords(&decl.parameters);
+        }
+    }
+
+    /// Regression test for a second live-caught bug: a single
+    /// `run_experiment` function with a `oneOf`-tagged-union parameter
+    /// schema made Gemini omit the `"type"` discriminator field. None of
+    /// the three per-experiment schemas should have a `"type"` *property*
+    /// named literally `"type"` (the tag was only ever injected by the
+    /// outer `Experiment` enum, not present on the inner Input structs
+    /// these schemas are generated from), nor a `oneOf` at the top level.
+    #[test]
+    fn function_schemas_have_no_type_discriminator_or_oneof() {
+        for decl in experiment_function_declarations() {
+            let params = decl.parameters.as_object().expect("object schema");
+            assert!(
+                !params.contains_key("oneOf"),
+                "{}: schema has a oneOf at the top level",
+                decl.name
+            );
+            if let Some(Value::Object(properties)) = params.get("properties") {
+                assert!(
+                    !properties.contains_key("type"),
+                    "{}: schema has a \"type\" property (the tagged-union discriminator)",
+                    decl.name
+                );
+            }
+        }
     }
 
     fn assert_no_incompatible_keywords(value: &Value) {
