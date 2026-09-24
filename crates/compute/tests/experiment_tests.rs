@@ -196,7 +196,7 @@ fn conditional_propagation_is_noop_when_all_factors_given() {
     shocks.insert("MARKET".to_string(), -12.0);
     shocks.insert("USDINR".to_string(), 2.0);
     shocks.insert("BRENT".to_string(), 20.0);
-    shocks.insert("GOLD".to_string(), 5.0);
+    shocks.insert("GOLD_USD".to_string(), 5.0);
     shocks.insert("RATES_PROXY".to_string(), 1.0);
 
     let input = FactorShockInput {

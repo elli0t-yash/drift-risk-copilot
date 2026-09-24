@@ -60,7 +60,7 @@ pub struct FactorShockInput {
     pub portfolio: Portfolio,
     /// Shocks as simple (user-facing) percent returns (e.g. -12.0 for
     /// -12%), keyed by factor name (one of `FACTOR_NAMES`: MARKET, USDINR,
-    /// BRENT, GOLD, RATES_PROXY).
+    /// BRENT, GOLD_USD, RATES_PROXY).
     pub shocks_pct: BTreeMap<String, f64>,
     /// When true (default), unshocked factors receive their conditional
     /// expectation given the shocked factors, via the factor covariance.
@@ -169,6 +169,51 @@ pub struct FactorShockOutput {
     /// space; see `portfolio_log_pnl_inr` doc for why it does not equal
     /// `portfolio_pnl_inr` outside `linear_approximation` mode.
     pub factor_attribution_log_inr: BTreeMap<String, f64>,
+    /// Factor correlation matrix at fit time (`FACTOR_NAMES` order, matches
+    /// `factor_correlation.factor_names`).
+    pub factor_correlation: CorrelationMatrix,
+    /// Conditional coefficients `F_uk * F_kk^-1`, keyed
+    /// `implied_factor -> { given_factor: coefficient }`: each implied
+    /// move's log shock is exactly `Sum_k coefficient_k * given_log_shock_k`
+    /// over the given factors, so this is how much of each implied move is
+    /// attributable to each given shock. Empty when `propagate` is false or
+    /// no factors are both given and left unspecified.
+    pub conditional_coefficients: BTreeMap<String, BTreeMap<String, f64>>,
+    /// Gold priced in INR is `GOLD_USD * USDINR`, so its log return is
+    /// `GOLD_USD`'s log shock plus `USDINR`'s log shock (given or implied,
+    /// whichever applies to each). Reported because `GOLD_USD` alone (the
+    /// fitted factor) does not include the rupee move a domestic gold
+    /// holder actually realizes.
+    pub gold_inr_implied_move: ShockValue,
+}
+
+/// A labelled square matrix, `FACTOR_NAMES` order, for JSON output.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CorrelationMatrix {
+    pub factor_names: Vec<String>,
+    /// `rows[i][j]` = correlation between `factor_names[i]` and `factor_names[j]`.
+    pub rows: Vec<Vec<f64>>,
+}
+
+/// Computes the conditional coefficients `F_uk * F_kk^-1` (unknown_idx x
+/// known_idx). The conditional expectation is `s_u = coefficients * s_k`.
+fn conditional_coefficients(
+    f: &DMatrix<f64>,
+    known_idx: &[usize],
+    unknown_idx: &[usize],
+) -> Result<DMatrix<f64>> {
+    let f_kk = DMatrix::from_fn(known_idx.len(), known_idx.len(), |i, j| {
+        f[(known_idx[i], known_idx[j])]
+    });
+    let f_uk = DMatrix::from_fn(unknown_idx.len(), known_idx.len(), |i, j| {
+        f[(unknown_idx[i], known_idx[j])]
+    });
+    let f_kk_inv = f_kk.clone().try_inverse().ok_or_else(|| {
+        ComputeError::Model(
+            "factor covariance sub-block F_kk is singular; cannot condition".to_string(),
+        )
+    })?;
+    Ok(f_uk * f_kk_inv)
 }
 
 /// Computes conditional expectations for the "unknown" factor block given
@@ -178,25 +223,17 @@ fn conditional_expectation(
     known_idx: &[usize],
     known_vals: &[f64],
     unknown_idx: &[usize],
-) -> Result<Vec<f64>> {
+) -> Result<(Vec<f64>, DMatrix<f64>)> {
     if known_idx.is_empty() || unknown_idx.is_empty() {
-        return Ok(vec![0.0; unknown_idx.len()]);
+        return Ok((
+            vec![0.0; unknown_idx.len()],
+            DMatrix::zeros(unknown_idx.len(), known_idx.len()),
+        ));
     }
-    let f_kk = DMatrix::from_fn(known_idx.len(), known_idx.len(), |i, j| {
-        f[(known_idx[i], known_idx[j])]
-    });
-    let f_uk = DMatrix::from_fn(unknown_idx.len(), known_idx.len(), |i, j| {
-        f[(unknown_idx[i], known_idx[j])]
-    });
+    let coefficients = conditional_coefficients(f, known_idx, unknown_idx)?;
     let s_k = DVector::from_row_slice(known_vals);
-
-    let f_kk_inv = f_kk.clone().try_inverse().ok_or_else(|| {
-        ComputeError::Model(
-            "factor covariance sub-block F_kk is singular; cannot condition".to_string(),
-        )
-    })?;
-    let s_u = f_uk * f_kk_inv * s_k;
-    Ok(s_u.iter().copied().collect())
+    let s_u = &coefficients * s_k;
+    Ok((s_u.iter().copied().collect(), coefficients))
 }
 
 pub fn run_factor_shock(
@@ -254,12 +291,22 @@ pub fn run_factor_shock(
     }
 
     let mut implied_computation = BTreeMap::new();
+    let mut conditional_coefficients_out: BTreeMap<String, BTreeMap<String, f64>> =
+        BTreeMap::new();
     if input.propagate && !unknown_idx.is_empty() && !known_idx.is_empty() {
         let f = model.factor_covariance();
-        let implied = conditional_expectation(&f, &known_idx, &known_vals, &unknown_idx)?;
+        let (implied, coefficients) =
+            conditional_expectation(&f, &known_idx, &known_vals, &unknown_idx)?;
         for (idx, val) in unknown_idx.iter().zip(implied.iter()) {
             full_shock[*idx] = *val;
             implied_computation.insert(factor_names[*idx].clone(), *val);
+        }
+        for (ui, &unknown_factor_idx) in unknown_idx.iter().enumerate() {
+            let mut row = BTreeMap::new();
+            for (ki, &known_factor_idx) in known_idx.iter().enumerate() {
+                row.insert(factor_names[known_factor_idx].clone(), coefficients[(ui, ki)]);
+            }
+            conditional_coefficients_out.insert(factor_names[unknown_factor_idx].clone(), row);
         }
     }
 
@@ -278,6 +325,26 @@ pub fn run_factor_shock(
         .iter()
         .map(|(k, v)| (k.clone(), to_shock_value(*v)))
         .collect();
+
+    let log_shock_at = |idx: usize| -> f64 {
+        if input.linear_approximation {
+            simple_to_log(full_shock[idx])
+        } else {
+            full_shock[idx]
+        }
+    };
+    let gold_idx = factor_names.iter().position(|n| n == "GOLD_USD").unwrap();
+    let usdinr_idx = factor_names.iter().position(|n| n == "USDINR").unwrap();
+    let gold_inr_implied_move =
+        ShockValue::from_log(log_shock_at(gold_idx) + log_shock_at(usdinr_idx));
+
+    let corr = model.factor_correlation();
+    let factor_correlation = CorrelationMatrix {
+        factor_names: factor_names.clone(),
+        rows: (0..factor_names.len())
+            .map(|i| (0..factor_names.len()).map(|j| corr[(i, j)]).collect())
+            .collect(),
+    };
 
     if input.portfolio.tickers() != model.tickers {
         return Err(ComputeError::InvalidInput(
@@ -353,6 +420,9 @@ pub fn run_factor_shock(
         portfolio_pnl_inr,
         portfolio_log_pnl_inr,
         factor_attribution_log_inr,
+        factor_correlation,
+        conditional_coefficients: conditional_coefficients_out,
+        gold_inr_implied_move,
     };
 
     let note = if input.linear_approximation {

@@ -117,6 +117,22 @@ impl FactorModel {
     pub fn factor_covariance(&self) -> DMatrix<f64> {
         annualize_matrix(&self.factor_covariance_daily, self.frequency)
     }
+
+    /// Factor correlation matrix, in `FACTOR_NAMES` order. Scale-free: the
+    /// annualization factor cancels in the ratio, so this is identical
+    /// whether computed from the per-period or annualized covariance.
+    pub fn factor_correlation(&self) -> DMatrix<f64> {
+        let f = &self.factor_covariance_daily;
+        let n = f.nrows();
+        let sd: Vec<f64> = (0..n).map(|i| f[(i, i)].max(0.0).sqrt()).collect();
+        DMatrix::from_fn(n, n, |i, j| {
+            if sd[i] > 0.0 && sd[j] > 0.0 {
+                f[(i, j)] / (sd[i] * sd[j])
+            } else {
+                0.0
+            }
+        })
+    }
 }
 
 /// Ordinary least squares with intercept: y ~ 1 + X, solved via the

@@ -33,6 +33,11 @@ cargo run -p compute --bin experiment -- crates/compute/examples/risk_decomposit
 Add `--refresh` to refetch price series instead of reading `data/cache/`.
 Each run prints a JSON `EvidenceTrace` to stdout.
 
+> Note: the frequency comparison below was run before the `GOLD` factor
+> label was renamed to `GOLD_USD` (see "Trace additions for
+> explainability"); `GOLD` in this section refers to what the trace now
+> calls `GOLD_USD`. The numbers themselves are unaffected by the rename.
+
 ## Return frequency
 
 `FactorShockInput`/`RiskDecompositionInput` take an optional `frequency`
@@ -129,6 +134,35 @@ relative to NSEI (149 dates each), and identical gap-run-length histograms
 (all singleton 1-day gaps, no clustering — `Counter({1: 149})` for both).
 No behavioral difference; kept `INR=X` (already in use, and the shorter of
 the two equivalent tickers).
+
+## Trace additions for explainability
+
+`FactorShockOutput` (nested in every `FactorShock` `EvidenceTrace`) now
+also carries:
+
+- `factor_correlation`: the fit-time factor correlation matrix
+  (`FACTOR_NAMES` order), so a reader can see e.g. MARKET/BRENT correlation
+  without recomputing it from the covariance.
+- `conditional_coefficients`: `F_uk * F_kk^-1`, keyed
+  `implied_factor -> { given_factor: coefficient }`. Each implied move is
+  exactly `Sum_k coefficient_k * given_log_shock_k`, so a reader can
+  attribute, say, "why did GOLD_USD move -6.6% log?" to specific coefficient
+  x given-shock products instead of trusting an opaque number.
+- `gold_inr_implied_move`: gold priced in INR is `GOLD_USD * USDINR`, so its
+  log return is the sum of the `GOLD_USD` and `USDINR` log shocks (given or
+  implied, whichever applies). The fitted `GOLD_USD` factor alone excludes
+  the rupee move a domestic gold holder actually realizes, so this is
+  reported as a separate, clearly-labelled derived field rather than
+  folded into `GOLD_USD`.
+- `model_params.frequency` / `model_params.window_periods` (added in the
+  frequency changes above) record which frequency/window the fit used.
+
+The `GOLD` factor label is renamed `GOLD_USD` everywhere (`FACTOR_NAMES`,
+`factor_returns` keys, `shocks_pct` keys, betas, trace output) to make
+explicit that it is USD-denominated gold, not INR-denominated gold — see
+`gold_inr_implied_move` above for the INR-denominated derived move. The
+Yahoo ticker constant (`data::GOLD`, `"GC=F"`) is unchanged; only the
+factor *label* moved.
 
 ## Tests
 

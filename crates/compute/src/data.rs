@@ -17,7 +17,9 @@ pub const MARKET: &str = "^NSEI";
 pub const USDINR: &str = "INR=X";
 /// Brent crude futures ticker.
 pub const BRENT: &str = "BZ=F";
-/// Gold futures ticker.
+/// Gold futures ticker, quoted in USD (hence the `GOLD_USD` factor label —
+/// it is *not* INR-denominated gold; see `to_returns`'s doc for the
+/// derived INR-gold move some experiments compute).
 pub const GOLD: &str = "GC=F";
 /// Nifty Bank ticker, used only to build the rates proxy factor.
 pub const BANK: &str = "^NSEBANK";
@@ -30,7 +32,7 @@ pub const RATES_PROXY: &str = "RATES_PROXY";
 /// Fixed, ordered list of factor names as they appear in every beta vector,
 /// factor covariance matrix, and trace. Order matters: index `k` here is
 /// index `k` everywhere else in the model.
-pub const FACTOR_NAMES: [&str; 5] = ["MARKET", "USDINR", "BRENT", "GOLD", RATES_PROXY];
+pub const FACTOR_NAMES: [&str; 5] = ["MARKET", "USDINR", "BRENT", "GOLD_USD", RATES_PROXY];
 
 /// Tickers that must be fetched to build the five named factors above.
 /// (RATES_PROXY is derived, not fetched directly.)
@@ -494,7 +496,7 @@ pub fn to_returns(prices: &AlignedPrices, frequency: crate::model::Frequency) ->
     factor_returns.insert("MARKET".to_string(), market_ret);
     factor_returns.insert("USDINR".to_string(), usdinr_ret);
     factor_returns.insert("BRENT".to_string(), brent_ret);
-    factor_returns.insert("GOLD".to_string(), gold_ret);
+    factor_returns.insert("GOLD_USD".to_string(), gold_ret);
     factor_returns.insert(RATES_PROXY.to_string(), rates_proxy_ret);
 
     MarketData {
