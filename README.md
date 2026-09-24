@@ -1,16 +1,18 @@
 # drift-risk-copilot
 
-Portfolio risk copilot for BFSI users (AI Builder Cup 2026). This checkpoint
-covers the **compute layer** only — a Rust workspace that fetches market
-data, fits a factor risk model, and runs portfolio-risk experiments,
-returning a fully-cited `EvidenceTrace` for every result. The `agent` and
-`server` crates are empty stubs, built in a later checkpoint.
+Portfolio risk copilot for BFSI users (AI Builder Cup 2026). A Rust
+workspace: `compute` fetches market data, fits a factor risk model, and
+runs portfolio-risk experiments, returning a fully-cited `EvidenceTrace`
+for every result; `agent` turns a natural-language request into one of
+those experiments via Gemini, runs it, and narrates the result back with a
+verbatim-number grounding check. `server` (HTTP API, not yet built) will
+call `agent::pipeline::run`.
 
 ## Workspace layout
 
 ```
 crates/
-  compute/   # data layer, factor model, experiments, evidence trace (this checkpoint)
+  compute/   # data layer, factor model, experiments, evidence trace
     src/data.rs         Yahoo fetch + cache + NSE calendar alignment + log returns
     src/model.rs         OLS factor fits, Ledoit-Wolf shrinkage, stock covariance
     src/experiments.rs    FactorShock, RiskDecomposition
@@ -19,7 +21,15 @@ crates/
     src/bin/experiment.rs CLI: runs one experiment from a JSON file
     examples/              FactorShock / RiskDecomposition / CvarRebalance inputs, 10-stock Nifty portfolio
     tests/                  Synthetic-data unit/integration tests (no network required)
-  agent/     # stub — LLM-facing layer, not yet built
+  agent/     # NL -> Experiment -> EvidenceTrace -> grounded narration
+    src/gemini.rs        Async Gemini client: request/response types, retrying HTTP transport
+    src/schema.rs         JSON Schema (via schemars) for the run_experiment function declaration
+    src/parse.rs           NL -> Experiment via a single Gemini function-calling turn
+    src/narrate.rs          EvidenceTrace -> plain-language narration via Gemini
+    src/grounding.rs        Verbatim-number check on narration vs. trace, with retry
+    src/pipeline.rs          agent::pipeline::run: the one function `server` calls
+    examples/demo_pipeline.rs  One-off demo: mocked Gemini + a real compute call (see below)
+    tests/                    Mocked-Gemini unit/integration tests (no network to Gemini)
   server/    # stub — HTTP API, not yet built
 data/cache/  # cached raw price CSVs (gitignored; fetched on first run)
 ```
@@ -188,6 +198,9 @@ no network access required.
 | `csv` | Reading/writing the on-disk price cache. |
 | `clap` (derive) | CLI argument parsing (`--refresh`, `--cache-dir`) for the `experiment` binary — not in the original justified list, added because the spec requires a `--refresh` flag and hand-rolled arg parsing would be worse than a one-line derive. |
 | `good_lp` (`clarabel` backend only, `default-features = false`) | The Rockafellar-Uryasev LP for `CvarRebalance`. `clarabel` is a pure-Rust interior-point solver (no C/C++ toolchain or system solver binary needed), matching the design note's preference for build simplicity over a HiGHS/CBC binding. |
+| `tokio` (`rt-multi-thread`, `macros`, `time`) | Async runtime for `agent`'s Gemini calls (`reqwest`'s async client) and retry backoff (`tokio::time::sleep`); `rt-multi-thread`/`macros` also back `#[tokio::main]`/`#[tokio::test]`. |
+| `async-trait` | `agent::gemini::GeminiClient` is an async trait (needed so `parse`/`narrate`/`pipeline` can be generic over a real HTTP client or a test mock); stable Rust doesn't yet support `async fn` in traits used as trait objects/generically without this. |
+| `regex` | Number extraction in `agent::grounding` (lakh/percent/plain numeric tokens) — a hand-rolled parser would be far more error-prone for this than a well-tested regex engine. |
 
 ## Judgment calls
 
@@ -317,3 +330,135 @@ Full trace: `cargo run -p compute --bin experiment -- crates/compute/examples/cv
   experiment (no factor model is fit); left as an empty vec / 0.0 rather
   than adding an experiment-specific trace variant, with an explicit note
   in `outputs.note` saying so.
+
+## Agent pipeline (`agent::pipeline::run`)
+
+`compute` is unchanged in this checkpoint. `agent` adds the NL -> Experiment
+-> EvidenceTrace -> grounded-narration pipeline `server` will call:
+
+```
+agent::pipeline::run(client, user_message, portfolio)
+  -> parse::parse_experiment   (1 Gemini call, function-calling)
+  -> compute_trace              (real compute::data/model/experiments/cvar call,
+                                  on a blocking thread via tokio::task::spawn_blocking)
+  -> grounding::grounded_narrate (1-3 Gemini calls: narrate, then up to 2 grounding retries)
+```
+
+### Gemini client (`agent::gemini`)
+
+`GeminiClient` is an async trait with one method, `generate`; `HttpGeminiClient`
+is the real POST-to-`generateContent` implementation (API key from
+`GEMINI_API_KEY`, retrying up to 3 attempts with exponential backoff — 250ms,
+500ms — on HTTP 429/503, surfacing any other status as `GeminiError::Status`).
+Being a trait (not a concrete struct) is what makes `parse`/`narrate`/`pipeline`
+testable without network access: tests supply a `MockGeminiClient` with a
+queue of canned responses instead.
+
+### Schema (`agent::schema`)
+
+`experiment_json_schema()` derives a JSON Schema from `compute::experiments::Experiment`
+via `schemars::schema_for!`, then strips the `portfolio` field from every
+variant's `properties`/`required` (recursively, including inside `definitions`)
+before it's shown to Gemini — see judgment calls below for why.
+
+### Grounding check (`agent::grounding`)
+
+The core piece. `extract_numbers` recognizes three token shapes, tried in
+priority order (most specific first) via one alternation-based regex, so
+e.g. `"₹11.7 lakh"` is consumed whole rather than also matching `"11.7"`
+generically:
+
+1. **Lakh:** `(?:₹\s*)?(-?[\d,]+(?:\.\d+)?)\s*lakh\b` → `value * 100_000`.
+2. **Percent:** `(-?[\d,]+(?:\.\d+)?)\s*%` → `value / 100`.
+3. **Plain:** `(?:₹\s*)?(-?[\d,]+(?:\.\d+)?)` → `value` as-is.
+
+The minus sign accepts both ASCII `-` and Unicode `−` (U+2212), since
+Gemini (and Indian financial prose generally) uses both; commas are
+stripped before parsing, which normalizes both Western (`1,175,389`) and
+Indian (`11,75,389`) digit grouping identically. `numeric_leaves` flattens
+every numeric JSON leaf out of `serde_json::to_value(&trace)` (recursively;
+strings/bools/nulls ignored). A narration number matches a trace number if
+`|a - b| / max(|a|, |b|, 1e-9) <= 0.02` (the `1e-9` floor avoids
+division-by-zero when both are ~0, without changing behavior anywhere the
+spec's 2% figure actually matters).
+
+`grounded_narrate` calls `narrate`, checks, and — if any number is
+unmatched — retries up to twice with the failing tokens named in an
+appended system instruction, per the spec's exact retry wording. If still
+failing after 2 retries (3 calls total), it returns the last narration with
+`grounding_warnings` populated rather than suppressing the response.
+
+### Sample `PipelineResult` — FactorShock, live 10-stock portfolio
+
+No `GEMINI_API_KEY` is available in this environment, so `agent::pipeline::run`
+below used a **scripted mock Gemini client** (`crates/agent/examples/demo_pipeline.rs`)
+for the two Gemini calls, while the compute step hit live Yahoo data exactly
+as the `experiment` CLI does. The narration text was written by hand,
+honoring the narrate system prompt's rules, then run through the *real*
+`grounding::check_grounding` (not mocked) — this is a demonstration of the
+grounding machinery on a genuine trace, not a live Gemini call:
+
+```
+$ cargo run -p agent --example demo_pipeline
+```
+
+**Parsed experiment:** `FactorShock { shocks_pct: {MARKET: -12.0, BRENT: 20.0}, propagate: true, ... }`
+(portfolio injected from the caller, not from Gemini's args).
+
+**Trace summary** (`trace.outputs.result`, full JSON via the command above):
+
+```
+given_shocks:    MARKET  -12.00% (simple)     BRENT  +20.00% (simple)
+implied_shocks:  USDINR  +2.53%                GOLD_USD  -6.36%             RATES_PROXY  -1.80%
+portfolio_pnl_inr: -1,177,846.39
+invariants: sum(per_holding.pnl_inr) == portfolio_pnl_inr        -> passed
+            sum(factor_attribution_log_inr) == portfolio_log_pnl_inr -> passed
+```
+
+**Narration:**
+
+> A -12% shock to MARKET combined with a +20% shock to BRENT produces a
+> portfolio loss of approximately -1,177,846 INR on this ten-stock Nifty
+> portfolio. Because the user specified only these two factors, the
+> remaining three factors are model-estimated from this portfolio's return
+> history via the factor covariance: USDINR is implied to move +2.53%,
+> GOLD_USD -6.36%, and RATES_PROXY -1.80%, each shown separately from the
+> two given shocks above. These implied moves are not user inputs; they
+> follow from the historical correlation between MARKET, BRENT and the
+> other factors. The loss is dominated by the MARKET shock, given the
+> portfolio's substantial equity beta exposure.
+
+**`grounding_warnings`: `[]`** — every number in the narration matched a
+trace value on the first attempt; no retry was needed. See "flag
+immediately if grounding_warnings fires" below.
+
+### Judgment calls
+
+- **`portfolio` stripped from the schema Gemini sees**, not just documented
+  in the function description: with `Portfolio` present as a required field
+  in each variant's schema but the model told "don't extract this," a small
+  model can still feel obligated to invent a plausible-looking (wrong)
+  portfolio object, wasting tokens and risking a parse failure if its
+  shape is malformed. Stripping it removes the temptation entirely; the
+  real portfolio is always spliced into the function-call args
+  (`args["portfolio"] = ...`) before deserializing into `Experiment`,
+  overwriting whatever Gemini did or didn't include.
+- **2% relative tolerance, not absolute:** an absolute tolerance would be
+  either too loose for small numbers (betas, shrinkage intensities are
+  often < 0.1) or too tight for large INR amounts (portfolio values in the
+  millions), so every comparison is scaled by the larger of the two
+  magnitudes (floored at `1e-9` to stay finite at/near zero).
+- **Number-matching, not phrase-matching:** the grounding check verifies
+  every *number* the narration states is real, not that the *sentence*
+  containing it is accurate (e.g. it can't catch a narration that swaps
+  which factor a correct number belongs to). This matches the spec's
+  literal ask ("every number... must appear verbatim") but is worth naming
+  as a limitation — a stronger check would need entity/number pairing,
+  out of scope here.
+- **Blocking compute on `spawn_blocking`:** `compute`'s data/model/CVaR
+  path is synchronous (blocking `reqwest`, CPU-bound linear algebra/LP
+  solve); `pipeline::run` moves it to a blocking thread rather than making
+  `compute` itself async, since `compute` has no other reason to depend on
+  an async runtime and the CLI (`experiment`) needs to stay synchronous too.
+- **`commission_bps`/`window`/`frequency` defaults are unchanged** from the
+  compute-layer checkpoints; `agent` doesn't override or second-guess them.

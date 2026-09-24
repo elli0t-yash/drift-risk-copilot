@@ -17,3 +17,6 @@ thiserror = "1"
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 csv = "1"
 clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+async-trait = "0.1"
+regex = "1"
