@@ -58,14 +58,23 @@ pub enum Experiment {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct FactorShockInput {
     pub portfolio: Portfolio,
-    /// Shocks in percent (e.g. -12.0 for -12%), keyed by factor name (one
-    /// of `FACTOR_NAMES`: MARKET, USDINR, BRENT, GOLD, RATES_PROXY).
+    /// Shocks as simple (user-facing) percent returns (e.g. -12.0 for
+    /// -12%), keyed by factor name (one of `FACTOR_NAMES`: MARKET, USDINR,
+    /// BRENT, GOLD, RATES_PROXY).
     pub shocks_pct: BTreeMap<String, f64>,
     /// When true (default), unshocked factors receive their conditional
     /// expectation given the shocked factors, via the factor covariance.
     /// When false, unshocked factors are held at zero.
     #[serde(default = "default_true")]
     pub propagate: bool,
+    /// When false (default), shocks are converted simple -> log before
+    /// propagation and betas are applied in log-return space, converting
+    /// back to simple returns (`exp(log_return) - 1`) for P&L. When true,
+    /// reproduces the original checkpoint's behaviour: shocks are treated
+    /// as literal decimal returns with no log conversion, and P&L is
+    /// exactly linear in the shock (`value * (beta . shock)`).
+    #[serde(default)]
+    pub linear_approximation: bool,
     #[serde(default)]
     pub frequency: Frequency,
     /// Trailing window in periods at `frequency`. Defaults to
@@ -84,27 +93,82 @@ impl FactorShockInput {
     }
 }
 
+/// A shock or implied move in both the user-facing simple-return form and
+/// the log-return form used internally for propagation and beta
+/// application. `simple = exp(log) - 1` and `log = ln(1 + simple)` exactly
+/// (see `simple_to_log`/`log_to_simple`); both are carried in the trace so
+/// nothing has to be recomputed to check the conversion.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct ShockValue {
+    pub simple: f64,
+    pub log: f64,
+}
+
+impl ShockValue {
+    fn from_simple(simple: f64) -> Self {
+        ShockValue {
+            simple,
+            log: simple_to_log(simple),
+        }
+    }
+
+    fn from_log(log: f64) -> Self {
+        ShockValue {
+            simple: log_to_simple(log),
+            log,
+        }
+    }
+}
+
+/// Simple return -> log return: `ln(1 + simple)`.
+pub fn simple_to_log(simple: f64) -> f64 {
+    (1.0 + simple).ln()
+}
+
+/// Log return -> simple return: `exp(log) - 1`.
+pub fn log_to_simple(log: f64) -> f64 {
+    log.exp() - 1.0
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct HoldingShockResult {
     pub ticker: String,
     pub value_inr: f64,
-    /// beta . s (decimal return implied by the full shock vector).
-    pub implied_return: f64,
+    /// beta . (full log shock vector). Equal to `simple_return` when
+    /// `linear_approximation` is true (no log conversion applied).
+    pub log_return: f64,
+    /// `exp(log_return) - 1`, or (under `linear_approximation`) the same
+    /// linear `beta . shock` value used directly with no conversion.
+    pub simple_return: f64,
     pub pnl_inr: f64,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct FactorShockOutput {
-    /// The shocks as given by the caller (decimal, e.g. -0.12).
-    pub given_shocks: BTreeMap<String, f64>,
+    pub linear_approximation: bool,
+    /// The shocks as given by the caller, in both simple and log form.
+    pub given_shocks: BTreeMap<String, ShockValue>,
     /// Shocks implied by conditional expectation for factors the caller
     /// did not specify (empty if `propagate` is false, or if all factors
-    /// were given).
-    pub implied_shocks: BTreeMap<String, f64>,
+    /// were given), in both simple and log form.
+    pub implied_shocks: BTreeMap<String, ShockValue>,
     pub per_holding: Vec<HoldingShockResult>,
+    /// Sum of `per_holding.pnl_inr`: value * simple_return per holding,
+    /// summed. Exact (not an approximation) regardless of
+    /// `linear_approximation`.
     pub portfolio_pnl_inr: f64,
-    /// Attribution of portfolio P&L (INR) by factor: sum_i value_i * beta_ik * s_k.
-    pub factor_attribution_inr: BTreeMap<String, f64>,
+    /// Value-weighted sum of log returns, Sum_i value_i * log_return_i.
+    /// This is what `factor_attribution_log_inr` sums to exactly (an exact
+    /// identity in log-return space); it is *not* the same number as
+    /// `portfolio_pnl_inr` once `exp(.) - 1` conversion is applied, because
+    /// that conversion is convex, not linear. Equal to `portfolio_pnl_inr`
+    /// under `linear_approximation`.
+    pub portfolio_log_pnl_inr: f64,
+    /// Attribution of `portfolio_log_pnl_inr` (not `portfolio_pnl_inr`) by
+    /// factor: Sum_i value_i * beta_ik * log_shock_k. Exact in log-return
+    /// space; see `portfolio_log_pnl_inr` doc for why it does not equal
+    /// `portfolio_pnl_inr` outside `linear_approximation` mode.
+    pub factor_attribution_log_inr: BTreeMap<String, f64>,
 }
 
 /// Computes conditional expectations for the "unknown" factor block given
@@ -151,16 +215,29 @@ pub fn run_factor_shock(
         }
     }
 
-    let given_shocks: BTreeMap<String, f64> = input
+    // "Computation space" values: simple (decimal) shocks directly under
+    // `linear_approximation`, or log-converted shocks otherwise. Betas were
+    // fit on log returns, so propagation and beta application are only
+    // exact in log space; `linear_approximation` reproduces the original
+    // (less correct, but simpler) checkpoint behaviour on request.
+    let given_computation: BTreeMap<String, f64> = input
         .shocks_pct
         .iter()
-        .map(|(k, v)| (k.clone(), v / 100.0))
+        .map(|(k, v)| {
+            let simple = v / 100.0;
+            let value = if input.linear_approximation {
+                simple
+            } else {
+                simple_to_log(simple)
+            };
+            (k.clone(), value)
+        })
         .collect();
 
     let known_idx: Vec<usize> = factor_names
         .iter()
         .enumerate()
-        .filter(|(_, n)| given_shocks.contains_key(*n))
+        .filter(|(_, n)| given_computation.contains_key(*n))
         .map(|(i, _)| i)
         .collect();
     let unknown_idx: Vec<usize> = (0..factor_names.len())
@@ -168,23 +245,39 @@ pub fn run_factor_shock(
         .collect();
     let known_vals: Vec<f64> = known_idx
         .iter()
-        .map(|i| given_shocks[&factor_names[*i]])
+        .map(|i| given_computation[&factor_names[*i]])
         .collect();
 
-    let mut implied_shocks = BTreeMap::new();
     let mut full_shock = vec![0.0; factor_names.len()];
     for (i, v) in known_idx.iter().zip(known_vals.iter()) {
         full_shock[*i] = *v;
     }
 
+    let mut implied_computation = BTreeMap::new();
     if input.propagate && !unknown_idx.is_empty() && !known_idx.is_empty() {
         let f = model.factor_covariance();
         let implied = conditional_expectation(&f, &known_idx, &known_vals, &unknown_idx)?;
         for (idx, val) in unknown_idx.iter().zip(implied.iter()) {
             full_shock[*idx] = *val;
-            implied_shocks.insert(factor_names[*idx].clone(), *val);
+            implied_computation.insert(factor_names[*idx].clone(), *val);
         }
     }
+
+    let to_shock_value = |v: f64| -> ShockValue {
+        if input.linear_approximation {
+            ShockValue::from_simple(v)
+        } else {
+            ShockValue::from_log(v)
+        }
+    };
+    let given_shocks: BTreeMap<String, ShockValue> = given_computation
+        .iter()
+        .map(|(k, v)| (k.clone(), to_shock_value(*v)))
+        .collect();
+    let implied_shocks: BTreeMap<String, ShockValue> = implied_computation
+        .iter()
+        .map(|(k, v)| (k.clone(), to_shock_value(*v)))
+        .collect();
 
     if input.portfolio.tickers() != model.tickers {
         return Err(ComputeError::InvalidInput(
@@ -193,54 +286,85 @@ pub fn run_factor_shock(
     }
 
     let mut per_holding = Vec::with_capacity(model.fits.len());
-    let mut factor_attribution_inr: BTreeMap<String, f64> =
+    let mut factor_attribution_log_inr: BTreeMap<String, f64> =
         factor_names.iter().map(|n| (n.clone(), 0.0)).collect();
     let mut portfolio_pnl_inr = 0.0;
+    let mut portfolio_log_pnl_inr = 0.0;
 
     for (holding, fit) in input.portfolio.holdings.iter().zip(model.fits.iter()) {
         let value_inr = holding.weight * input.portfolio.total_value_inr;
-        let implied_return: f64 = fit
+        let log_return: f64 = fit
             .betas
             .iter()
             .zip(full_shock.iter())
             .map(|(b, s)| b * s)
             .sum();
-        let pnl_inr = value_inr * implied_return;
+        let simple_return = if input.linear_approximation {
+            log_return
+        } else {
+            log_to_simple(log_return)
+        };
+        let pnl_inr = value_inr * simple_return;
         portfolio_pnl_inr += pnl_inr;
+        portfolio_log_pnl_inr += value_inr * log_return;
 
         for (k, name) in factor_names.iter().enumerate() {
-            *factor_attribution_inr.get_mut(name).unwrap() +=
+            *factor_attribution_log_inr.get_mut(name).unwrap() +=
                 value_inr * fit.betas[k] * full_shock[k];
         }
 
         per_holding.push(HoldingShockResult {
             ticker: holding.ticker.clone(),
             value_inr,
-            implied_return,
+            log_return,
+            simple_return,
             pnl_inr,
         });
     }
 
-    let attribution_sum: f64 = factor_attribution_inr.values().sum();
+    let attribution_log_sum: f64 = factor_attribution_log_inr.values().sum();
+    let tolerance = 1e-6 * input.portfolio.total_value_inr.abs().max(1.0);
     let mut invariants = vec![InvariantCheck::approx_eq(
         "sum(per_holding.pnl_inr) == portfolio_pnl_inr",
         per_holding.iter().map(|h| h.pnl_inr).sum(),
         portfolio_pnl_inr,
-        1e-6 * input.portfolio.total_value_inr.abs().max(1.0),
+        tolerance,
     )];
     invariants.push(InvariantCheck::approx_eq(
-        "sum(factor_attribution_inr) == portfolio_pnl_inr",
-        attribution_sum,
-        portfolio_pnl_inr,
-        1e-6 * input.portfolio.total_value_inr.abs().max(1.0),
+        "sum(factor_attribution_log_inr) == portfolio_log_pnl_inr",
+        attribution_log_sum,
+        portfolio_log_pnl_inr,
+        tolerance,
     ));
+    if input.linear_approximation {
+        invariants.push(InvariantCheck::approx_eq(
+            "linear_approximation: portfolio_log_pnl_inr == portfolio_pnl_inr",
+            portfolio_log_pnl_inr,
+            portfolio_pnl_inr,
+            tolerance,
+        ));
+    }
 
     let output = FactorShockOutput {
+        linear_approximation: input.linear_approximation,
         given_shocks,
         implied_shocks,
         per_holding,
         portfolio_pnl_inr,
-        factor_attribution_inr,
+        portfolio_log_pnl_inr,
+        factor_attribution_log_inr,
+    };
+
+    let note = if input.linear_approximation {
+        "linear_approximation=true: shocks are treated as literal decimal returns with no \
+         log conversion; P&L = value * (beta . shock) is exact and \
+         portfolio_log_pnl_inr == portfolio_pnl_inr."
+    } else {
+        "Shocks are converted simple -> log for propagation and beta application \
+         (betas are fit on log returns); per-holding/portfolio P&L converts back with \
+         exp(log_return) - 1. portfolio_log_pnl_inr and factor_attribution_log_inr are an \
+         exact decomposition in log-return space, not of the (convex-transformed) INR P&L. \
+         Stock alpha/intercept from the OLS fit is not applied in either mode."
     };
 
     let trace = EvidenceTrace {
@@ -257,8 +381,7 @@ pub fn run_factor_shock(
         },
         outputs: serde_json::json!({
             "result": output,
-            "note": "Linear, no-intercept approximation: P&L = value * (beta . shock). \
-                     Stock alpha/intercept from the OLS fit is not applied.",
+            "note": note,
         }),
         invariants,
         engine_version: crate::trace::engine_version(),
