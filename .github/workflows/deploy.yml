@@ -1,0 +1,77 @@
+name: Deploy to Cloud Run
+
+# Fires on every push that lands on main -- including a merged PR, since
+# GitHub sends a push event for the merge commit itself. A separate
+# `pull_request: types: [closed]` trigger would double-deploy the same
+# commit, so it's deliberately not added.
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  # Required for google-github-actions/auth's Workload Identity
+  # Federation exchange (no long-lived service account key is stored in
+  # this repo).
+  id-token: write
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Build and push image (Cloud Build)
+        run: |
+          set -euo pipefail
+          IMAGE="gcr.io/${{ vars.GCP_PROJECT_ID }}/drift-risk-copilot"
+          gcloud builds submit \
+            --project="${{ vars.GCP_PROJECT_ID }}" \
+            --tag "${IMAGE}:${{ github.sha }}" \
+            .
+          gcloud container images add-tag \
+            --project="${{ vars.GCP_PROJECT_ID }}" \
+            "${IMAGE}:${{ github.sha }}" "${IMAGE}:latest" \
+            --quiet
+
+      - name: Render cloudrun.yaml for this project/build
+        run: |
+          set -euo pipefail
+          sed \
+            -e "s#gcr.io/PROJECT_ID/drift-risk-copilot:latest#gcr.io/${{ vars.GCP_PROJECT_ID }}/drift-risk-copilot:${{ github.sha }}#" \
+            cloudrun.yaml > cloudrun.deploy.yaml
+          cat cloudrun.deploy.yaml
+
+      - name: Deploy to Cloud Run
+        run: |
+          set -euo pipefail
+          gcloud run services replace cloudrun.deploy.yaml \
+            --project="${{ vars.GCP_PROJECT_ID }}" \
+            --region=asia-south1
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          URL=$(gcloud run services describe drift-risk-copilot \
+            --project="${{ vars.GCP_PROJECT_ID }}" \
+            --region=asia-south1 \
+            --format="value(status.url)")
+          echo "Deployed: ${URL}"
+          curl -sf "${URL}/health" | tee /dev/stderr | grep -q '"status":"ok"'
