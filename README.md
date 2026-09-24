@@ -688,6 +688,11 @@ path first) and reads `GEMINI_API_KEY` from Secret Manager
 (`secretKeyRef: {name: drift-gemini-key, key: latest}` — the secret must
 exist and the Cloud Run service's runtime service account needs
 `roles/secretmanager.secretAccessor` on it before `services replace` will
-succeed). `minScale: 0` / `maxScale: 3`, 512Mi/1 CPU, `timeoutSeconds: 60`
-to give a cold-start compute call (Yahoo fetch + model fit, or an LP solve)
-room to finish.
+succeed). `minScale: 0` / `maxScale: 3`, 512Mi/1 CPU, `timeoutSeconds: 300`
+(bumped from the originally-specified 60 -- confirmed live that a real
+`/ask` request hit Cloud Run's own gateway timeout at exactly 60.1s: `/ask`
+can chain up to 4 sequential Gemini round trips -- parse, then narrate,
+then up to 2 grounding-retry narrate calls, each itself retrying up to 3x
+internally on 429/503 -- which routinely exceeds 60s under real API
+latency/rate-limiting, well beyond just the cold-start compute call the
+original 60s was sized for).

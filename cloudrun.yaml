@@ -12,7 +12,15 @@ spec:
         autoscaling.knative.dev/maxScale: "3"
     spec:
       containerConcurrency: 80
-      timeoutSeconds: 60
+      # 60s (the checkpoint spec's original value, sized for the compute
+      # step alone) is too short in practice: /ask can chain up to 4
+      # sequential Gemini round trips -- parse, then narrate, then up to 2
+      # grounding-retry narrate calls, each of which itself retries up to
+      # 3x internally on 429/503 -- confirmed live, a real /ask request hit
+      # Cloud Run's own gateway timeout at exactly 60.1s ("upstream request
+      # timeout"). 300s gives that chain real headroom without being
+      # unbounded.
+      timeoutSeconds: 300
       containers:
         - image: gcr.io/PROJECT_ID/drift-risk-copilot:latest
           ports:
