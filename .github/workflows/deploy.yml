@@ -51,11 +51,44 @@ jobs:
           # a "forbidden from accessing the bucket" error -- worth
           # revisiting if GCP support clarifies why, but this sidesteps it
           # cleanly).
-          gcloud builds submit \
+          #
+          # --async, not a blocking `gcloud builds submit`: the blocking
+          # form tries to stream build logs back to the caller, which
+          # requires the caller to be a project Viewer/Owner ("This tool
+          # can only stream logs if you are Viewer/Owner of the
+          # project..."). github-deployer deliberately isn't (least
+          # privilege), and granting roles/logging.viewer did not satisfy
+          # that check either (confirmed via a live run) -- so submit
+          # async and poll `gcloud builds describe` instead, which only
+          # needs cloudbuild.builds.get (already covered by
+          # roles/cloudbuild.builds.editor).
+          BUILD_ID=$(gcloud builds submit \
             --project="${{ vars.GCP_PROJECT_ID }}" \
             --gcs-source-staging-dir="gs://${{ vars.GCP_PROJECT_ID }}-ci-source/cloudbuild-source" \
             --tag "${IMAGE}:${{ github.sha }}" \
-            .
+            --async \
+            --format="value(id)" \
+            .)
+          echo "Cloud Build ID: ${BUILD_ID}"
+
+          for i in $(seq 1 90); do
+            STATUS=$(gcloud builds describe "${BUILD_ID}" \
+              --project="${{ vars.GCP_PROJECT_ID }}" \
+              --format="value(status)")
+            echo "[$i] build status: ${STATUS}"
+            case "${STATUS}" in
+              SUCCESS) break ;;
+              FAILURE|INTERNAL_ERROR|TIMEOUT|CANCELLED|EXPIRED)
+                echo "Cloud Build ${BUILD_ID} ended with status ${STATUS}" >&2
+                exit 1
+                ;;
+            esac
+            if [ "$i" -eq 90 ]; then
+              echo "Timed out waiting for Cloud Build ${BUILD_ID}" >&2
+              exit 1
+            fi
+            sleep 10
+          done
           gcloud container images add-tag \
             --project="${{ vars.GCP_PROJECT_ID }}" \
             "${IMAGE}:${{ github.sha }}" "${IMAGE}:latest" \
