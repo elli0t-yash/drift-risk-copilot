@@ -267,8 +267,8 @@ pub fn run_cvar_rebalance(
     for s in 0..scenario_count {
         // u_s + Sum_i R[s][i] * w_i + zeta >= 0
         let mut expr = Expression::from(u[s]) + Expression::from(zeta);
-        for i in 0..n {
-            expr += w[i] * scenarios[s][i];
+        for (&wi, &ri) in w.iter().zip(scenarios[s].iter()) {
+            expr += wi * ri;
         }
         model = model.with(expr.geq(0.0));
     }
