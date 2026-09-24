@@ -54,7 +54,7 @@ fn sample_trace() -> EvidenceTrace {
             shrinkage_intensity: 0.0374,
             annualization_factor: 252.0,
         },
-        outputs: serde_json::json!({ "portfolio_vol_annualized": 0.1552 }),
+        outputs: serde_json::json!({ "result": { "portfolio_vol_annualized": 0.1552 } }),
         invariants: vec![],
         engine_version: "0.1.0".to_string(),
     }
@@ -149,7 +149,7 @@ async fn experiment_with_valid_request_returns_a_trace() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
     assert_eq!(body["experiment"], "RiskDecomposition");
-    assert_eq!(body["outputs"]["portfolio_vol_annualized"], 0.1552);
+    assert_eq!(body["outputs"]["result"]["portfolio_vol_annualized"], 0.1552);
 }
 
 #[tokio::test]

@@ -123,7 +123,7 @@ fn sample_trace() -> compute::trace::EvidenceTrace {
             shrinkage_intensity: 0.0374,
             annualization_factor: 252.0,
         },
-        outputs: serde_json::json!({ "portfolio_vol_annualized": 0.1552 }),
+        outputs: serde_json::json!({ "result": { "portfolio_vol_annualized": 0.1552 } }),
         invariants: vec![],
         engine_version: "0.1.0".to_string(),
     }

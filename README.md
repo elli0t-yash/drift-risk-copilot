@@ -575,7 +575,7 @@ input and a hand-written, grounding-checked narration.
     "data_quality": {"date_range_start": "2021-09-27", "date_range_end": "2026-09-24", "trading_days": 1234, "per_series": []},
     "model_params": {"frequency": "Daily", "window_periods": 252, "factor_names": ["MARKET"], "shrinkage_intensity": 0.0374, "annualization_factor": 252.0},
     "inputs": {},
-    "outputs": {"portfolio_vol_annualized": 0.1552},
+    "outputs": {"result": {"portfolio_vol_annualized": 0.1552}},
     "invariants": [],
     "engine_version": "0.1.0"
   },

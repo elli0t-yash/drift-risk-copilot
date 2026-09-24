@@ -606,7 +606,7 @@ pub fn run_risk_decomposition(
             shrinkage_intensity: model.shrinkage_intensity,
             annualization_factor: model.frequency.annualization_factor(),
         },
-        outputs: serde_json::to_value(&output)?,
+        outputs: serde_json::json!({ "result": output }),
         invariants,
         engine_version: crate::trace::engine_version(),
     };
