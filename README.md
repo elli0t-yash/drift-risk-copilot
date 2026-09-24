@@ -5,8 +5,10 @@ workspace: `compute` fetches market data, fits a factor risk model, and
 runs portfolio-risk experiments, returning a fully-cited `EvidenceTrace`
 for every result; `agent` turns a natural-language request into one of
 those experiments via Gemini, runs it, and narrates the result back with a
-verbatim-number grounding check. `server` (HTTP API, not yet built) will
-call `agent::pipeline::run`.
+verbatim-number grounding check; `server` is an axum binary (`/health`,
+`/experiment`, `/ask`, plus an embedded single-page UI) that calls
+`agent::pipeline::run`, with a Dockerfile and Cloud Run config to deploy
+it. The backend is deployable and demo-ready as of this checkpoint.
 
 ## Workspace layout
 
@@ -30,8 +32,18 @@ crates/
     src/pipeline.rs          agent::pipeline::run: the one function `server` calls
     examples/demo_pipeline.rs  One-off demo: mocked Gemini + a real compute call (see below)
     tests/                    Mocked-Gemini unit/integration tests (no network to Gemini)
-  server/    # stub — HTTP API, not yet built
+  server/    # axum HTTP API + embedded UI
+    src/main.rs           Router, tracing setup, GEMINI_API_KEY startup check
+    src/routes.rs          /health, /experiment, /ask, static-file fallback handlers
+    src/backend.rs          Backend trait (RealBackend wraps compute+agent) + error mapping
+    src/validate.rs          Portfolio validation shared by /experiment and /ask
+    src/error.rs             ApiError ({error, code} JSON responses) + AppJson extractor
+    src/logging.rs            Request logging middleware (method, path, status, latency)
+    src/tests.rs               Route tests against a MockBackend (no network)
+    static/index.html         Embedded single-page UI (include_str!, no build step)
 data/cache/  # cached raw price CSVs (gitignored; fetched on first run)
+Dockerfile     # multi-stage build -> gcr.io/distroless/cc-debian12
+cloudrun.yaml  # Cloud Run service config
 ```
 
 ## Running an experiment
@@ -194,13 +206,16 @@ no network access required.
 | `schemars` (with `chrono` feature) | JSON Schema derivation for `Experiment` and trace types, for the future agent/tool-calling layer. |
 | `chrono` | Calendar-correct date handling for the NSE trading calendar and price series. |
 | `thiserror` | Structured `ComputeError` variants instead of stringly-typed errors. |
-| `reqwest` (blocking) | HTTP client for Yahoo Finance's chart endpoint. |
+| `reqwest` (blocking + async, `rustls-tls`, `default-features = false`) | HTTP client for Yahoo Finance's chart endpoint (blocking, `compute`) and Gemini's `generateContent` endpoint (async, `agent`). Switched from the default `native-tls`/OpenSSL backend to `rustls-tls` in the server checkpoint — see "Docker" below for why. |
 | `csv` | Reading/writing the on-disk price cache. |
 | `clap` (derive) | CLI argument parsing (`--refresh`, `--cache-dir`) for the `experiment` binary — not in the original justified list, added because the spec requires a `--refresh` flag and hand-rolled arg parsing would be worse than a one-line derive. |
 | `good_lp` (`clarabel` backend only, `default-features = false`) | The Rockafellar-Uryasev LP for `CvarRebalance`. `clarabel` is a pure-Rust interior-point solver (no C/C++ toolchain or system solver binary needed), matching the design note's preference for build simplicity over a HiGHS/CBC binding. |
 | `tokio` (`rt-multi-thread`, `macros`, `time`) | Async runtime for `agent`'s Gemini calls (`reqwest`'s async client) and retry backoff (`tokio::time::sleep`); `rt-multi-thread`/`macros` also back `#[tokio::main]`/`#[tokio::test]`. |
 | `async-trait` | `agent::gemini::GeminiClient` is an async trait (needed so `parse`/`narrate`/`pipeline` can be generic over a real HTTP client or a test mock); stable Rust doesn't yet support `async fn` in traits used as trait objects/generically without this. |
 | `regex` | Number extraction in `agent::grounding` (lakh/percent/plain numeric tokens) — a hand-rolled parser would be far more error-prone for this than a well-tested regex engine. |
+| `axum` | The HTTP framework for `server` — spec-named, and a natural fit given `tokio`/`tower` are already in the dependency tree via `reqwest`/`agent`. |
+| `tracing` / `tracing-subscriber` (`json`, `env-filter`) | Structured JSON request logging (method, path, status, latency), `RUST_LOG`-overridable level, per spec. |
+| `tower` (dev-only, `util`) / `http-body-util` (dev-only) | `ServiceExt::oneshot` and response-body reading for `server`'s route tests, run in-process against the axum `Router` with no real network listener. |
 
 ## Judgment calls
 
@@ -462,3 +477,217 @@ immediately if grounding_warnings fires" below.
   an async runtime and the CLI (`experiment`) needs to stay synchronous too.
 - **`commission_bps`/`window`/`frequency` defaults are unchanged** from the
   compute-layer checkpoints; `agent` doesn't override or second-guess them.
+
+## Server (`server::main`)
+
+```
+GET  /health        -> { status: "ok", version } (200)
+POST /experiment     -> { portfolio, experiment } in, EvidenceTrace out
+POST /ask              -> { portfolio, message } in, AskResponse out
+GET  /*                  -> embedded single-page UI (static/index.html)
+```
+
+`ExperimentRequest.experiment` is the tagged `Experiment` variant's JSON
+*minus* `portfolio` (e.g. `{"type": "FactorShock", "shocks_pct": {...}}`) —
+the same "caller supplies portfolio separately" pattern as `agent::parse`
+(§ Agent pipeline). The route handler splices `req.portfolio` into that
+JSON before deserializing into `compute::experiments::Experiment`, so a
+caller never has to repeat the portfolio inside the experiment object.
+
+**Validation** (`validate::validate_portfolio`, shared by both POST routes):
+at least 2 holdings, every weight > 0, `total_value_inr` > 0, weights sum
+to `1.0 +/- 0.01`. Tickers are deliberately not checked — `compute::data`
+already errors clearly on a bad one, and a second ticker-format check here
+would just be one more place to keep in sync. Every failure returns 400
+with `{"error": "...", "code": "invalid_portfolio"}`.
+
+**Error mapping** (`backend::BackendError` -> `error::ApiError`):
+
+| Backend error | HTTP status | `code` |
+|---|---|---|
+| `ParseError::Unrecognised` (the model's one-sentence explanation) | 422 | `unrecognised_request` |
+| any `compute::ComputeError` | 500 | `compute_error` |
+| any Gemini error other than a missing API key (already refused at startup) | 503 | `gemini_unavailable` |
+| malformed/missing-field JSON body (`AppJson`'s rejection) | 400 | `invalid_json` |
+| anything else unexpected | 500 | `internal_error` |
+
+**Testability:** routes depend on a `Backend` trait (`run_experiment`,
+`run_ask`), not on `compute`/`agent` directly. `RealBackend` wraps live
+calls (via `tokio::task::spawn_blocking` for the blocking compute path);
+`src/tests.rs` supplies a `MockBackend` with canned results, so the 5
+required tests need no network access to Yahoo Finance or Gemini.
+
+**Logging:** one `tracing::info!` event per request (`method`, `path`,
+`status`, `latency_ms`), emitted by a small `axum::middleware::from_fn`
+wrapper rather than `tower_http::trace::TraceLayer`, so the exact fields
+logged match the spec precisely instead of `TraceLayer`'s span-based
+defaults. `tracing_subscriber::fmt().json()`, level from `RUST_LOG`
+(default `info`).
+
+### UI (`static/index.html`)
+
+Single file, embedded via `include_str!` — no build step, no npm, no
+external fonts/scripts, plain system fonts, `#2563EB` as the one accent
+colour, two-column layout above 900px. Portfolio builder (add/remove
+ticker/weight rows + a client-side Validate button running the same rule
+as the server's `validate_portfolio`), a prompt box with a Direct toggle
+that reveals structured params per experiment type, a submit button with a
+spinner, a narration panel (yellow banner when `grounding_warnings` is
+non-empty, exact wording per spec), and a collapsible evidence-trace
+`<pre>` block with copy-to-clipboard.
+
+## Sample responses
+
+### `GET /health`
+
+```json
+{"status":"ok","version":"0.1.0"}
+```
+
+(Live, from a running binary — `GEMINI_API_KEY=<dummy> PORT=8099 ./target/debug/server`.)
+
+### `POST /ask` (mocked pipeline — see the agent checkpoint's note on no live Gemini access)
+
+Same approach as the agent checkpoint's demo: `src/tests.rs` used a
+`MockBackend` returning a `PipelineResult` built from a real FactorShock
+input and a hand-written, grounding-checked narration.
+
+```json
+{
+  "experiment": {
+    "type": "FactorShock",
+    "portfolio": {
+      "holdings": [
+        {"ticker": "RELIANCE.NS", "weight": 0.6},
+        {"ticker": "TCS.NS", "weight": 0.4}
+      ],
+      "total_value_inr": 1000000.0
+    },
+    "shocks_pct": {"BRENT": 20.0, "MARKET": -12.0},
+    "propagate": true,
+    "linear_approximation": false,
+    "frequency": "Daily",
+    "window": null
+  },
+  "trace": {
+    "experiment": "RiskDecomposition",
+    "data_window": {"frequency": "Daily", "window_periods": 252, "start": "2025-09-16", "end": "2026-09-24"},
+    "data_quality": {"date_range_start": "2021-09-27", "date_range_end": "2026-09-24", "trading_days": 1234, "per_series": []},
+    "model_params": {"frequency": "Daily", "window_periods": 252, "factor_names": ["MARKET"], "shrinkage_intensity": 0.0374, "annualization_factor": 252.0},
+    "inputs": {},
+    "outputs": {"portfolio_vol_annualized": 0.1552},
+    "invariants": [],
+    "engine_version": "0.1.0"
+  },
+  "narration": "A -12% shock to MARKET combined with a +20% shock to BRENT produces a portfolio loss on this portfolio. USDINR, GOLD_USD and RATES_PROXY move as implied, model-estimated moves, shown separately from the two given shocks.",
+  "grounding_warnings": []
+}
+```
+
+(`trace` here is a small stand-in fixture from the test suite, not a full
+live trace — the point of this response is the `AskResponse` *shape*, not
+new trace content; a full trace looks exactly like the ones in
+`crates/compute/examples/*.json`.)
+
+## Docker
+
+```
+docker build -t drift-risk-copilot:server .
+docker run -e GEMINI_API_KEY=<key> -p 8080:8080 drift-risk-copilot:server
+```
+
+Verified locally (`docker build` + `docker run` + a real `GET /health`
+against the running container). Final image: **~12.5MB** (`docker save
+drift-risk-copilot:server | wc -c` = 13,155,328 bytes; `docker images`'
+own ~62MB figure includes buildx provenance/attestation metadata that
+isn't part of the runtime image) — comfortably under the 50MB target.
+
+### Build failures hit along the way (reported verbatim, per instructions)
+
+**1. `rust:1.82-slim` as originally specified:**
+
+```
+error: failed to parse manifest at `/usr/local/cargo/registry/.../clap_lex-1.1.1/Cargo.toml`
+Caused by:
+  feature `edition2024` is required
+  The package requires the Cargo feature called `edition2024`, but that feature is not
+  stabilized in this version of Cargo (1.82.0 (8f40fc59f 2024-08-21)).
+```
+
+**2. `rust:1.85-slim`** (edition2024 stabilized in Cargo 1.85, tried next):
+
+```
+error: rustc 1.85.1 is not supported by the following packages:
+  icu_collections@2.3.0 requires rustc 1.88
+  icu_locale_core@2.3.0 requires rustc 1.88
+  icu_normalizer@2.3.0 requires rustc 1.88
+  ... (icu_normalizer_data, icu_properties, icu_properties_data, icu_provider @ rustc 1.88)
+  idna_adapter@1.2.2 requires rustc 1.86
+```
+
+**3. `rust:1.90-slim`** — built successfully.
+
+### Judgment calls
+
+- **Rust version bumped from 1.82 to 1.90 (not the spec's exact pin).**
+  This `Cargo.lock` was generated with a current toolchain (rustc 1.95),
+  which resolved several transitive dependencies (`clap_lex`, the
+  `icu_*` family via `idna`/`url`) to versions with an MSRV well above
+  1.82. Re-pinning those dependencies to older, 1.82-compatible versions
+  was the other option, but would mean carrying a second, artificially
+  old dependency set for Docker only, diverging from what's actually
+  tested locally — worse than moving the build image forward to a
+  version that supports the lockfile that's actually shipped. 1.90 is
+  the smallest bump that got a clean build in this environment (verified
+  by trying 1.82, then 1.85, then 1.90 — see above).
+- **`rustls-tls` instead of the default `native-tls`/OpenSSL backend for
+  `reqwest`** (workspace-wide, both `compute` and `agent`): this is what
+  actually makes `gcr.io/distroless/cc-debian12` viable as specified.
+  `distroless/cc` ships glibc + libstdc++ but **no OpenSSL** — a normal
+  `reqwest` build (native-tls) dynamically links `libssl.so`/`libcrypto.so`
+  at runtime and would fail to start in that image. The alternative the
+  checkpoint explicitly offered — static musl linking — would need either
+  `openssl-sys`'s `vendored` feature (a full C build of OpenSSL inside
+  the musl cross-build, plus a musl target + `musl-tools`) or switching to
+  `rustls-tls` anyway; since `rustls-tls` alone already solves the
+  OpenSSL-in-distroless problem with a normal glibc build and zero extra
+  toolchain setup, it's the cleaner of the two options the spec allowed
+  ("pick whichever is cleaner"). Confirmed working end-to-end: `--refresh`
+  against live Yahoo Finance still succeeds after the switch (rustls
+  validates Yahoo's cert chain fine via `webpki-roots`).
+- **The `touch` before the final `cargo build` in the Dockerfile is
+  load-bearing, not decorative** (see the Dockerfile's own comment for the
+  full story): without it, `cargo build --release -p server` after copying
+  the *real* source over the dummy-stub source finished in 0.08s doing
+  nothing, and the resulting image's `/server` silently ran the dummy
+  `fn main() {}` — exit code 0, no log output, port never opened. Caught by
+  actually running the built container and hitting `/health`, not by
+  trusting a "Finished" message. `find ... -exec touch {} +` on the real
+  source before rebuilding fixes it (BuildKit's `COPY` doesn't always
+  advance mtimes past cargo's fingerprint records from the earlier dummy
+  build).
+- **Dummy stubs cover every declared target in every workspace member's
+  Cargo.toml** (`compute`'s `lib.rs` *and* its `bin/experiment.rs`,
+  `agent`'s `lib.rs`, `server`'s `main.rs`), not just the crate(s) actually
+  being built — Cargo parses every workspace member's manifest (for
+  lockfile/dependency-graph resolution) even when building a single
+  package with `-p`, and errors if a declared target's source file is
+  missing.
+
+## Cloud Run deploy
+
+```
+gcloud run services replace cloudrun.yaml --region=asia-south1
+gcloud run services add-iam-policy-binding drift-risk-copilot \
+  --region=asia-south1 --member=allUsers --role=roles/run.invoker
+```
+
+`cloudrun.yaml` references the image as `gcr.io/PROJECT_ID/drift-risk-copilot:latest`
+(substitute the real project ID, and push the image built above to that
+path first) and reads `GEMINI_API_KEY` from Secret Manager
+(`secretKeyRef: {name: drift-gemini-key, key: latest}` — the secret must
+exist and the Cloud Run service's runtime service account needs
+`roles/secretmanager.secretAccessor` on it before `services replace` will
+succeed). `minScale: 0` / `maxScale: 3`, 512Mi/1 CPU, `timeoutSeconds: 60`
+to give a cold-start compute call (Yahoo fetch + model fit, or an LP solve)
+room to finish.

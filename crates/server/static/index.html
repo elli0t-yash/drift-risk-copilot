@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>drift-risk-copilot</title>
+<style>
+  :root {
+    --accent: #2563EB;
+    --fg: #111;
+    --bg: #fff;
+    --border: #ddd;
+    --muted: #666;
+    --warn-bg: #FEF3C7;
+    --warn-border: #D97706;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    color: var(--fg);
+    background: var(--bg);
+    line-height: 1.4;
+  }
+  header {
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 { margin: 0; font-size: 18px; }
+  header p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+  main {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 24px;
+    padding: 24px;
+    max-width: 1200px;
+    margin: 0 auto;
+  }
+  @media (min-width: 900px) {
+    main { grid-template-columns: 420px 1fr; align-items: start; }
+  }
+  section {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 16px;
+    margin-bottom: 16px;
+    background: var(--bg);
+  }
+  section h2 { margin: 0 0 12px; font-size: 14px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+  label { display: block; font-size: 13px; margin-bottom: 4px; color: var(--muted); }
+  input[type=text], input[type=number], textarea, select {
+    width: 100%;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-size: 14px;
+    font-family: inherit;
+    background: var(--bg);
+    color: var(--fg);
+  }
+  textarea { resize: vertical; min-height: 70px; }
+  table { width: 100%; border-collapse: collapse; margin-bottom: 8px; }
+  table th { text-align: left; font-size: 12px; color: var(--muted); font-weight: normal; padding-bottom: 4px; }
+  table td { padding: 3px 4px 3px 0; }
+  table td input { padding: 4px 6px; }
+  .row-actions { display: flex; gap: 8px; align-items: center; }
+  button {
+    cursor: pointer;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--fg);
+    border-radius: 4px;
+    padding: 7px 12px;
+    font-size: 13px;
+    font-family: inherit;
+  }
+  button.primary {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
+  }
+  button.small { padding: 3px 8px; font-size: 12px; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  .toolbar { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+  .validate-msg { font-size: 13px; margin-top: 6px; }
+  .validate-msg.ok { color: #15803D; }
+  .validate-msg.err { color: #B91C1C; }
+  .toggle-row { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; font-size: 13px; }
+  .hidden { display: none !important; }
+  .field { margin-bottom: 10px; }
+  .spinner {
+    display: inline-block;
+    width: 14px; height: 14px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+    vertical-align: middle;
+    margin-right: 6px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .banner-warn {
+    background: var(--warn-bg);
+    border: 1px solid var(--warn-border);
+    border-radius: 4px;
+    padding: 8px 10px;
+    font-size: 13px;
+    margin-bottom: 10px;
+  }
+  .narration-text { font-size: 14px; white-space: pre-wrap; }
+  details > summary { cursor: pointer; font-size: 13px; color: var(--muted); margin-bottom: 8px; }
+  pre.trace {
+    background: #f7f7f7;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 10px;
+    font-size: 12px;
+    overflow: auto;
+    max-height: 480px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .error-box {
+    border: 1px solid #B91C1C;
+    background: #FEF2F2;
+    color: #B91C1C;
+    border-radius: 4px;
+    padding: 8px 10px;
+    font-size: 13px;
+    margin-bottom: 10px;
+  }
+  .empty-state { color: var(--muted); font-size: 13px; }
+  footer { text-align: center; color: var(--muted); font-size: 12px; padding: 16px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>drift-risk-copilot</h1>
+  <p>Portfolio risk experiments, explained in plain language and cross-checked against the numbers.</p>
+</header>
+
+<main>
+  <div>
+    <section id="portfolio-section">
+      <h2>Portfolio</h2>
+      <table id="holdings-table">
+        <thead><tr><th>Ticker</th><th>Weight</th><th></th></tr></thead>
+        <tbody id="holdings-body"></tbody>
+      </table>
+      <div class="toolbar">
+        <button type="button" id="add-row">+ Add holding</button>
+        <button type="button" id="validate-btn">Validate</button>
+      </div>
+      <div id="validate-msg" class="validate-msg"></div>
+      <div class="field" style="margin-top: 12px;">
+        <label for="total-value">Total value (INR)</label>
+        <input type="number" id="total-value" value="10000000" min="0" step="1000">
+      </div>
+    </section>
+
+    <section id="request-section">
+      <h2>Request</h2>
+      <div class="toggle-row">
+        <label style="margin: 0;"><input type="checkbox" id="direct-toggle"> Direct (structured, skip NL parsing)</label>
+      </div>
+
+      <div id="ask-panel" class="field">
+        <label for="message">What do you want to know?</label>
+        <textarea id="message" placeholder="e.g. What happens to my portfolio if Nifty drops 12% and Brent jumps 20%?"></textarea>
+      </div>
+
+      <div id="direct-panel" class="hidden">
+        <div class="field">
+          <label for="experiment-type">Experiment type</label>
+          <select id="experiment-type">
+            <option value="FactorShock">FactorShock</option>
+            <option value="RiskDecomposition">RiskDecomposition</option>
+            <option value="CvarRebalance">CvarRebalance</option>
+          </select>
+        </div>
+
+        <div id="params-FactorShock" class="experiment-params">
+          <div class="field"><label>Shocks (% per factor, JSON object)</label>
+            <input type="text" id="fs-shocks" placeholder='{"MARKET": -12, "BRENT": 20}'></div>
+          <div class="field"><label><input type="checkbox" id="fs-propagate" checked> Propagate to unspecified factors</label></div>
+        </div>
+
+        <div id="params-RiskDecomposition" class="experiment-params hidden"></div>
+
+        <div id="params-CvarRebalance" class="experiment-params hidden">
+          <div class="field"><label>Confidence level (0-1)</label><input type="number" id="cvar-confidence" value="0.95" step="0.01" min="0" max="0.999"></div>
+          <div class="field"><label>Per-name cap (0-1)</label><input type="number" id="cvar-cap" value="0.2" step="0.01" min="0" max="1"></div>
+          <div class="field"><label>Turnover limit (0-1)</label><input type="number" id="cvar-turnover" value="0.3" step="0.01" min="0" max="2"></div>
+          <div class="field"><label>Commission (bps)</label><input type="number" id="cvar-commission" value="10" step="1" min="0"></div>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <button type="button" id="submit-btn" class="primary"><span id="spinner" class="spinner hidden"></span>Submit</button>
+      </div>
+    </section>
+  </div>
+
+  <div>
+    <section id="output-section">
+      <h2>Result</h2>
+      <div id="output-empty" class="empty-state">Submit a request to see a narrated result here.</div>
+      <div id="output-error" class="error-box hidden"></div>
+
+      <div id="output-body" class="hidden">
+        <div id="grounding-banner" class="banner-warn hidden">&#9888; Some numbers in this explanation could not be verified against the model output.</div>
+        <p class="narration-text" id="narration-text"></p>
+
+        <details>
+          <summary>Evidence trace (JSON)</summary>
+          <div class="toolbar" style="margin: 0 0 8px;">
+            <button type="button" id="copy-trace" class="small">Copy to clipboard</button>
+          </div>
+          <pre class="trace" id="trace-json"></pre>
+        </details>
+      </div>
+    </section>
+  </div>
+</main>
+
+<footer>AI Builder Cup 2026 &middot; BFSI track</footer>
+
+<script>
+(function () {
+  "use strict";
+
+  const holdingsBody = document.getElementById("holdings-body");
+  const addRowBtn = document.getElementById("add-row");
+  const validateBtn = document.getElementById("validate-btn");
+  const validateMsg = document.getElementById("validate-msg");
+  const totalValueInput = document.getElementById("total-value");
+  const directToggle = document.getElementById("direct-toggle");
+  const askPanel = document.getElementById("ask-panel");
+  const directPanel = document.getElementById("direct-panel");
+  const experimentType = document.getElementById("experiment-type");
+  const submitBtn = document.getElementById("submit-btn");
+  const spinner = document.getElementById("spinner");
+  const outputEmpty = document.getElementById("output-empty");
+  const outputError = document.getElementById("output-error");
+  const outputBody = document.getElementById("output-body");
+  const groundingBanner = document.getElementById("grounding-banner");
+  const narrationText = document.getElementById("narration-text");
+  const traceJson = document.getElementById("trace-json");
+  const copyTraceBtn = document.getElementById("copy-trace");
+
+  function addHoldingRow(ticker, weight) {
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      '<td><input type="text" class="ticker" placeholder="RELIANCE.NS" value="' + (ticker || "") + '"></td>' +
+      '<td><input type="number" class="weight" step="0.01" min="0" max="1" value="' + (weight != null ? weight : "") + '"></td>' +
+      '<td><button type="button" class="small remove-row">&times;</button></td>';
+    tr.querySelector(".remove-row").addEventListener("click", function () {
+      tr.remove();
+    });
+    holdingsBody.appendChild(tr);
+  }
+
+  addHoldingRow("RELIANCE.NS", 0.5);
+  addHoldingRow("TCS.NS", 0.5);
+
+  addRowBtn.addEventListener("click", function () { addHoldingRow("", ""); });
+
+  function readPortfolio() {
+    const holdings = [];
+    holdingsBody.querySelectorAll("tr").forEach(function (tr) {
+      const ticker = tr.querySelector(".ticker").value.trim();
+      const weight = parseFloat(tr.querySelector(".weight").value);
+      if (ticker && !isNaN(weight)) {
+        holdings.push({ ticker: ticker, weight: weight });
+      }
+    });
+    const totalValue = parseFloat(totalValueInput.value);
+    return { holdings: holdings, total_value_inr: isNaN(totalValue) ? 0 : totalValue };
+  }
+
+  function validatePortfolio(portfolio) {
+    if (portfolio.holdings.length < 2) return "Need at least 2 holdings.";
+    if (portfolio.total_value_inr <= 0) return "Total value must be > 0.";
+    for (const h of portfolio.holdings) {
+      if (h.weight <= 0) return 'Weight for "' + h.ticker + '" must be > 0.';
+    }
+    const sum = portfolio.holdings.reduce(function (s, h) { return s + h.weight; }, 0);
+    if (Math.abs(sum - 1.0) > 0.01) {
+      return "Weights sum to " + sum.toFixed(4) + "; they must sum to 1.0 (+/- 0.01).";
+    }
+    return null;
+  }
+
+  validateBtn.addEventListener("click", function () {
+    const err = validatePortfolio(readPortfolio());
+    if (err) {
+      validateMsg.textContent = err;
+      validateMsg.className = "validate-msg err";
+    } else {
+      validateMsg.textContent = "Portfolio looks good.";
+      validateMsg.className = "validate-msg ok";
+    }
+  });
+
+  directToggle.addEventListener("change", function () {
+    askPanel.classList.toggle("hidden", directToggle.checked);
+    directPanel.classList.toggle("hidden", !directToggle.checked);
+  });
+
+  function showExperimentParams() {
+    document.querySelectorAll(".experiment-params").forEach(function (el) { el.classList.add("hidden"); });
+    const el = document.getElementById("params-" + experimentType.value);
+    if (el) el.classList.remove("hidden");
+  }
+  experimentType.addEventListener("change", showExperimentParams);
+  showExperimentParams();
+
+  function buildDirectExperiment() {
+    const type = experimentType.value;
+    if (type === "FactorShock") {
+      let shocks = {};
+      const raw = document.getElementById("fs-shocks").value.trim();
+      if (raw) {
+        try { shocks = JSON.parse(raw); } catch (e) { throw new Error("Shocks field is not valid JSON: " + e.message); }
+      }
+      return { type: "FactorShock", shocks_pct: shocks, propagate: document.getElementById("fs-propagate").checked };
+    }
+    if (type === "RiskDecomposition") {
+      return { type: "RiskDecomposition" };
+    }
+    if (type === "CvarRebalance") {
+      return {
+        type: "CvarRebalance",
+        confidence_level: parseFloat(document.getElementById("cvar-confidence").value),
+        per_name_cap: parseFloat(document.getElementById("cvar-cap").value),
+        turnover_limit: parseFloat(document.getElementById("cvar-turnover").value),
+        commission_bps: parseFloat(document.getElementById("cvar-commission").value),
+      };
+    }
+    throw new Error("Unknown experiment type");
+  }
+
+  function setLoading(loading) {
+    submitBtn.disabled = loading;
+    spinner.classList.toggle("hidden", !loading);
+  }
+
+  function showError(message) {
+    outputEmpty.classList.add("hidden");
+    outputBody.classList.add("hidden");
+    outputError.classList.remove("hidden");
+    outputError.textContent = message;
+  }
+
+  function showResult(narration, groundingWarnings, trace) {
+    outputEmpty.classList.add("hidden");
+    outputError.classList.add("hidden");
+    outputBody.classList.remove("hidden");
+    groundingBanner.classList.toggle("hidden", !(groundingWarnings && groundingWarnings.length > 0));
+    narrationText.textContent = narration;
+    traceJson.textContent = JSON.stringify(trace, null, 2);
+  }
+
+  submitBtn.addEventListener("click", async function () {
+    outputError.classList.add("hidden");
+    const portfolio = readPortfolio();
+    const validationError = validatePortfolio(portfolio);
+    if (validationError) {
+      showError(validationError);
+      return;
+    }
+
+    setLoading(true);
+    try {
+      let response;
+      if (directToggle.checked) {
+        let experiment;
+        try {
+          experiment = buildDirectExperiment();
+        } catch (e) {
+          showError(e.message);
+          setLoading(false);
+          return;
+        }
+        response = await fetch("/experiment", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ portfolio: portfolio, experiment: experiment }),
+        });
+      } else {
+        const message = document.getElementById("message").value.trim();
+        if (!message) {
+          showError("Enter a message describing what you want to know.");
+          setLoading(false);
+          return;
+        }
+        response = await fetch("/ask", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ portfolio: portfolio, message: message }),
+        });
+      }
+
+      const body = await response.json();
+      if (!response.ok) {
+        showError((body.code ? "[" + body.code + "] " : "") + (body.error || response.statusText));
+        return;
+      }
+
+      if (directToggle.checked) {
+        showResult("(Direct /experiment call — no narration.)", [], body);
+      } else {
+        showResult(body.narration, body.grounding_warnings, body.trace);
+      }
+    } catch (e) {
+      showError("Request failed: " + e.message);
+    } finally {
+      setLoading(false);
+    }
+  });
+
+  copyTraceBtn.addEventListener("click", function () {
+    navigator.clipboard.writeText(traceJson.textContent).then(function () {
+      copyTraceBtn.textContent = "Copied!";
+      setTimeout(function () { copyTraceBtn.textContent = "Copy to clipboard"; }, 1200);
+    });
+  });
+})();
+</script>
+</body>
+</html>

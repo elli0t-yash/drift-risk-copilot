@@ -70,7 +70,11 @@ fn build_data_window(
     }
 }
 
-fn compute_trace(experiment: &Experiment) -> compute::Result<EvidenceTrace> {
+/// Runs the compute-layer path (data fetch + model fit + the appropriate
+/// experiment) for `experiment`. Synchronous/blocking (see the module-level
+/// note in `run`'s body about `spawn_blocking`); exposed so `server`'s
+/// direct `/experiment` route can reuse it without a Gemini round trip.
+pub fn compute_trace(experiment: &Experiment) -> compute::Result<EvidenceTrace> {
     let cache_dir = Path::new(CACHE_DIR);
     match experiment {
         Experiment::FactorShock(input) => {
