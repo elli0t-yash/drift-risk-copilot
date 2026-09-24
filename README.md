@@ -33,6 +33,103 @@ cargo run -p compute --bin experiment -- crates/compute/examples/risk_decomposit
 Add `--refresh` to refetch price series instead of reading `data/cache/`.
 Each run prints a JSON `EvidenceTrace` to stdout.
 
+## Return frequency
+
+`FactorShockInput`/`RiskDecompositionInput` take an optional `frequency`
+(`"Daily"` | `"Weekly"`, default `"Daily"` — unchanged from the first
+checkpoint) and an optional `window` (periods at that frequency; omit to
+get `frequency.default_window()`: 252 for Daily, 156 for Weekly).
+`Weekly` returns are **non-overlapping**, computed between successive
+last-NSE-trading-day-of-the-week closes (`data::weekly_resample_indices`),
+not a rolling 5-day window. Annualization (252 vs. 52) is still derived
+from a single function, `model::annualize_matrix`/`annualize_scalar`,
+now parameterized by `Frequency` instead of a bare constant.
+
+**`examples/*_weekly.json`** run the same 10-stock portfolio at
+`Weekly`/156 for comparison against the `Daily`/252 default.
+
+### Daily vs. Weekly comparison (10-stock Nifty portfolio, live data, run 2026-09-24)
+
+Betas on USDINR / BRENT / GOLD / RATES_PROXY (MARKET omitted — large and
+stable across both frequencies, ~0.7-1.1 for all ten names):
+
+| ticker | USDINR (D) | USDINR (W) | BRENT (D) | BRENT (W) | GOLD (D) | GOLD (W) | RATES_PROXY (D) | RATES_PROXY (W) |
+|---|---|---|---|---|---|---|---|---|
+| RELIANCE.NS | -0.059 | -0.505 | -0.011 | 0.046 | -0.016 | -0.083 | -0.732 | -0.597 |
+| HDFCBANK.NS | 0.021 | 0.166 | 0.016 | -0.021 | -0.038 | 0.017 | 0.668 | 1.080 |
+| ICICIBANK.NS | 0.205 | -0.384 | -0.012 | 0.004 | -0.033 | -0.031 | 0.868 | 0.928 |
+| INFY.NS | -0.207 | -0.156 | 0.022 | 0.002 | -0.051 | -0.117 | -1.342 | -1.257 |
+| TCS.NS | -0.364 | 0.085 | -0.002 | 0.022 | -0.052 | 0.029 | -1.333 | -0.974 |
+| LT.NS | 0.093 | 0.106 | -0.003 | -0.005 | 0.020 | -0.019 | -0.037 | 0.292 |
+| ITC.NS | -0.050 | 0.388 | -0.004 | -0.023 | -0.046 | 0.074 | -0.573 | -0.573 |
+| KOTAKBANK.NS | 0.244 | -0.109 | -0.002 | 0.005 | 0.037 | 0.127 | 0.416 | 0.413 |
+| BHARTIARTL.NS | 0.067 | -0.268 | 0.036 | 0.042 | 0.035 | 0.009 | -0.547 | -0.580 |
+| TMPV.NS | 0.083 | 1.225 | -0.052 | -0.086 | -0.060 | -0.111 | -0.011 | -0.760 |
+
+**Takeaway:** the USDINR and RATES_PROXY betas are noticeably less stable
+across frequency than MARKET (expected — currency and rate-proxy signal is
+noisier per-name and weekly regressions have ~6x fewer observations per
+year); BRENT and GOLD betas are small and noisy at both frequencies (no
+stock in this portfolio has meaningfully commodity-linked earnings).
+Shrinkage intensity is higher weekly (0.053) than daily (0.038), consistent
+with a noisier per-period factor covariance estimate needing more
+shrinkage toward the target.
+
+Factor correlation matrix (Daily / Weekly, same order MARKET, USDINR,
+BRENT, GOLD, RATES_PROXY):
+
+```
+Daily                                    Weekly
+         MKT   USD   BRT   GLD   RTP              MKT   USD   BRT   GLD   RTP
+MKT    1.00 -0.28 -0.27  0.24  0.20     MKT     1.00 -0.23 -0.29  0.04  0.04
+USD   -0.28  1.00  0.23 -0.19 -0.02     USD    -0.23  1.00  0.24 -0.04 -0.04
+BRT   -0.27  0.23  1.00 -0.17 -0.19     BRT    -0.29  0.24  1.00 -0.08 -0.14
+GLD    0.24 -0.19 -0.17  1.00  0.11     GLD     0.04 -0.04 -0.08  1.00 -0.03
+RTP    0.20 -0.02 -0.19  0.11  1.00     RTP     0.04 -0.04 -0.14 -0.03  1.00
+```
+
+MARKET/USDINR and MARKET/BRENT correlations are stable in sign and
+magnitude across frequency (~-0.23 to -0.29); GOLD's and RATES_PROXY's
+correlations with everything else shrink toward zero weekly, consistent
+with those being the noisiest factor pair at daily frequency (aliased
+short-horizon noise that partially cancels over a week).
+
+FactorShock (Nifty -12%, Brent +20%, propagate=true) implied moves:
+
+| factor | Daily | Weekly |
+|---|---|---|
+| USDINR | +2.42% | +1.63% |
+| GOLD | -6.34% | -1.12% |
+| RATES_PROXY | -1.79% | -0.67% |
+| portfolio P&L (INR) | -1,175,389 | -1,132,802 |
+
+RiskDecomposition shares (`fraction_of_vol`):
+
+| | Daily | Weekly |
+|---|---|---|
+| portfolio vol (annualized) | 15.52% | 13.50% |
+| MARKET | 82.4% | 82.2% |
+| specific risk | 18.8% | 17.4% |
+| USDINR / BRENT / GOLD / RATES_PROXY (combined) | -1.2% | 0.4% |
+
+Vol estimates are reasonably close (15.5% vs 13.5%); the systematic/specific
+split is nearly identical (~82/18 both ways), which is the most
+frequency-robust number here. **Not changing the default** pending review —
+Daily/252 stays the default per the spec until you confirm one way or the
+other; Weekly's much smaller effective sample (260 weeks in a 5y fetch vs.
+1235 days) makes its factor-covariance and small-beta estimates visibly
+noisier, which shows up as instability in the USDINR/RATES_PROXY betas
+above.
+
+### `INR=X` vs. `USDINR=X`
+
+Checked both tickers against the `^NSEI` master calendar over the same 5y
+fetch: identical raw observation counts (1300), identical missing-date sets
+relative to NSEI (149 dates each), and identical gap-run-length histograms
+(all singleton 1-day gaps, no clustering — `Counter({1: 149})` for both).
+No behavioral difference; kept `INR=X` (already in use, and the shorter of
+the two equivalent tickers).
+
 ## Tests
 
 ```

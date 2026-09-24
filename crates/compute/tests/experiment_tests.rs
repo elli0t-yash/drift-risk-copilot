@@ -16,13 +16,14 @@ fn two_stock_model() -> (compute::data::MarketData, compute::model::FactorModel)
     ];
     let data = common::synthetic_multi_stock(&stocks, 300, 0.0008, 123);
     let tickers = vec!["AAA".to_string(), "BBB".to_string()];
-    let model = fit_factor_model(&data, &tickers, 252).unwrap();
+    let model = fit_factor_model(&data, &tickers, 252, compute::model::Frequency::Daily).unwrap();
     (data, model)
 }
 
 fn data_window(data: &compute::data::MarketData, window: usize) -> DataWindow {
     DataWindow {
-        window_days: window,
+        frequency: compute::model::Frequency::Daily,
+        window_periods: window,
         start: data.dates[data.dates.len() - window],
         end: *data.dates.last().unwrap(),
     }
@@ -46,7 +47,8 @@ fn euler_contributions_sum_to_portfolio_vol_stock_and_factor_views() {
     };
     let input = RiskDecompositionInput {
         portfolio,
-        window: 252,
+        frequency: compute::model::Frequency::Daily,
+        window: Some(252),
     };
 
     let (output, trace) =
@@ -88,7 +90,8 @@ fn factor_shock_pnl_is_linear_in_shock_size() {
         portfolio: portfolio.clone(),
         shocks_pct: shocks.clone(),
         propagate: false,
-        window: 252,
+        frequency: compute::model::Frequency::Daily,
+        window: Some(252),
     };
     let mut shocks2 = shocks.clone();
     *shocks2.get_mut("MARKET").unwrap() *= 2.0;
@@ -96,7 +99,8 @@ fn factor_shock_pnl_is_linear_in_shock_size() {
         portfolio,
         shocks_pct: shocks2,
         propagate: false,
-        window: 252,
+        frequency: compute::model::Frequency::Daily,
+        window: Some(252),
     };
 
     let (out1, trace1) =
@@ -145,7 +149,8 @@ fn conditional_propagation_is_noop_when_all_factors_given() {
         portfolio,
         shocks_pct: shocks,
         propagate: true,
-        window: 252,
+        frequency: compute::model::Frequency::Daily,
+        window: Some(252),
     };
 
     let (output, _) =

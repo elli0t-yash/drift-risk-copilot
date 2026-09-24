@@ -30,9 +30,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raw = std::fs::read_to_string(&args.input)?;
     let experiment: Experiment = serde_json::from_str(&raw)?;
 
-    let (portfolio, window) = match &experiment {
-        Experiment::FactorShock(i) => (&i.portfolio, i.window),
-        Experiment::RiskDecomposition(i) => (&i.portfolio, i.window),
+    let (portfolio, window, frequency) = match &experiment {
+        Experiment::FactorShock(i) => (&i.portfolio, i.resolved_window(), i.frequency),
+        Experiment::RiskDecomposition(i) => (&i.portfolio, i.resolved_window(), i.frequency),
         Experiment::CvarRebalance(_) => {
             eprintln!("CvarRebalance is a design note only in this checkpoint; not implemented.");
             std::process::exit(1);
@@ -40,11 +40,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let tickers = portfolio.tickers();
-    let data = load_market_data(&args.cache_dir, &tickers, args.refresh)?;
-    let model = fit_factor_model(&data, &tickers, window)?;
+    let data = load_market_data(&args.cache_dir, &tickers, args.refresh, frequency)?;
+    let model = fit_factor_model(&data, &tickers, window, frequency)?;
 
     let data_window = DataWindow {
-        window_days: window,
+        frequency,
+        window_periods: window,
         start: data.dates[data.dates.len() - window],
         end: *data.dates.last().unwrap(),
     };

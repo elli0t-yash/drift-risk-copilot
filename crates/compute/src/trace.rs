@@ -7,17 +7,20 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 use crate::data::DataQuality;
+use crate::model::Frequency;
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct DataWindow {
-    pub window_days: usize,
+    pub frequency: Frequency,
+    pub window_periods: usize,
     pub start: NaiveDate,
     pub end: NaiveDate,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ModelParams {
-    pub window_days: usize,
+    pub frequency: Frequency,
+    pub window_periods: usize,
     pub factor_names: Vec<String>,
     pub shrinkage_intensity: f64,
     pub annualization_factor: f64,

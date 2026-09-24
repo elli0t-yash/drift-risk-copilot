@@ -17,7 +17,7 @@ fn ols_recovers_known_betas() {
     );
 
     let tickers = vec!["TEST".to_string()];
-    let model = fit_factor_model(&data, &tickers, 252).expect("fit should succeed");
+    let model = fit_factor_model(&data, &tickers, 252, compute::model::Frequency::Daily).expect("fit should succeed");
 
     let fit = &model.fits[0];
     assert_eq!(fit.betas.len(), 5);
@@ -40,7 +40,7 @@ fn ledoit_wolf_shrinkage_in_unit_interval_and_psd() {
     let true_betas = [0.8, 0.1, -0.2, 0.3, -0.1];
     let data = common::synthetic_single_stock("TEST", 0.0, &true_betas, 300, 0.001, 7);
     let tickers = vec!["TEST".to_string()];
-    let model = fit_factor_model(&data, &tickers, 252).unwrap();
+    let model = fit_factor_model(&data, &tickers, 252, compute::model::Frequency::Daily).unwrap();
 
     assert!(
         (0.0..=1.0).contains(&model.shrinkage_intensity),

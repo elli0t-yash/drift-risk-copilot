@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::data::{DataQuality, FACTOR_NAMES};
 use crate::error::{ComputeError, Result};
-use crate::model::{annualize_scalar, FactorModel};
+use crate::model::{annualize_scalar, FactorModel, Frequency};
 use crate::trace::{DataWindow, EvidenceTrace, InvariantCheck, ModelParams};
 
 /// One portfolio line: ticker plus portfolio weight (fraction of total
@@ -66,12 +66,22 @@ pub struct FactorShockInput {
     /// When false, unshocked factors are held at zero.
     #[serde(default = "default_true")]
     pub propagate: bool,
-    #[serde(default = "crate::model::default_window")]
-    pub window: usize,
+    #[serde(default)]
+    pub frequency: Frequency,
+    /// Trailing window in periods at `frequency`. Defaults to
+    /// `frequency.default_window()` (252 daily, 156 weekly) when omitted.
+    #[serde(default)]
+    pub window: Option<usize>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+impl FactorShockInput {
+    pub fn resolved_window(&self) -> usize {
+        self.window.unwrap_or_else(|| self.frequency.default_window())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -239,10 +249,11 @@ pub fn run_factor_shock(
         data_window,
         data_quality: data_quality.clone(),
         model_params: ModelParams {
-            window_days: model.window,
+            frequency: model.frequency,
+            window_periods: model.window,
             factor_names: factor_names.clone(),
             shrinkage_intensity: model.shrinkage_intensity,
-            annualization_factor: crate::model::ANNUALIZATION_FACTOR,
+            annualization_factor: model.frequency.annualization_factor(),
         },
         outputs: serde_json::json!({
             "result": output,
@@ -263,8 +274,18 @@ pub fn run_factor_shock(
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RiskDecompositionInput {
     pub portfolio: Portfolio,
-    #[serde(default = "crate::model::default_window")]
-    pub window: usize,
+    #[serde(default)]
+    pub frequency: Frequency,
+    /// Trailing window in periods at `frequency`. Defaults to
+    /// `frequency.default_window()` (252 daily, 156 weekly) when omitted.
+    #[serde(default)]
+    pub window: Option<usize>,
+}
+
+impl RiskDecompositionInput {
+    pub fn resolved_window(&self) -> usize {
+        self.window.unwrap_or_else(|| self.frequency.default_window())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -343,7 +364,8 @@ pub fn run_risk_decomposition(
 
     let specific_variance_contribution: f64 = (0..n)
         .map(|i| {
-            let d_i_annual = annualize_scalar(model.fits[i].residual_variance_daily);
+            let d_i_annual =
+                annualize_scalar(model.fits[i].residual_variance_daily, model.frequency);
             w[i] * w[i] * d_i_annual
         })
         .sum();
@@ -385,10 +407,11 @@ pub fn run_risk_decomposition(
         data_window,
         data_quality: data_quality.clone(),
         model_params: ModelParams {
-            window_days: model.window,
+            frequency: model.frequency,
+            window_periods: model.window,
             factor_names,
             shrinkage_intensity: model.shrinkage_intensity,
-            annualization_factor: crate::model::ANNUALIZATION_FACTOR,
+            annualization_factor: model.frequency.annualization_factor(),
         },
         outputs: serde_json::to_value(&output)?,
         invariants,

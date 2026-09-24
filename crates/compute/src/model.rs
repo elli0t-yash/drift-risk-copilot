@@ -3,30 +3,60 @@
 //! covariance Sigma = B F B^T + D.
 
 use nalgebra::{DMatrix, DVector};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 use crate::data::{MarketData, FACTOR_NAMES};
 use crate::error::{ComputeError, Result};
 
-/// Trading days per year. This is the single place the annualization
-/// factor is applied: everything upstream (OLS, Ledoit-Wolf shrinkage) is
-/// computed on daily log returns, and `annualize_matrix`/`annualize_scalar`
-/// are the only functions that scale a daily (co)variance into annual terms.
-pub const ANNUALIZATION_FACTOR: f64 = 252.0;
-
-pub fn annualize_scalar(daily_variance: f64) -> f64 {
-    daily_variance * ANNUALIZATION_FACTOR
+/// Return frequency the factor model is fit at. Non-overlapping: `Weekly`
+/// returns are computed between successive week-end closes, not a rolling
+/// 5-day window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+pub enum Frequency {
+    #[default]
+    Daily,
+    Weekly,
 }
 
-pub fn annualize_matrix(daily_covariance: &DMatrix<f64>) -> DMatrix<f64> {
-    daily_covariance * ANNUALIZATION_FACTOR
+impl Frequency {
+    /// Periods per year at this frequency. This is the single place the
+    /// annualization factor is defined: everything upstream (OLS,
+    /// Ledoit-Wolf shrinkage) is computed on period returns at whatever
+    /// frequency was chosen, and `annualize_matrix`/`annualize_scalar` are
+    /// the only functions that scale a period (co)variance into annual
+    /// terms, using this value.
+    pub fn annualization_factor(&self) -> f64 {
+        match self {
+            Frequency::Daily => 252.0,
+            Frequency::Weekly => 52.0,
+        }
+    }
+
+    /// Default trailing window, in periods at this frequency: 252 trading
+    /// days, or 156 weeks (~3 years, chosen to keep a comparable number of
+    /// independent observations to the daily 252-day/~1yr default given
+    /// weekly data's lower observation density).
+    pub fn default_window(&self) -> usize {
+        match self {
+            Frequency::Daily => 252,
+            Frequency::Weekly => 156,
+        }
+    }
 }
 
-/// Default trailing window (trading days) for OLS and factor covariance.
-pub const DEFAULT_WINDOW: usize = 252;
+pub fn annualize_scalar(period_variance: f64, frequency: Frequency) -> f64 {
+    period_variance * frequency.annualization_factor()
+}
 
-/// serde `default =` helper: default trailing window for experiment inputs.
+pub fn annualize_matrix(period_covariance: &DMatrix<f64>, frequency: Frequency) -> DMatrix<f64> {
+    period_covariance * frequency.annualization_factor()
+}
+
+/// serde `default =` helper: default trailing window for experiment inputs
+/// (daily convention; callers on `Frequency::Weekly` should override).
 pub fn default_window() -> usize {
-    DEFAULT_WINDOW
+    Frequency::Daily.default_window()
 }
 
 /// Per-stock OLS fit against the five fixed factors.
@@ -44,11 +74,12 @@ pub struct StockFit {
 
 /// The fitted factor model for a set of stocks over a trailing window.
 pub struct FactorModel {
+    pub frequency: Frequency,
     pub window: usize,
     pub tickers: Vec<String>,
     pub fits: Vec<StockFit>,
-    /// Daily factor covariance after Ledoit-Wolf shrinkage, in
-    /// `FACTOR_NAMES` order (rows/cols).
+    /// Per-period (daily or weekly, per `frequency`) factor covariance
+    /// after Ledoit-Wolf shrinkage, in `FACTOR_NAMES` order (rows/cols).
     pub factor_covariance_daily: DMatrix<f64>,
     pub shrinkage_intensity: f64,
 }
@@ -61,7 +92,7 @@ impl FactorModel {
         DMatrix::from_fn(n, k, |i, j| self.fits[i].betas[j])
     }
 
-    /// Diagonal matrix D of daily residual variances (n_stocks x n_stocks).
+    /// Diagonal matrix D of per-period residual variances (n_stocks x n_stocks).
     pub fn residual_matrix_daily(&self) -> DMatrix<f64> {
         let n = self.fits.len();
         DMatrix::from_fn(n, n, |i, j| {
@@ -78,13 +109,13 @@ impl FactorModel {
         let b = self.beta_matrix();
         let f = &self.factor_covariance_daily;
         let d = self.residual_matrix_daily();
-        let daily_sigma = &b * f * b.transpose() + d;
-        annualize_matrix(&daily_sigma)
+        let period_sigma = &b * f * b.transpose() + d;
+        annualize_matrix(&period_sigma, self.frequency)
     }
 
     /// Annualized factor covariance F.
     pub fn factor_covariance(&self) -> DMatrix<f64> {
-        annualize_matrix(&self.factor_covariance_daily)
+        annualize_matrix(&self.factor_covariance_daily, self.frequency)
     }
 }
 
@@ -181,12 +212,14 @@ pub fn ledoit_wolf_shrink_identity(data: &DMatrix<f64>) -> (DMatrix<f64>, f64) {
     (shrunk, shrinkage)
 }
 
-/// Fits the factor model for `tickers` over the trailing `window` trading
-/// days of `data` (the most recent `window` return observations).
+/// Fits the factor model for `tickers` over the trailing `window` periods
+/// (trading days or weeks, per `frequency`) of `data` (the most recent
+/// `window` return observations, which must already be at `frequency`).
 pub fn fit_factor_model(
     data: &MarketData,
     tickers: &[String],
     window: usize,
+    frequency: Frequency,
 ) -> Result<FactorModel> {
     let factor_matrices: Vec<&Vec<f64>> = FACTOR_NAMES
         .iter()
@@ -240,6 +273,7 @@ pub fn fit_factor_model(
     }
 
     Ok(FactorModel {
+        frequency,
         window,
         tickers: tickers.to_vec(),
         fits,

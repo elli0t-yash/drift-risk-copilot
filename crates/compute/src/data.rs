@@ -1,6 +1,7 @@
 //! Data layer: fetches daily adjusted-close series from Yahoo Finance,
 //! caches them to disk, aligns them onto the NSE trading calendar, and
-//! derives the daily log-return series used by the factor model.
+//! derives the daily- or weekly-frequency log-return series used by the
+//! factor model (see `to_returns`).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -73,14 +74,28 @@ pub struct DataQuality {
 
 /// Aligned, return-space dataset ready for factor-model fitting.
 ///
-/// `dates` is the master NSE calendar (length = returns rows + 1, since a
-/// return needs a prior price). `stock_returns` and `factor_returns` are
+/// `dates` is the master NSE calendar at the chosen `frequency` (length =
+/// returns rows + 1, since a return needs a prior price): every daily
+/// trading day for `Frequency::Daily`, or the last NSE trading day of each
+/// week for `Frequency::Weekly`. `stock_returns` and `factor_returns` are
 /// keyed by ticker (stocks) / factor name (factors) and are all the same
 /// length, aligned to `dates[1..]`.
 pub struct MarketData {
     pub dates: Vec<NaiveDate>,
     pub stock_returns: BTreeMap<String, Vec<f64>>,
     pub factor_returns: BTreeMap<String, Vec<f64>>,
+    pub quality: DataQuality,
+}
+
+/// Daily-aligned adjusted closes for every requested stock and factor
+/// ticker, on the NSE (`^NSEI`) master calendar, forward-filled per
+/// `align_to_calendar`. This is the frequency-independent intermediate:
+/// `MarketData` (daily or weekly log returns) is derived from it by
+/// `to_returns`.
+pub struct AlignedPrices {
+    pub dates: Vec<NaiveDate>,
+    pub stock_closes: BTreeMap<String, Vec<f64>>,
+    pub factor_closes: BTreeMap<String, Vec<f64>>,
     pub quality: DataQuality,
 }
 
@@ -294,31 +309,20 @@ fn align_to_calendar(
     (aligned, fills, drops)
 }
 
-fn log_returns(prices: &[Option<f64>]) -> Result<Vec<f64>> {
-    let mut out = Vec::with_capacity(prices.len().saturating_sub(1));
-    for w in prices.windows(2) {
-        match (w[0], w[1]) {
-            (Some(p0), Some(p1)) if p0 > 0.0 && p1 > 0.0 => out.push((p1 / p0).ln()),
-            _ => {
-                return Err(ComputeError::Data(
-                    "cannot compute log return across a dropped/missing price; \
-                     trim the calendar or lengthen the fetch window"
-                        .to_string(),
-                ))
-            }
-        }
-    }
-    Ok(out)
+fn log_returns(prices: &[f64]) -> Vec<f64> {
+    prices.windows(2).map(|w| (w[1] / w[0]).ln()).collect()
 }
 
-/// Loads and aligns everything needed to fit the factor model: the given
-/// stock tickers (holdings) plus the five fixed factor tickers, on the NSE
-/// (`^NSEI`) trading calendar, forward-filled per `align_to_calendar`.
-pub fn load_market_data(
+/// Loads and aligns daily adjusted closes for everything needed to fit the
+/// factor model: the given stock tickers (holdings) plus the five fixed
+/// factor tickers, on the NSE (`^NSEI`) trading calendar, forward-filled
+/// per `align_to_calendar`. Frequency-independent; see `to_returns` for the
+/// daily/weekly log-return derivation.
+pub fn load_aligned_prices(
     cache_dir: &Path,
     stock_tickers: &[String],
     refresh: bool,
-) -> Result<MarketData> {
+) -> Result<AlignedPrices> {
     let market_series = load_series(cache_dir, MARKET, refresh)?;
     let mut calendar = market_series.dates.clone();
     calendar.sort();
@@ -366,12 +370,16 @@ pub fn load_market_data(
         *closes = closes[start_idx..].to_vec();
     }
 
-    let mut stock_returns = BTreeMap::new();
+    let mut stock_closes = BTreeMap::new();
     for ticker in stock_tickers {
         let closes = aligned_closes
             .get(ticker)
             .ok_or_else(|| ComputeError::Data(format!("missing series for {ticker}")))?;
-        stock_returns.insert(ticker.clone(), log_returns(closes)?);
+        let closes: Vec<f64> = closes
+            .iter()
+            .map(|c| c.expect("trimmed to a common non-None prefix"))
+            .collect();
+        stock_closes.insert(ticker.clone(), closes);
     }
 
     let mut factor_closes = BTreeMap::new();
@@ -379,14 +387,102 @@ pub fn load_market_data(
         let closes = aligned_closes
             .get(ticker)
             .ok_or_else(|| ComputeError::Data(format!("missing factor series for {ticker}")))?;
-        factor_closes.insert(ticker.to_string(), log_returns(closes)?);
+        let closes: Vec<f64> = closes
+            .iter()
+            .map(|c| c.expect("trimmed to a common non-None prefix"))
+            .collect();
+        factor_closes.insert(ticker.to_string(), closes);
     }
 
-    let market_ret = factor_closes.remove(MARKET).unwrap();
-    let usdinr_ret = factor_closes.remove(USDINR).unwrap();
-    let brent_ret = factor_closes.remove(BRENT).unwrap();
-    let gold_ret = factor_closes.remove(GOLD).unwrap();
-    let bank_ret = factor_closes.remove(BANK).unwrap();
+    let quality = DataQuality {
+        date_range_start: *calendar.first().unwrap(),
+        date_range_end: *calendar.last().unwrap(),
+        trading_days: calendar.len(),
+        per_series: per_series_quality,
+    };
+
+    Ok(AlignedPrices {
+        dates: calendar,
+        stock_closes,
+        factor_closes,
+        quality,
+    })
+}
+
+/// Keeps only the last daily observation in each ISO (year, week) group,
+/// i.e. the last NSE trading day of each week (usually Friday, but a
+/// holiday-shortened week keeps whatever day is last). Non-overlapping by
+/// construction: each week contributes exactly one point.
+fn weekly_resample_indices(dates: &[NaiveDate]) -> Vec<usize> {
+    use chrono::Datelike;
+    let mut indices = Vec::new();
+    for i in 0..dates.len() {
+        let this_week = dates[i].iso_week();
+        let is_last_of_week = match dates.get(i + 1) {
+            Some(next) => next.iso_week() != this_week,
+            None => true,
+        };
+        if is_last_of_week {
+            indices.push(i);
+        }
+    }
+    indices
+}
+
+/// Derives daily or (non-overlapping, weekly-resampled) log-return series
+/// from `prices`, computing `RATES_PROXY` = NIFTY BANK return - NIFTY 50
+/// return at that same frequency.
+type CloseSeriesByTicker = BTreeMap<String, Vec<f64>>;
+
+pub fn to_returns(prices: &AlignedPrices, frequency: crate::model::Frequency) -> MarketData {
+    let (dates, stock_closes, factor_closes, quality): (
+        Vec<NaiveDate>,
+        CloseSeriesByTicker,
+        CloseSeriesByTicker,
+        DataQuality,
+    ) = match frequency {
+        crate::model::Frequency::Daily => (
+            prices.dates.clone(),
+            prices.stock_closes.clone(),
+            prices.factor_closes.clone(),
+            prices.quality.clone(),
+        ),
+        crate::model::Frequency::Weekly => {
+            let idx = weekly_resample_indices(&prices.dates);
+            let dates: Vec<NaiveDate> = idx.iter().map(|&i| prices.dates[i]).collect();
+            let resample = |series: &Vec<f64>| -> Vec<f64> {
+                idx.iter().map(|&i| series[i]).collect()
+            };
+            let stock_closes = prices
+                .stock_closes
+                .iter()
+                .map(|(k, v)| (k.clone(), resample(v)))
+                .collect();
+            let factor_closes = prices
+                .factor_closes
+                .iter()
+                .map(|(k, v)| (k.clone(), resample(v)))
+                .collect();
+            let quality = DataQuality {
+                date_range_start: *dates.first().unwrap(),
+                date_range_end: *dates.last().unwrap(),
+                trading_days: dates.len(),
+                per_series: prices.quality.per_series.clone(),
+            };
+            (dates, stock_closes, factor_closes, quality)
+        }
+    };
+
+    let mut stock_returns = BTreeMap::new();
+    for (ticker, closes) in &stock_closes {
+        stock_returns.insert(ticker.clone(), log_returns(closes));
+    }
+
+    let market_ret = log_returns(&factor_closes[MARKET]);
+    let usdinr_ret = log_returns(&factor_closes[USDINR]);
+    let brent_ret = log_returns(&factor_closes[BRENT]);
+    let gold_ret = log_returns(&factor_closes[GOLD]);
+    let bank_ret = log_returns(&factor_closes[BANK]);
 
     let rates_proxy_ret: Vec<f64> = bank_ret
         .iter()
@@ -401,17 +497,51 @@ pub fn load_market_data(
     factor_returns.insert("GOLD".to_string(), gold_ret);
     factor_returns.insert(RATES_PROXY.to_string(), rates_proxy_ret);
 
-    let quality = DataQuality {
-        date_range_start: *calendar.first().unwrap(),
-        date_range_end: *calendar.last().unwrap(),
-        trading_days: calendar.len(),
-        per_series: per_series_quality,
-    };
-
-    Ok(MarketData {
-        dates: calendar,
+    MarketData {
+        dates,
         stock_returns,
         factor_returns,
         quality,
-    })
+    }
+}
+
+/// Convenience wrapper: loads aligned daily prices and derives returns at
+/// `frequency` in one call.
+pub fn load_market_data(
+    cache_dir: &Path,
+    stock_tickers: &[String],
+    refresh: bool,
+    frequency: crate::model::Frequency,
+) -> Result<MarketData> {
+    let prices = load_aligned_prices(cache_dir, stock_tickers, refresh)?;
+    Ok(to_returns(&prices, frequency))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn weekly_resample_keeps_last_trading_day_of_each_week() {
+        // Mon 2024-01-01 .. Fri 2024-01-05 (full week), then Mon 2024-01-08,
+        // Tue 2024-01-09 (a holiday-shortened second week ending Tuesday).
+        let dates = vec![
+            NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 1, 3).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 1, 4).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 1, 5).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 1, 8).unwrap(),
+            NaiveDate::from_ymd_opt(2024, 1, 9).unwrap(),
+        ];
+        let idx = weekly_resample_indices(&dates);
+        let kept: Vec<NaiveDate> = idx.iter().map(|&i| dates[i]).collect();
+        assert_eq!(
+            kept,
+            vec![
+                NaiveDate::from_ymd_opt(2024, 1, 5).unwrap(),
+                NaiveDate::from_ymd_opt(2024, 1, 9).unwrap(),
+            ]
+        );
+    }
 }
