@@ -1059,6 +1059,83 @@
           ]
         }
       ]
+    },
+    {
+      "name": "11. Portfolio Performance",
+      "item": [
+        {
+          "name": "a. POST /experiment - direct",
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"experiment\": {\n    \"type\": \"PortfolioPerformance\"\n  }\n}",
+              "options": {"raw": {"language": "json"}}
+            },
+            "url": {"raw": "{{base_url}}/experiment", "host": ["{{base_url}}"], "path": ["experiment"]}
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('outputs.result has total_return and max_drawdown', () => {",
+                  "    const out = pm.response.json().outputs.result;",
+                  "    pm.expect(out.total_return).to.be.a('number');",
+                  "    pm.expect(out.max_drawdown).to.be.a('number');",
+                  "    pm.expect(out.max_drawdown).to.be.at.most(0);",
+                  "});",
+                  "pm.test('end_value invariant passed', () => {",
+                  "    const inv = pm.response.json().invariants.find(i => i.name.includes('end_value_inr'));",
+                  "    pm.expect(inv, 'invariant not found').to.exist;",
+                  "    pm.expect(inv.passed).to.be.true;",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "b. POST /ask - How has my portfolio performed lately?",
+          "request": {
+            "method": "POST",
+            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"message\": \"How is my portfolio performing recently in terms of market trends?\"\n}",
+              "options": {"raw": {"language": "json"}}
+            },
+            "url": {"raw": "{{base_url}}/ask", "host": ["{{base_url}}"], "path": ["ask"]}
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Regression test: this exact style of question (asking about realized",
+                  "// portfolio performance/returns, not a hypothetical shock, current risk,",
+                  "// or a rebalance) used to return 422 unrecognised_request, because no",
+                  "// experiment computed historical returns at all. Fixed by adding a fourth",
+                  "// experiment, PortfolioPerformance.",
+                  "pm.test('status 200 (not 422)', () => pm.response.to.have.status(200));",
+                  "pm.test('experiment.type === \"PortfolioPerformance\"', () => {",
+                  "    pm.expect(pm.response.json().experiment.type).to.eql('PortfolioPerformance');",
+                  "});",
+                  "pm.test('narration is a non-empty string', () => {",
+                  "    const n = pm.response.json().narration;",
+                  "    pm.expect(n).to.be.a('string');",
+                  "    pm.expect(n.length).to.be.above(0);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
     }
   ]
 }

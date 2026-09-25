@@ -2,7 +2,10 @@ mod support;
 
 use agent::conversation::ConversationTurn;
 use agent::parse::{parse_experiment, ParseError};
-use agent::schema::{CVAR_REBALANCE_FUNCTION, FACTOR_SHOCK_FUNCTION, RISK_DECOMPOSITION_FUNCTION};
+use agent::schema::{
+    CVAR_REBALANCE_FUNCTION, FACTOR_SHOCK_FUNCTION, PORTFOLIO_PERFORMANCE_FUNCTION,
+    RISK_DECOMPOSITION_FUNCTION,
+};
 use compute::experiments::{Experiment, Holding, Portfolio};
 use support::{function_call_response, text_response, MockGeminiClient};
 
@@ -62,6 +65,30 @@ async fn parses_risk_decomposition_function_call() {
             assert_eq!(input.portfolio.tickers(), portfolio.tickers());
         }
         other => panic!("expected RiskDecomposition, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn parses_portfolio_performance_function_call() {
+    let args = serde_json::json!({});
+    let client =
+        MockGeminiClient::new(vec![function_call_response(PORTFOLIO_PERFORMANCE_FUNCTION, args)]);
+
+    let portfolio = two_stock_portfolio();
+    let experiment = parse_experiment(
+        &client,
+        "how has my portfolio been performing recently?",
+        portfolio.clone(),
+        &[],
+    )
+    .await
+    .unwrap();
+
+    match experiment {
+        Experiment::PortfolioPerformance(input) => {
+            assert_eq!(input.portfolio.tickers(), portfolio.tickers());
+        }
+        other => panic!("expected PortfolioPerformance, got {other:?}"),
     }
 }
 

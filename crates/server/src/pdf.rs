@@ -266,6 +266,34 @@ fn key_numbers(
             }
             rows
         }
+        "PortfolioPerformance" => {
+            let mut rows = vec![
+                [
+                    "Total Return".to_string(),
+                    pct(f(&["total_return"]).unwrap_or(0.0)),
+                    "%".to_string(),
+                ],
+                [
+                    "Annualized Return".to_string(),
+                    pct(f(&["annualized_return"]).unwrap_or(0.0)),
+                    "%".to_string(),
+                ],
+                [
+                    "Annualized Vol (realized)".to_string(),
+                    pct(f(&["annualized_vol_realized"]).unwrap_or(0.0)),
+                    "%".to_string(),
+                ],
+                [
+                    "Max Drawdown".to_string(),
+                    pct(f(&["max_drawdown"]).unwrap_or(0.0)),
+                    "%".to_string(),
+                ],
+            ];
+            if let Some(end_value) = f(&["end_value_inr"]) {
+                rows.push(["End Value".to_string(), format_inr(end_value), "\u{20b9}".to_string()]);
+            }
+            rows
+        }
         _ => vec![],
     }
 }

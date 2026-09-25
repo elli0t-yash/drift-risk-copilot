@@ -1157,3 +1157,53 @@ timestamp is `chrono::Utc::now()` at PDF-render time (which can be later
 than when the underlying `/ask` actually ran, if the result sat in the
 store for a while). Good enough for a demo; would need a real field on
 `EvidenceTrace` to be exact.
+
+## Fourth experiment: PortfolioPerformance
+
+Added in response to a real production report: a user asked "How is my
+portfolio performing right now in terms of recent market trends?" via the
+live UI and got a 422 `unrecognised_request` -- not a parsing bug, but a
+genuine capability gap. The other three experiments answer "what if"
+(FactorShock), "where's my current risk" (RiskDecomposition), and "how do
+I rebalance" (CvarRebalance); none of them compute realized historical
+returns, so `agent::parse` correctly had nothing to map that question to.
+
+`compute::performance::run_portfolio_performance` (`PortfolioPerformance`,
+a fourth `Experiment` variant) closes the gap: `total_return`,
+`annualized_return`, `annualized_vol_realized` (realized, from the actual
+period-by-period return series -- distinct from RiskDecomposition's
+factor-model-*implied* `portfolio_vol_annualized`), `max_drawdown`,
+`best_period_return`, `worst_period_return`, `start_value_inr`/
+`end_value_inr`. Wired through the same path every other experiment uses:
+`agent::schema` (`run_portfolio_performance` function declaration),
+`agent::parse` (system prompt + match arm), `agent::pipeline::compute_trace`,
+`server::pdf` (a `PortfolioPerformance` Key Numbers table), and the UI
+(needed no changes at all -- narration/suggestion/download/trace rendering
+is already experiment-agnostic).
+
+**Judgment call: constant-mix, not literal buy-and-hold.** Each period's
+portfolio return is the *current* target weights applied to that period's
+per-holding simple return, as if rebalanced back to target weights every
+period, rather than a literal share-count simulation that lets weights
+drift with prices. This is a real simplification (it modestly
+understates/overstates drift-related effects vs. true buy-and-hold), but
+it's the only option available without a new data source: past the data
+layer (`compute::data`), only aligned *log returns* survive, not raw
+per-share prices, and every other experiment in this codebase already
+treats "the portfolio's weights" as the snapshot to analyze, not a
+historical share-count schedule to reconstruct. Documented in the trace's
+`outputs.note` field, not just here.
+
+**Live-verified** (real Gemini, real Yahoo data): the exact failing
+question now returns 200 with `experiment.type: "PortfolioPerformance"`
+and a real narrated answer (`total_return -16.27%`, `max_drawdown -19.66%`
+on the 10-stock Nifty portfolio's trailing 252 trading days). PDF report
+generation also confirmed working for the new experiment type. Tests: 3
+new `compute` tests (constant-return compounding is exact, a V-shaped
+return path is correctly flagged as a deep drawdown despite ending near
+zero, and the trace's own value invariant holds for a multi-holding
+portfolio) and 1 new `agent` parse test (mocked Gemini calling
+`run_portfolio_performance`). Postman: a new "11. Portfolio Performance"
+folder, including the exact regression case (this question used to 422,
+now returns 200) -- full collection re-run clean, 30/30 requests, 92/92
+assertions.

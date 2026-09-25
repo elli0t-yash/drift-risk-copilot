@@ -18,7 +18,9 @@
 
 use std::collections::HashMap;
 
-use compute::experiments::{CvarRebalanceInput, FactorShockInput, RiskDecompositionInput};
+use compute::experiments::{
+    CvarRebalanceInput, FactorShockInput, PortfolioPerformanceInput, RiskDecompositionInput,
+};
 use serde_json::Value;
 
 use crate::gemini::FunctionDeclaration;
@@ -26,6 +28,7 @@ use crate::gemini::FunctionDeclaration;
 pub const FACTOR_SHOCK_FUNCTION: &str = "run_factor_shock";
 pub const RISK_DECOMPOSITION_FUNCTION: &str = "run_risk_decomposition";
 pub const CVAR_REBALANCE_FUNCTION: &str = "run_cvar_rebalance";
+pub const PORTFOLIO_PERFORMANCE_FUNCTION: &str = "run_portfolio_performance";
 
 /// Fields the caller supplies out-of-band (portfolio holdings/weights) and
 /// that are therefore stripped from the schema shown to Gemini, so a small
@@ -73,6 +76,18 @@ pub fn experiment_function_declarations() -> Vec<FunctionDeclaration> {
                 or risk budget."
                 .to_string(),
             parameters: sanitized_schema::<CvarRebalanceInput>(),
+        },
+        FunctionDeclaration {
+            name: PORTFOLIO_PERFORMANCE_FUNCTION.to_string(),
+            description: "Parse the user's request into PortfolioPerformance parameters. \
+                Portfolio holdings and weights are provided separately; only extract the \
+                (optional) frequency/window parameters from the user's text, if any are \
+                mentioned. Use this when the user asks how their portfolio has actually been \
+                doing, its returns, gains/losses, or drawdown over some recent period -- \
+                anything about realized historical performance, not a hypothetical shock, a \
+                current risk breakdown, or a rebalance."
+                .to_string(),
+            parameters: sanitized_schema::<PortfolioPerformanceInput>(),
         },
     ]
 }

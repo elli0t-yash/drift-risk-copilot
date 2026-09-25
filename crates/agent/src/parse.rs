@@ -1,28 +1,31 @@
 //! Natural-language -> `Experiment` extraction via a single Gemini
 //! function-calling turn.
 
-use compute::experiments::{CvarRebalanceInput, Experiment, FactorShockInput, Portfolio, RiskDecompositionInput};
+use compute::experiments::{
+    CvarRebalanceInput, Experiment, FactorShockInput, Portfolio, PortfolioPerformanceInput,
+    RiskDecompositionInput,
+};
 use thiserror::Error;
 
 use crate::conversation::{turn_to_content, ConversationTurn};
 use crate::gemini::{Content, GeminiClient, GeminiError, GeminiRequest, Part, Tool};
 use crate::schema::{
     experiment_function_declarations, CVAR_REBALANCE_FUNCTION, FACTOR_SHOCK_FUNCTION,
-    RISK_DECOMPOSITION_FUNCTION,
+    PORTFOLIO_PERFORMANCE_FUNCTION, RISK_DECOMPOSITION_FUNCTION,
 };
 
 /// Adapted from the checkpoint spec's original wording, which named a
 /// single `run_experiment` function: that design doesn't work in practice
 /// (see `schema`'s module doc — Gemini reliably drops the `"type"`
 /// discriminator from a `oneOf`-typed function's args), so this names the
-/// three real functions instead. Everything else is unchanged.
+/// real functions instead. Everything else is unchanged.
 pub const PARSE_SYSTEM_PROMPT: &str = "You are a parameter extraction engine. Your only job is \
-to call the correct function -- run_factor_shock, run_risk_decomposition, or run_cvar_rebalance \
--- with the parameters extracted from the user's message. Do not add explanation. Do not ask \
-clarifying questions. If the user's intent clearly maps to one of the three experiment types, \
-call the function. If it does not, return a text response with one sentence explaining what you \
-cannot extract. For CvarRebalance: if the user does not mention a per-name cap, omit \
-per_name_cap from the function call.";
+to call the correct function -- run_factor_shock, run_risk_decomposition, run_cvar_rebalance, or \
+run_portfolio_performance -- with the parameters extracted from the user's message. Do not add \
+explanation. Do not ask clarifying questions. If the user's intent clearly maps to one of the \
+four experiment types, call the function. If it does not, return a text response with one \
+sentence explaining what you cannot extract. For CvarRebalance: if the user does not mention a \
+per-name cap, omit per_name_cap from the function call.";
 
 #[derive(Debug, Error)]
 pub enum ParseError {
@@ -96,6 +99,9 @@ pub async fn parse_experiment<C: GeminiClient>(
                 CVAR_REBALANCE_FUNCTION => {
                     Experiment::CvarRebalance(serde_json::from_value::<CvarRebalanceInput>(args)?)
                 }
+                PORTFOLIO_PERFORMANCE_FUNCTION => Experiment::PortfolioPerformance(
+                    serde_json::from_value::<PortfolioPerformanceInput>(args)?,
+                ),
                 other => return Err(ParseError::UnexpectedFunction(other.to_string())),
             };
             return Ok(experiment);
