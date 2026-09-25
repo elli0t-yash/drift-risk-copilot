@@ -57,14 +57,6 @@ pub struct CvarRebalanceInput {
     /// Scenario window in periods; omit for the full available history.
     #[serde(default)]
     pub window: Option<usize>,
-    /// When true, fits a regime-conditional factor model (see
-    /// `model::ModelConfig`) purely for a reported sanity check —
-    /// `regime_portfolio_vol_annualized_{before,after}` in the output —
-    /// alongside the historical-scenario CVaR. This does **not** feed into
-    /// the LP or the feasibility checks: the LP always uses historical
-    /// scenarios directly, per the design note.
-    #[serde(default)]
-    pub regime_covariance: bool,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -104,10 +96,10 @@ pub struct CvarRebalanceOutput {
     /// reported alongside `stats_after.historical_cvar` (computed
     /// independently from the scenario matrix) so the two can be compared.
     pub lp_objective_cvar: Option<f64>,
-    /// `Some` only when `regime_covariance: true`: annualized portfolio
-    /// vol under the current-regime factor covariance (`sqrt(w' Sigma_regime w)`),
-    /// for `weights_before`. An informational cross-check against the
-    /// historical-scenario CVaR/VaR above, not used in the LP/feasibility.
+    /// Annualized portfolio vol under the current-regime factor covariance
+    /// (`sqrt(w' Sigma_regime w)`), for `weights_before`. An informational
+    /// cross-check against the historical-scenario CVaR/VaR above, not used
+    /// in the LP/feasibility.
     pub regime_portfolio_vol_annualized_before: Option<f64>,
     /// Same as `regime_portfolio_vol_annualized_before`, for `weights_after`
     /// (only when `status == "optimal"`).
@@ -178,28 +170,26 @@ pub fn run_cvar_rebalance(
     let weights_before: BTreeMap<String, f64> =
         tickers.iter().cloned().zip(w0.iter().copied()).collect();
 
-    // Informational only (see CvarRebalanceInput::regime_covariance doc):
-    // fits a regime-conditional factor model purely to report
-    // regime_portfolio_vol_annualized_{before,after} as a parametric
-    // cross-check alongside the historical-scenario CVaR/VaR. Never feeds
-    // the LP or the feasibility checks below.
-    let regime_model = if input.regime_covariance {
-        let regime_window = input.frequency.default_window();
-        Some(crate::model::fit_factor_model_with_config(
-            data,
-            &tickers,
-            ModelConfig::new(regime_window, input.frequency).with_regime_covariance(true),
-        )?)
-    } else {
-        None
-    };
+    // Informational only: always fits a regime-conditional factor model
+    // purely to report regime_portfolio_vol_annualized_{before,after} as a
+    // parametric cross-check alongside the historical-scenario CVaR/VaR.
+    // Never feeds the LP or the feasibility checks below. Uses the same
+    // `window` already resolved above (the CVaR scenario window, bounded by
+    // available data) rather than a fixed default, so the regime read
+    // reflects the same span the CVaR analysis itself runs over. `fit_hmm`
+    // needs >= 90 observations (`regime::N_STATES * 30`); on a window
+    // narrower than that (or any other fit failure) this degrades to `None`
+    // rather than failing the whole experiment, since it's informational
+    // only, not load-bearing for the LP/feasibility above.
+    let regime_model =
+        crate::model::fit_factor_model(data, &tickers, ModelConfig::new(window, input.frequency)).ok();
     let regime_state: Option<RegimeState> = regime_model.as_ref().and_then(|m| m.regime_state.clone());
     let regime_fallback_warnings: Vec<String> =
         regime_model.as_ref().map(|m| m.regime_fallback_warnings.clone()).unwrap_or_default();
     let regime_vol = |weights: &BTreeMap<String, f64>| -> Option<f64> {
         let m = regime_model.as_ref()?;
         // m.factor_covariance_daily (and hence stock_covariance()) is
-        // already the *current* regime's F, per fit_factor_model_with_config.
+        // already the *current* regime's F, per fit_factor_model.
         let sigma = m.stock_covariance();
         let w = DVector::from_iterator(m.tickers.len(), m.tickers.iter().map(|t| weights[t]));
         let variance = (w.transpose() * &sigma * &w)[(0, 0)];

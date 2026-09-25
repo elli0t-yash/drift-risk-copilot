@@ -53,7 +53,7 @@ pub struct PriceSeries {
 }
 
 /// Per-series data-quality accounting, surfaced in every Evidence Trace.
-#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct SeriesQuality {
     pub ticker: String,
     /// Raw observations returned by the source (or cache) before alignment.
@@ -66,7 +66,7 @@ pub struct SeriesQuality {
 }
 
 /// Aggregate data-quality report for a loaded dataset.
-#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct DataQuality {
     pub date_range_start: NaiveDate,
     pub date_range_end: NaiveDate,

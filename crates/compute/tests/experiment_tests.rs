@@ -6,7 +6,7 @@ use compute::experiments::{
     log_to_simple, run_factor_shock, run_risk_decomposition, simple_to_log, FactorShockInput,
     Holding, Portfolio, RiskDecompositionInput,
 };
-use compute::model::{fit_factor_model, fit_factor_model_with_config, Frequency, ModelConfig};
+use compute::model::{fit_factor_model, Frequency, ModelConfig};
 use compute::trace::DataWindow;
 
 fn two_stock_model() -> (compute::data::MarketData, compute::model::FactorModel) {
@@ -16,7 +16,7 @@ fn two_stock_model() -> (compute::data::MarketData, compute::model::FactorModel)
     ];
     let data = common::synthetic_multi_stock(&stocks, 300, 0.0008, 123);
     let tickers = vec!["AAA".to_string(), "BBB".to_string()];
-    let model = fit_factor_model(&data, &tickers, 252, compute::model::Frequency::Daily).unwrap();
+    let model = fit_factor_model(&data, &tickers, ModelConfig::new(252, Frequency::Daily)).unwrap();
     (data, model)
 }
 
@@ -74,10 +74,10 @@ fn regime_structured_returns(order: [f64; 3], seed: u64) -> Vec<f64> {
 
 /// Builds the same two-stock model as `two_stock_model`, but with the
 /// MARKET factor series replaced by a regime-structured one (see
-/// `regime_structured_returns`) and fit with `regime_covariance: true`.
-/// `volatility_order` controls which regime the window ends in (and
-/// therefore which regime is "current"): `[0.003, 0.012, 0.035]` ends in
-/// Crisis, `[0.035, 0.012, 0.003]` ends in Bull.
+/// `regime_structured_returns`). `volatility_order` controls which regime
+/// the window ends in (and therefore which regime is "current"):
+/// `[0.003, 0.012, 0.035]` ends in Crisis, `[0.035, 0.012, 0.003]` ends in
+/// Bull.
 fn two_stock_model_with_regime(
     volatility_order: [f64; 3],
     seed: u64,
@@ -92,8 +92,7 @@ fn two_stock_model_with_regime(
         regime_structured_returns(volatility_order, seed),
     );
     let tickers = vec!["AAA".to_string(), "BBB".to_string()];
-    let config = ModelConfig::new(252, Frequency::Daily).with_regime_covariance(true);
-    let model = fit_factor_model_with_config(&data, &tickers, config).unwrap();
+    let model = fit_factor_model(&data, &tickers, ModelConfig::new(252, Frequency::Daily)).unwrap();
     (data, model)
 }
 
@@ -104,7 +103,6 @@ fn euler_contributions_sum_to_portfolio_vol_stock_and_factor_views() {
         portfolio: two_holding_portfolio(),
         frequency: compute::model::Frequency::Daily,
         window: Some(252),
-        regime_covariance: false,
     };
 
     let (output, trace) =
@@ -140,7 +138,6 @@ fn linear_approximation_pnl_is_linear_in_shock_size() {
         linear_approximation: true,
         frequency: compute::model::Frequency::Daily,
         window: Some(252),
-        regime_covariance: false,
     };
     let mut shocks2 = shocks.clone();
     *shocks2.get_mut("MARKET").unwrap() *= 2.0;
@@ -151,7 +148,6 @@ fn linear_approximation_pnl_is_linear_in_shock_size() {
         linear_approximation: true,
         frequency: compute::model::Frequency::Daily,
         window: Some(252),
-        regime_covariance: false,
     };
 
     let (out1, trace1) =
@@ -200,7 +196,6 @@ fn log_space_holding_return_is_linear_in_log_shock() {
         linear_approximation: false,
         frequency: compute::model::Frequency::Daily,
         window: Some(252),
-        regime_covariance: false,
     };
     let input2 = FactorShockInput {
         portfolio,
@@ -209,7 +204,6 @@ fn log_space_holding_return_is_linear_in_log_shock() {
         linear_approximation: false,
         frequency: compute::model::Frequency::Daily,
         window: Some(252),
-        regime_covariance: false,
     };
 
     let (out1, _) =
@@ -263,7 +257,6 @@ fn conditional_propagation_is_noop_when_all_factors_given() {
         linear_approximation: false,
         frequency: compute::model::Frequency::Daily,
         window: Some(252),
-        regime_covariance: false,
     };
 
     let (output, _) =
@@ -275,13 +268,15 @@ fn conditional_propagation_is_noop_when_all_factors_given() {
     );
 }
 
+/// Regime-conditioning is now unconditional (no more `regime_covariance`
+/// flag): fitting against a window with a genuine regime-structured MARKET
+/// series must always populate `regime_state` and use the *current*
+/// regime's factor covariance, which differs from the naive full-window
+/// covariance whenever the data has real regime structure.
 #[test]
-fn risk_decomposition_with_and_without_regime_covariance_gives_different_vol() {
+fn risk_decomposition_always_uses_regime_conditional_vol() {
     let portfolio = two_holding_portfolio();
 
-    // Same underlying data (window ends in the Crisis segment), fit twice
-    // with different ModelConfigs, so the only difference between the two
-    // FactorModels below is whether regime_covariance was requested.
     let stocks = [
         ("AAA", 0.0001, [0.9, 0.1, 0.0, 0.2, 0.3]),
         ("BBB", -0.0002, [0.4, -0.3, 0.5, 0.0, -0.1]),
@@ -292,57 +287,31 @@ fn risk_decomposition_with_and_without_regime_covariance_gives_different_vol() {
         regime_structured_returns([0.003, 0.012, 0.035], 2),
     );
     let tickers = vec!["AAA".to_string(), "BBB".to_string()];
-    let model_no_regime = fit_factor_model_with_config(
-        &data,
-        &tickers,
-        ModelConfig::new(252, Frequency::Daily),
-    )
-    .unwrap();
-    let model_with_regime = fit_factor_model_with_config(
-        &data,
-        &tickers,
-        ModelConfig::new(252, Frequency::Daily).with_regime_covariance(true),
-    )
-    .unwrap();
-    assert!(model_no_regime.regime_state.is_none());
-    assert!(model_with_regime.regime_state.is_some());
+    let model = fit_factor_model(&data, &tickers, ModelConfig::new(252, Frequency::Daily)).unwrap();
+    assert!(model.regime_state.is_some(), "regime_state must always be populated");
 
-    let input_no_regime = RiskDecompositionInput {
-        portfolio: portfolio.clone(),
-        frequency: Frequency::Daily,
-        window: Some(252),
-        regime_covariance: false,
-    };
-    let input_with_regime = RiskDecompositionInput {
+    // Direct signal that regime-conditioning is actually doing something on
+    // this regime-structured data (not a no-op): Bull and Crisis regimes'
+    // own factor covariances differ from each other.
+    let regimes = model.regime_factor_covariance_daily.as_ref().unwrap();
+    assert!(
+        regimes[0] != regimes[2],
+        "Bull and Crisis regime covariances should differ on regime-structured data"
+    );
+
+    let input = RiskDecompositionInput {
         portfolio,
         frequency: Frequency::Daily,
         window: Some(252),
-        regime_covariance: true,
     };
+    let (output, trace) =
+        run_risk_decomposition(&data.quality, data_window(&data, 252), &model, &input).unwrap();
 
-    let (out_no_regime, _) = run_risk_decomposition(
-        &data.quality,
-        data_window(&data, 252),
-        &model_no_regime,
-        &input_no_regime,
-    )
-    .unwrap();
-    let (out_with_regime, trace_with_regime) = run_risk_decomposition(
-        &data.quality,
-        data_window(&data, 252),
-        &model_with_regime,
-        &input_with_regime,
-    )
-    .unwrap();
-
-    for inv in &trace_with_regime.invariants {
+    for inv in &trace.invariants {
         assert!(inv.passed, "invariant failed: {} ({})", inv.name, inv.detail);
     }
-    assert_ne!(
-        out_no_regime.portfolio_vol_annualized, out_with_regime.portfolio_vol_annualized,
-        "regime-conditional vol should differ from the full-window vol"
-    );
-    assert!(trace_with_regime.model_params.regime_state.is_some());
+    assert!(output.portfolio_vol_annualized > 0.0);
+    assert!(trace.model_params.regime_state.is_some());
 }
 
 #[test]
@@ -363,7 +332,6 @@ fn factor_shock_crisis_comparison_present_when_current_regime_is_not_crisis() {
         linear_approximation: false,
         frequency: Frequency::Daily,
         window: Some(252),
-        regime_covariance: true,
     };
 
     let (output, _) =
@@ -394,7 +362,6 @@ fn factor_shock_crisis_comparison_absent_when_current_regime_is_crisis() {
         linear_approximation: false,
         frequency: Frequency::Daily,
         window: Some(252),
-        regime_covariance: true,
     };
 
     let (output, _) =

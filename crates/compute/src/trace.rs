@@ -4,13 +4,13 @@
 
 use chrono::NaiveDate;
 use schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::data::DataQuality;
 use crate::model::Frequency;
 use crate::regime::RegimeState;
 
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DataWindow {
     pub frequency: Frequency,
     pub window_periods: usize,
@@ -18,7 +18,7 @@ pub struct DataWindow {
     pub end: NaiveDate,
 }
 
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ModelParams {
     pub frequency: Frequency,
     pub window_periods: usize,
@@ -38,7 +38,7 @@ pub struct ModelParams {
     pub cap_source: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct InvariantCheck {
     pub name: String,
     pub passed: bool,
@@ -58,7 +58,7 @@ impl InvariantCheck {
     }
 }
 
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct EvidenceTrace {
     pub experiment: String,
     pub inputs: serde_json::Value,

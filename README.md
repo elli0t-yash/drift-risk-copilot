@@ -37,15 +37,20 @@ crates/
     examples/demo_pipeline.rs  One-off demo: mocked Gemini + a real compute call (see below)
     tests/                    Mocked-Gemini unit/integration tests (no network to Gemini)
   server/    # axum HTTP API + embedded UI
-    src/main.rs           Router, tracing setup, GEMINI_API_KEY startup check
-    src/routes.rs          /health, /scenarios, /experiment, /ask, static-file fallback handlers
+    src/main.rs           Router, tracing setup, GEMINI_API_KEY + SnapshotStore startup checks
+    src/routes.rs          /health, /scenarios, /experiment, /ask, /report/{id}, static-file fallback handlers
+    src/upload.rs            POST /portfolio/upload: CSV/XLSX -> Portfolio
     src/backend.rs          Backend trait (RealBackend wraps compute+agent) + error mapping
-    src/validate.rs          Portfolio validation shared by /experiment and /ask
+    src/validate.rs          Portfolio validation shared by /experiment, /ask, and /portfolio/upload
     src/error.rs             ApiError ({error, code} JSON responses) + AppJson extractor
     src/logging.rs            Request logging middleware (method, path, status, latency)
+    src/pdf.rs                GET /report/{id}: renders a PDF from a stored EvidenceTrace
     src/tests.rs               Route tests against a MockBackend (no network)
     static/index.html         Embedded single-page UI (include_str!, no build step)
+  store/     # persistent SQLite-backed risk-snapshot store
+    src/lib.rs             SnapshotStore + RiskSnapshot; rusqlite (bundled feature, no external sqlite3 needed)
 data/cache/  # cached raw price CSVs (gitignored; fetched on first run)
+data/snapshots.db (or $SNAPSHOT_DB_PATH)  # SQLite risk-snapshot store
 Dockerfile     # multi-stage build -> gcr.io/distroless/cc-debian12
 cloudrun.yaml  # Cloud Run service config
 ```
@@ -485,11 +490,42 @@ immediately if grounding_warnings fires" below.
 ## Server (`server::main`)
 
 ```
-GET  /health        -> { status: "ok", version } (200)
-POST /experiment     -> { portfolio, experiment } in, EvidenceTrace out
-POST /ask              -> { portfolio, message } in, AskResponse out
-GET  /*                  -> embedded single-page UI (static/index.html)
+GET  /health              -> { status: "ok", version } (200)
+POST /experiment           -> { portfolio, experiment } in, EvidenceTrace out
+POST /ask                    -> { portfolio, message } in, AskResponse out
+GET  /report/{result_id}      -> PDF, rendered from a stored EvidenceTrace
+POST /portfolio/upload         -> multipart CSV/XLSX in, { portfolio, ... } out
+GET  /*                          -> embedded single-page UI (static/index.html)
 ```
+
+Both `POST /experiment` and `POST /ask` now also insert a `RiskSnapshot`
+into the persistent `store::SnapshotStore` on every successful call (see
+"PDF reports, snapshot store, and CVaR cap defaulting" below) — `/ask`
+returns the row's id as `result_id`; `/experiment`'s response shape is
+unchanged (still the bare `EvidenceTrace`), so its snapshot is a side
+effect, not something the caller gets an id for directly.
+
+### `POST /portfolio/upload` (`server::upload`)
+
+Accepts `multipart/form-data` with one field, `file` (`.csv` or `.xlsx`,
+first sheet only for XLSX). Two accepted column layouts, detected from the
+header row (case-insensitive): `ticker,weight` (weight-based) or
+`ticker,shares,avg_price_inr` (value-based — `value_inr = shares *
+avg_price_inr` per holding, `weight = value_inr / total_value_inr` rounded
+to 6 decimals, `total_value_inr` recomputed as the sum). A bare NSE-looking
+ticker with no exchange suffix (all uppercase letters/digits, no `.`) gets
+`.NS` appended, reported back in `tickers_normalised`. Runs the same
+`validate_portfolio` check as `/experiment`/`/ask` before responding, so a
+malformed upload (weights not summing to 1.0, fewer than 2 holdings, an
+unsupported extension, missing columns, or an empty file) gets the same
+400 `{error, code}` shape those routes use.
+
+**Judgment call:** weight-based CSVs carry no portfolio value at all (only
+ticker + weight), so there's nothing to derive `total_value_inr` from.
+Defaults to 1,000,000 INR — this codebase's existing demo convention
+elsewhere (`sample_portfolio` helpers throughout the test suite) — which
+the caller should overwrite before using the returned `Portfolio` for
+anything that cares about real INR amounts (P&L, commission cost, etc.).
 
 `ExperimentRequest.experiment` is the tagged `Experiment` variant's JSON
 *minus* `portfolio` (e.g. `{"type": "FactorShock", "shocks_pct": {...}}`) —
@@ -706,8 +742,16 @@ original 60s was sized for).
 A 3-state Gaussian HMM (`compute::regime`, Baum-Welch fit from scratch, no
 external HMM crate) on Nifty (`^NSEI`) daily log returns, used to split the
 factor covariance `F` by market regime instead of always pooling the full
-window. Default is unchanged behaviour (`regime_covariance: false`
-everywhere) — this is purely opt-in.
+window.
+
+**Always-on as of the session that added persistent snapshots and portfolio
+upload**: regime-conditioning used to be an opt-in `regime_covariance: bool`
+field on `FactorShockInput`/`RiskDecompositionInput`/`CvarRebalanceInput`,
+defaulting to `false` everywhere. That field is gone -- every request now
+gets a regime-conditional fit unconditionally, and every `EvidenceTrace`'s
+`model_params.regime_state` is always populated (never `None`). The
+mechanics below (states, fallback, per-experiment wiring) are unchanged;
+only the "was this requested" branch was removed.
 
 ### The model
 
@@ -733,22 +777,22 @@ everywhere) — this is purely opt-in.
 
 ### Wiring into the factor model
 
-`model::ModelConfig { window, frequency, regime_covariance }` replaces the
-old bare `(window, frequency)` pair for the regime-aware path
-(`fit_factor_model_with_config`); the original `fit_factor_model(data,
-tickers, window, frequency)` is kept as a thin non-regime wrapper so
-**nothing outside `compute`'s own CLI/experiments/cvar needed to change**
-— `agent`/`server` still call the old signature and compile unmodified.
+`model::ModelConfig { window, frequency }` is the only fit configuration
+now -- `fit_factor_model_with_config` was renamed to `fit_factor_model` and
+the old non-regime `fit_factor_model(data, tickers, window, frequency)`
+thin wrapper was removed, since there is no longer a non-regime path to
+wrap. Every caller (`agent::pipeline`, `compute`'s own CLI, `cvar`) was
+updated to the new signature.
 
-When `regime_covariance: true`: the HMM fits on the *same* window's `MARKET`
-factor series (already Nifty's own log returns, no separate fetch), factor
-returns are split by the Viterbi sequence, and each regime gets its own
-Ledoit-Wolf `F_k`. `FactorModel.factor_covariance_daily` — the field every
-existing `factor_covariance()`/`stock_covariance()` call already reads —
-becomes `F_{current_regime}`, so **RiskDecomposition needed zero changes to
-its own math**: it was already just calling those methods. All three
-regimes' `F_k` remain available via `factor_covariance_for_regime(k)` /
-`stock_covariance_for_regime(k)`, which is what `FactorShock`'s
+The HMM fits on the *same* window's `MARKET` factor series (already
+Nifty's own log returns, no separate fetch), factor returns are split by
+the Viterbi sequence, and each regime gets its own Ledoit-Wolf `F_k`.
+`FactorModel.factor_covariance_daily` — the field every existing
+`factor_covariance()`/`stock_covariance()` call already reads — is always
+`F_{current_regime}`, so **RiskDecomposition needs zero special-casing of
+its own math**: it just calls those methods, unconditionally regime-aware.
+All three regimes' `F_k` remain available via `factor_covariance_for_regime(k)`
+/ `stock_covariance_for_regime(k)`, which is what `FactorShock`'s
 `crisis_comparison` uses.
 
 **Fallback**: a regime with fewer than `MIN_REGIME_OBSERVATIONS` (30) days
@@ -759,24 +803,31 @@ case, not just a hypothetical — see the live run below.
 
 ### Per-experiment behaviour
 
-- **RiskDecomposition**: `regime_covariance: bool` field; when true, vol
-  and Euler contributions use `F_{current_regime}` automatically (see
-  above). `model_params.regime_state` records which regime.
-- **FactorShock**: `regime_covariance: bool` field; when true *and* the
-  current regime isn't already Crisis, `outputs.result.crisis_comparison`
-  reruns the same shock (including conditional propagation) using
-  `F_crisis` instead of `F_current`, so a reader can see "how much worse
-  would this look under crisis-regime correlations" without a second
-  request. Absent (not zeroed) when the current regime already is Crisis,
-  since that comparison would be a no-op.
-- **CvarRebalance**: `regime_covariance: bool` field; per the design note,
-  the LP and feasibility checks always use historical scenarios directly,
-  *never* a factor-model covariance — so this can't gate optimality. It
-  instead fits a regime-conditional factor model purely to report
+- **RiskDecomposition**: vol and Euler contributions always use
+  `F_{current_regime}` (see above). `model_params.regime_state` records
+  which regime.
+- **FactorShock**: whenever the current regime isn't already Crisis,
+  `outputs.result.crisis_comparison` reruns the same shock (including
+  conditional propagation) using `F_crisis` instead of `F_current`, so a
+  reader can see "how much worse would this look under crisis-regime
+  correlations" without a second request. Absent (not zeroed) when the
+  current regime already is Crisis, since that comparison would be a no-op.
+- **CvarRebalance**: per the design note, the LP and feasibility checks
+  always use historical scenarios directly, *never* a factor-model
+  covariance — so regime can't gate optimality. It instead always fits a
+  regime-conditional factor model purely to report
   `regime_portfolio_vol_annualized_{before,after}` (`sqrt(w' Sigma_regime
   w)` for `weights_before`/`weights_after`) as a parametric cross-check
   alongside the historical CVaR/VaR, with `model_params.regime_state`
-  recording which regime.
+  recording which regime. This fit uses the CVaR experiment's own resolved
+  scenario `window` (not a separate fixed default), and degrades to `None`
+  regime fields (rather than failing the whole request) if that window is
+  narrower than the HMM's 90-observation minimum.
+- **PortfolioPerformance**: never fits a factor model (unchanged), but now
+  reports `outputs.result.regime_label` (informational only) from a
+  standalone HMM fit on the window's own MARKET series, and populates
+  `model_params.regime_state` the same way. `None` only if that standalone
+  fit itself fails.
 
 ### Live run (10-stock Nifty portfolio)
 
@@ -791,18 +842,22 @@ the 252-day window).
 covariance"` — Bear was too thin a slice of this particular 252-day window
 to shrink its own `F`.
 
-**RiskDecomposition, `portfolio_vol_annualized`**:
+**RiskDecomposition, `portfolio_vol_annualized`**, captured from the
+session that first added regime-conditioning (back when it was still
+opt-in via `regime_covariance: bool`; the flag itself is gone now, see
+above, but the comparison is still the right mental model for what
+regime-conditioning does):
 
 | | value |
 |---|---|
-| `regime_covariance: false` | 0.1549 |
-| `regime_covariance: true` (Bull) | 0.1174 |
+| full-window `F` (no regime split) | 0.1549 |
+| regime-conditional `F` (Bull) | 0.1174 |
 
 Meaningfully lower under the Bull-regime `F` than the full-window `F`, as
 expected — the window's Bear/Crisis days pull the full-window covariance up.
 
-**FactorShock (Nifty −12%, Brent +20%, `regime_covariance: true`)**,
-current regime Bull, so `crisis_comparison` is present:
+**FactorShock (Nifty −12%, Brent +20%)**, current regime Bull, so
+`crisis_comparison` is present:
 
 | | current regime (Bull) | `crisis_comparison` |
 |---|---|---|
@@ -824,11 +879,13 @@ order the segments appear in the data (a deliberately *not* variance-sorted
 order — high, low, medium). `model`'s own tests inject a synthetic Viterbi
 sequence directly (rather than coaxing a real HMM fit into an unlucky
 split) to test the <30-obs fallback deterministically. `experiment_tests.rs`
-covers RiskDecomposition's vol actually differing with/without
-`regime_covariance`, and FactorShock's `crisis_comparison` presence/absence
-by regime. One test — `F` is PSD for all three regimes on real NSEI data —
-needs network and is `#[ignore]`d by default; run with `cargo test -p
-compute --test model_tests -- --ignored`. Confirmed passing.
+covers RiskDecomposition always using a regime-conditional `F` that differs
+across regimes, and FactorShock's `crisis_comparison` presence/absence by
+regime. Two tests need network and are `#[ignore]`d by default: `F` is PSD
+for all three regimes on real NSEI data (`cargo test -p compute --test
+model_tests -- --ignored`), and every experiment type's trace has a
+non-null `regime_state` on real data (`cargo test -p compute --test
+always_on_regime_tests -- --ignored`). Both confirmed passing.
 
 ### Judgment calls
 
@@ -859,16 +916,25 @@ compute --test model_tests -- --ignored`. Confirmed passing.
   at all currently (they're pure cap/turnover arithmetic), so doing that
   would be a bigger, unrequested change to what "feasible" means for this
   experiment.
-- **Regime HMM window for CvarRebalance** defaults to
-  `frequency.default_window()` (252 daily), independent of CvarRebalance's
-  own `window` (which defaults to *full available history* for scenarios) —
-  these are two different jobs (regime detection wants a recent window;
-  historical CVaR wants as much data as possible), so tying them together
-  would have been actively wrong.
-- **`fit_factor_model` (old signature) kept as a thin wrapper** rather than
-  changing its signature and updating every call site across `agent`/
-  `server`, per this checkpoint's explicit scope ("no other crate changes
-  in this session").
+- **Regime HMM window for CvarRebalance now reuses the CVaR experiment's own
+  resolved scenario `window`**, not a separate fixed `frequency.default_window()`
+  (252 daily) as in the original opt-in design. That fixed default broke
+  the moment regime-conditioning became unconditional, since it required
+  every ticker to have >= 252 observations even when the caller's own
+  `window`/available data was shorter (hit immediately by this crate's
+  existing short-synthetic-data CVaR tests, all of which use ~100
+  observations). Reusing the resolved window also has the advantage of
+  keeping the reported regime consistent with the same span the CVaR
+  analysis itself runs over, rather than an unrelated hardcoded lookback.
+- **CvarRebalance's regime fit degrades to `None` on failure** (including
+  "window narrower than 90 observations", `regime::fit_hmm`'s minimum)
+  instead of failing the whole request, since it's explicitly informational
+  and not load-bearing for the LP/feasibility checks. The equivalent
+  standalone fit in `PortfolioPerformance` (for `regime_label`) does the
+  same. `FactorShock`/`RiskDecomposition` do *not* have this fallback —
+  regime-conditioning is load-bearing there (`crisis_comparison`, and the
+  vol/Euler-contribution math itself), so a fit failure there is a genuine
+  error, propagated with `?` from `fit_factor_model`.
 
 ## Historical scenario presets and multi-turn `/ask`
 
@@ -982,35 +1048,73 @@ the test can inspect what it captured after the request completes.
   per spec "sequential is fine") is therefore also unmeasured against real
   API latency in this session.
 
-## PDF reports, result store, and CVaR cap defaulting
+## PDF reports, snapshot store, and CVaR cap defaulting
 
-### In-memory result store (`server::store`)
+### Persistent risk snapshot store (`store::SnapshotStore`)
 
-`ResultStore`: a fixed-capacity (`20`) ring buffer (`VecDeque<(Uuid, PipelineResult)>`
-behind a `Mutex`), keyed by a server-generated UUID v4. Every successful
-`POST /ask` inserts its `PipelineResult` and returns the id as
-`result_id` in `AskResponse`; the oldest entry is evicted once the buffer
-is full. `POST /experiment` does **not** store anything -- it has no
-narration/suggestion to report on, only a bare `EvidenceTrace`.
-`agent::pipeline::PipelineResult` and `agent::grounding::GroundedNarration`
-both gained `#[derive(Clone)]` (a small, unavoidable agent-crate touch):
-`ResultStore::get(&self, id) -> Option<PipelineResult>` hands the caller
-its own owned copy without moving the entry out of the shared queue, which
-needs `Clone`, not a reference.
+`ResultStore` (an in-memory, fixed-capacity-20 `VecDeque`) has been
+replaced by `store::SnapshotStore`, a SQLite-backed store in its own crate
+(`crates/store`, using `rusqlite`'s `bundled` feature so no external
+`sqlite3` needs to be installed on the distroless runtime image -- SQLite
+is compiled from source as part of the crate build). Both `POST /experiment`
+and `POST /ask` now insert a `RiskSnapshot` row on every successful call
+(`POST /experiment` didn't store anything at all before this); `POST /ask`
+still returns the row's id as `result_id` in `AskResponse`.
+
+A `RiskSnapshot` holds the full `EvidenceTrace` as `trace_json`, plus a
+handful of fields pulled out of it for fast querying without re-parsing
+JSON: `portfolio_hash` (see below), `experiment_type`, `engine_version`,
+`regime_label`/`smoothed_probs` (from `model_params.regime_state`, which
+every experiment type now always populates -- see "Regime-conditional
+factor covariance" below), `portfolio_vol_annualized` (`RiskDecomposition`
+only), and `cvar_historical` (`CvarRebalance` only). It deliberately does
+**not** persist narration or the follow-up suggestion -- those are
+`/ask`-pipeline-only text, not part of the evidence trace, and adding them
+would mean widening the fixed schema.
+
+**Judgment call:** since the persisted schema has no room for narration,
+`GET /report/{id}`'s PDF (`server::pdf`, below) now renders purely from the
+trace -- the old "Analysis" section (the narration paragraph + grounding
+warning) is gone. A report requested for a `POST /experiment` result was
+always narration-less (there's no Gemini call on that path); the same is
+now also true for a `POST /ask` result once it's fetched back out of the
+store. The live narration text is still returned synchronously in `/ask`'s
+own JSON response -- only the *stored, re-fetchable-later* copy lost it.
+
+**Persistence caveat (Cloud Run):** the store's file path comes from
+`SNAPSHOT_DB_PATH` (`main.rs`), defaulting to `/data/snapshots.db`. On
+Cloud Run, `/data` is the container instance's own ephemeral local disk: it
+survives across requests on a single warm instance, but is never shared
+between instances or revisions, and is wiped on a cold start or
+scale-to-zero (this service's `cloudrun.yaml` sets `minScale: "0"`, so
+scale-to-zero is the normal idle state, not an edge case). Snapshots are
+therefore best-effort recent history, not a durable audit log -- acceptable
+for a hackathon-scale demo, but a real deployment should point
+`SNAPSHOT_DB_PATH` at a mounted persistent volume (e.g. a GCS FUSE mount)
+or replace `SnapshotStore`'s backing store with a managed database
+(Cloud SQL) instead.
+
+### Portfolio identity (`compute::portfolio::portfolio_hash`)
+
+`SnapshotStore::latest_for_portfolio` looks up prior snapshots for "the
+same portfolio" by `portfolio_hash`: SHA-256 of `"TICKER:weight,..."` pairs
+sorted by ticker ascending, hex-encoded. Order-independent by construction
+(sorted before hashing), so the same holdings always hash identically
+regardless of what order the caller listed them in.
 
 ### `GET /report/{result_id}` (`server::pdf`)
 
 A single-page A4 PDF built on `printpdf = "=0.12.8"` (pinned exactly, see
 "Judgment calls" below for why the version matters here more than usual).
-404 (`result_not_found`) if the id was never stored or has since been
-evicted. Layout: header (title + experiment type/timestamp, rule),
-Analysis (word-wrapped narration + a grounding-warning line if any),
-key Numbers (a 3-column table, one row set per experiment type -- P&L/
-given+implied shocks/regime/crisis P&L for FactorShock; vol/top-2 factors/
-specific risk/regime for RiskDecomposition; CVaR before/after/reduction/
-turnover/commission for CvarRebalance), Evidence Trace (model params,
-data quality, invariants with pass/fail), footer (fixed regime-smoothing
-disclaimer). Single-pass, no pagination, per spec.
+404 (`result_not_found`) if the id was never stored. Renders from the
+`EvidenceTrace` alone (see the judgment call above for why narration is no
+longer part of this). Layout: header (title + experiment type/timestamp,
+rule), Key Numbers (a 3-column table, one row set per experiment type --
+P&L/given+implied shocks/regime/crisis P&L for FactorShock; vol/top-2
+factors/specific risk/regime for RiskDecomposition; CVaR before/after/
+reduction/turnover/commission for CvarRebalance), Evidence Trace (model
+params, data quality, invariants with pass/fail), footer (fixed
+regime-smoothing disclaimer). Single-pass, no pagination, per spec.
 
 ### Shared INR formatting (`compute::format::format_inr`)
 

@@ -15,6 +15,5 @@
     ],
     "total_value_inr": 10000000.0
   },
-  "window": 252,
-  "regime_covariance": true
+  "window": 252
 }

@@ -56,6 +56,11 @@ COPY crates/server/static crates/server/static
 RUN find crates/compute/src crates/agent/src crates/server/src -type f -exec touch {} + \
     && cargo build --release -p server
 
+# distroless has no shell, so `RUN mkdir` isn't available in the run stage
+# below -- create the SQLite data directory here, in the build stage (which
+# does have a shell), and copy the empty directory across instead.
+RUN mkdir -p /data
+
 # ---- Stage 2: run -------------------------------------------------------
 # distroless/cc-debian12 (glibc + libgcc/libstdc++, no shell, no package
 # manager) rather than a static-musl build — see the README's "Docker" /
@@ -63,6 +68,7 @@ RUN find crates/compute/src crates/agent/src crates/server/src -type f -exec tou
 FROM gcr.io/distroless/cc-debian12
 
 COPY --from=build /app/target/release/server /server
+COPY --from=build /data /data
 
 EXPOSE 8080
 CMD ["/server"]

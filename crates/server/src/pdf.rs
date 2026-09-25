@@ -1,15 +1,24 @@
-//! `GET /report/{id}`: a single-page A4 PDF summary of a stored `/ask`
-//! result, built directly on `printpdf` 0.12's `Op`-list API (see
-//! `Cargo.toml` -- pinned exactly). That API is a full rewrite from the
-//! `PdfLayerReference`-based API most printpdf examples/tutorials still
-//! show; this module only uses the low-level `Op` primitives (text
-//! positioning, lines), not printpdf's optional HTML/CSS layout engine
-//! (which is what pulls in the crate's much heavier dependency tree --
-//! azul-core, azul-layout, hyphenation, rust-fontconfig -- none of which
-//! this module touches).
+//! `GET /report/{id}`: a single-page A4 PDF summary of a stored
+//! `/experiment` or `/ask` result, built directly on `printpdf` 0.12's
+//! `Op`-list API (see `Cargo.toml` -- pinned exactly). That API is a full
+//! rewrite from the `PdfLayerReference`-based API most printpdf
+//! examples/tutorials still show; this module only uses the low-level `Op`
+//! primitives (text positioning, lines), not printpdf's optional HTML/CSS
+//! layout engine (which is what pulls in the crate's much heavier
+//! dependency tree -- azul-core, azul-layout, hyphenation,
+//! rust-fontconfig -- none of which this module touches).
+//!
+//! Renders from `EvidenceTrace` alone, not the full `/ask` pipeline result:
+//! since `SnapshotStore` only persists `trace_json` (see `store::RiskSnapshot`
+//! -- narration/suggestion text isn't part of that schema), a report
+//! requested after the process that served the original `/ask` restarts (or
+//! for a `/experiment` result, which never had narration) has no narration
+//! to show. The "Analysis" narration section from the old
+//! `PipelineResult`-based renderer is dropped accordingly; the report is
+//! now purely the evidence trace (key numbers + invariants + data quality).
 
-use agent::pipeline::PipelineResult;
 use compute::format::format_inr;
+use compute::trace::EvidenceTrace;
 use printpdf::*;
 use serde_json::Value;
 
@@ -20,48 +29,31 @@ const RIGHT_MARGIN_MM: f32 = 20.0;
 const CONTENT_WIDTH_MM: f32 = PAGE_WIDTH_MM - LEFT_MARGIN_MM - RIGHT_MARGIN_MM; // 170mm, per spec
 const RIGHT_EDGE_MM: f32 = PAGE_WIDTH_MM - RIGHT_MARGIN_MM;
 
-/// Renders `result` as a one-page PDF and returns the raw file bytes.
-pub fn render_report(result: &PipelineResult) -> Vec<u8> {
+/// Renders `trace` as a one-page PDF and returns the raw file bytes.
+pub fn render_report(trace: &EvidenceTrace) -> Vec<u8> {
     let mut doc = PdfDocument::new("Drift Risk Copilot Report");
     let mut page = Page::new();
 
-    let outputs = &result.trace.outputs;
+    let outputs = &trace.outputs;
     let result_value = outputs.get("result");
 
     // --- Section 1: header ---
     page.text(LEFT_MARGIN_MM, page.y, "Drift Risk Copilot", BuiltinFont::HelveticaBold, 18.0);
     let generated_at = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC");
-    let header_right = format!("{} | generated {}", result.trace.experiment, generated_at);
+    let header_right = format!("{} | generated {}", trace.experiment, generated_at);
     page.text_right(RIGHT_EDGE_MM, page.y, &header_right, BuiltinFont::Helvetica, 10.0);
     page.advance(7.0);
     page.rule();
     page.advance(8.0);
 
-    // --- Section 2: narration ---
-    page.text(LEFT_MARGIN_MM, page.y, "Analysis", BuiltinFont::HelveticaBold, 12.0);
-    page.advance(6.0);
-    page.wrapped_text(&result.narration.narration, BuiltinFont::Helvetica, 10.0, 5.0);
-    if !result.narration.grounding_warnings.is_empty() {
-        page.advance(2.0);
-        page.text(
-            LEFT_MARGIN_MM,
-            page.y,
-            "\u{26a0} Some numbers in this explanation could not be verified against the model output.",
-            BuiltinFont::HelveticaOblique,
-            9.0,
-        );
-        page.advance(5.0);
-    }
-    page.advance(4.0);
-
-    // --- Section 3: key numbers ---
+    // --- Section 2: key numbers ---
     page.text(LEFT_MARGIN_MM, page.y, "Key Numbers", BuiltinFont::HelveticaBold, 12.0);
     page.advance(6.0);
-    let rows = key_numbers(&result.trace.experiment, result_value, &result.trace.model_params);
+    let rows = key_numbers(&trace.experiment, result_value, &trace.model_params);
     page.table(&["Metric", "Value", "Unit"], &rows);
     page.advance(4.0);
 
-    // --- Section 4: evidence trace (abridged) ---
+    // --- Section 3: evidence trace (abridged) ---
     page.text(LEFT_MARGIN_MM, page.y, "Evidence Trace", BuiltinFont::HelveticaBold, 12.0);
     page.advance(6.0);
 
@@ -70,11 +62,10 @@ pub fn render_report(result: &PipelineResult) -> Vec<u8> {
         page.y,
         &format!(
             "Model: window={} periods, frequency={:?}, shrinkage_intensity={:.4}{}",
-            result.trace.model_params.window_periods,
-            result.trace.model_params.frequency,
-            result.trace.model_params.shrinkage_intensity,
-            result
-                .trace
+            trace.model_params.window_periods,
+            trace.model_params.frequency,
+            trace.model_params.shrinkage_intensity,
+            trace
                 .model_params
                 .regime_state
                 .as_ref()
@@ -86,22 +77,17 @@ pub fn render_report(result: &PipelineResult) -> Vec<u8> {
     );
     page.advance(5.0);
 
-    let total_forward_filled: usize = result
-        .trace
-        .data_quality
-        .per_series
-        .iter()
-        .map(|s| s.forward_filled_days)
-        .sum();
-    let total_dropped: usize = result.trace.data_quality.per_series.iter().map(|s| s.dropped_days).sum();
+    let total_forward_filled: usize =
+        trace.data_quality.per_series.iter().map(|s| s.forward_filled_days).sum();
+    let total_dropped: usize = trace.data_quality.per_series.iter().map(|s| s.dropped_days).sum();
     page.text(
         LEFT_MARGIN_MM,
         page.y,
         &format!(
             "Data quality: {} to {} ({} trading days), {} forward-filled, {} dropped",
-            result.trace.data_quality.date_range_start,
-            result.trace.data_quality.date_range_end,
-            result.trace.data_quality.trading_days,
+            trace.data_quality.date_range_start,
+            trace.data_quality.date_range_end,
+            trace.data_quality.trading_days,
             total_forward_filled,
             total_dropped,
         ),
@@ -110,8 +96,7 @@ pub fn render_report(result: &PipelineResult) -> Vec<u8> {
     );
     page.advance(6.0);
 
-    let invariant_rows: Vec<[String; 3]> = result
-        .trace
+    let invariant_rows: Vec<[String; 3]> = trace
         .invariants
         .iter()
         .map(|inv| {
@@ -402,16 +387,6 @@ impl Page {
         });
     }
 
-    /// Word-wraps `text` at `CONTENT_WIDTH_MM` and draws it, advancing `y`
-    /// by `line_height_mm` per line.
-    fn wrapped_text(&mut self, text: &str, font: BuiltinFont, size_pt: f32, line_height_mm: f32) {
-        let text = pdf_safe(text);
-        for line in wrap_text(&text, font, size_pt, CONTENT_WIDTH_MM) {
-            self.text(LEFT_MARGIN_MM, self.y, &line, font, size_pt);
-            self.advance(line_height_mm);
-        }
-    }
-
     /// A simple 3-column table: header row bold, one row per entry,
     /// columns at fixed fractions of `CONTENT_WIDTH_MM` (55% / 25% / 20%).
     fn table(&mut self, headers: &[&str; 3], rows: &[[String; 3]]) {
@@ -468,24 +443,3 @@ fn text_width_mm(text: &str, font: BuiltinFont, size_pt: f32) -> f32 {
     width_pt * (25.4 / 72.0)
 }
 
-fn wrap_text(text: &str, font: BuiltinFont, size_pt: f32, max_width_mm: f32) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    for word in text.split_whitespace() {
-        let candidate = if current.is_empty() {
-            word.to_string()
-        } else {
-            format!("{current} {word}")
-        };
-        if text_width_mm(&candidate, font, size_pt) > max_width_mm && !current.is_empty() {
-            lines.push(current);
-            current = word.to_string();
-        } else {
-            current = candidate;
-        }
-    }
-    if !current.is_empty() {
-        lines.push(current);
-    }
-    lines
-}

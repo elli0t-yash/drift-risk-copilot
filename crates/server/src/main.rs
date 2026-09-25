@@ -3,7 +3,7 @@ mod error;
 mod logging;
 mod pdf;
 mod routes;
-mod store;
+mod upload;
 mod validate;
 
 use std::sync::Arc;
@@ -13,7 +13,15 @@ use axum::Router;
 
 use backend::{Backend, RealBackend};
 use routes::AppState;
-use store::ResultStore;
+use store::SnapshotStore;
+
+/// On Cloud Run, `/data` is ephemeral local disk: it survives a single
+/// warm instance across requests but is not shared across instances or
+/// revisions, and is lost on cold start/scale-to-zero. Acceptable for a
+/// hackathon-scale demo (see the README's "Persistence" section); a real
+/// deployment would point this at a Cloud SQL instance or a mounted GCS
+/// FUSE volume instead.
+const DEFAULT_SNAPSHOT_DB_PATH: &str = "/data/snapshots.db";
 
 #[tokio::main]
 async fn main() {
@@ -27,7 +35,15 @@ async fn main() {
         }
     };
     let backend: Arc<dyn Backend> = Arc::new(RealBackend::new(gemini));
-    let store = Arc::new(ResultStore::new());
+    let db_path =
+        std::env::var("SNAPSHOT_DB_PATH").unwrap_or_else(|_| DEFAULT_SNAPSHOT_DB_PATH.to_string());
+    let store = match SnapshotStore::open(&db_path) {
+        Ok(store) => Arc::new(store),
+        Err(err) => {
+            tracing::error!(error = %err, %db_path, "failed to open snapshot store");
+            std::process::exit(1);
+        }
+    };
     let state = AppState { backend, store };
 
     let app = build_router(state);
@@ -55,6 +71,7 @@ fn build_router(state: AppState) -> Router {
         .route("/experiment", post(routes::post_experiment))
         .route("/ask", post(routes::post_ask))
         .route("/report/:result_id", get(routes::get_report))
+        .route("/portfolio/upload", post(upload::post_portfolio_upload))
         .fallback(routes::static_handler)
         .layer(axum::middleware::from_fn(logging::log_requests))
         .with_state(state)

@@ -4,7 +4,7 @@ use clap::Parser;
 use compute::cvar::run_cvar_rebalance;
 use compute::data::load_market_data;
 use compute::experiments::{run_factor_shock, run_risk_decomposition, Experiment};
-use compute::model::{fit_factor_model_with_config, ModelConfig};
+use compute::model::{fit_factor_model, ModelConfig};
 use compute::performance::run_portfolio_performance;
 use compute::trace::DataWindow;
 
@@ -54,11 +54,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let (portfolio, window, frequency, regime_covariance) = match &experiment {
-        Experiment::FactorShock(i) => (&i.portfolio, i.resolved_window(), i.frequency, i.regime_covariance),
-        Experiment::RiskDecomposition(i) => {
-            (&i.portfolio, i.resolved_window(), i.frequency, i.regime_covariance)
-        }
+    let (portfolio, window, frequency) = match &experiment {
+        Experiment::FactorShock(i) => (&i.portfolio, i.resolved_window(), i.frequency),
+        Experiment::RiskDecomposition(i) => (&i.portfolio, i.resolved_window(), i.frequency),
         Experiment::CvarRebalance(_) | Experiment::PortfolioPerformance(_) => {
             unreachable!("handled above")
         }
@@ -66,11 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let tickers = portfolio.tickers();
     let data = load_market_data(&args.cache_dir, &tickers, args.refresh, frequency)?;
-    let model = fit_factor_model_with_config(
-        &data,
-        &tickers,
-        ModelConfig::new(window, frequency).with_regime_covariance(regime_covariance),
-    )?;
+    let model = fit_factor_model(&data, &tickers, ModelConfig::new(window, frequency))?;
 
     let data_window = DataWindow {
         frequency,

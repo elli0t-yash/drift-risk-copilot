@@ -7,11 +7,10 @@ use axum::Json;
 use compute::experiments::{Experiment, Portfolio};
 use compute::trace::EvidenceTrace;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
+use store::{RiskSnapshot, SnapshotStore};
 
 use crate::backend::Backend;
 use crate::error::{ApiError, AppJson};
-use crate::store::ResultStore;
 use crate::validate::validate_portfolio;
 
 const INDEX_HTML: &str = include_str!("../static/index.html");
@@ -19,7 +18,48 @@ const INDEX_HTML: &str = include_str!("../static/index.html");
 #[derive(Clone)]
 pub struct AppState {
     pub backend: Arc<dyn Backend>,
-    pub store: Arc<ResultStore>,
+    pub store: Arc<SnapshotStore>,
+}
+
+/// Builds the `RiskSnapshot` `SnapshotStore::insert` persists for a
+/// completed experiment: `trace_json` is the full trace (so `GET
+/// /report/{id}` can render a PDF from it later), and the other fields are
+/// pulled out of it for fast querying without re-parsing `trace_json`.
+/// `regime_label`/`smoothed_probs` come from `model_params.regime_state`,
+/// which every experiment type now always populates (see `compute`'s
+/// always-on regime).
+fn snapshot_from_trace(trace: &EvidenceTrace, portfolio: &Portfolio) -> Result<RiskSnapshot, ApiError> {
+    let holdings: Vec<(String, f64)> =
+        portfolio.holdings.iter().map(|h| (h.ticker.clone(), h.weight)).collect();
+    let portfolio_hash = compute::portfolio::portfolio_hash(&holdings);
+
+    let result = trace.outputs.get("result");
+    let number_at = |path: &[&str]| -> Option<f64> {
+        let mut v = result?;
+        for key in path {
+            v = v.get(key)?;
+        }
+        v.as_f64()
+    };
+    let portfolio_vol_annualized = number_at(&["portfolio_vol_annualized"]);
+    let cvar_historical = number_at(&["stats_after", "historical_cvar"])
+        .or_else(|| number_at(&["stats_before", "historical_cvar"]));
+
+    let trace_json = serde_json::to_string(trace)
+        .map_err(|e| ApiError::bad_request("internal_error", format!("failed to serialize trace: {e}")))?;
+
+    Ok(RiskSnapshot {
+        id: String::new(), // SnapshotStore::insert assigns the real id
+        created_at: String::new(),
+        portfolio_hash,
+        experiment_type: trace.experiment.clone(),
+        engine_version: trace.engine_version.clone(),
+        regime_label: trace.model_params.regime_state.as_ref().map(|r| r.current_label.to_string()),
+        smoothed_probs: trace.model_params.regime_state.as_ref().map(|r| r.smoothed_probs),
+        portfolio_vol_annualized,
+        cvar_historical,
+        trace_json,
+    })
 }
 
 #[derive(Serialize)]
@@ -68,6 +108,12 @@ pub async fn post_experiment(
     })?;
 
     let trace = state.backend.run_experiment(experiment).await?;
+
+    let snapshot = snapshot_from_trace(&trace, &req.portfolio)?;
+    state.store.insert(&snapshot).map_err(|e| {
+        ApiError::bad_request("internal_error", format!("failed to persist risk snapshot: {e}"))
+    })?;
+
     Ok(Json(trace))
 }
 
@@ -92,9 +138,9 @@ pub struct AskResponse {
     pub assistant_turn: agent::ConversationTurn,
     /// One follow-up question a risk manager would naturally ask next.
     pub suggestion: String,
-    /// Stored under this id in the server's in-memory `ResultStore`;
+    /// Stored under this id in the persistent `SnapshotStore`;
     /// `GET /report/{result_id}` renders it as a PDF.
-    pub result_id: Uuid,
+    pub result_id: String,
 }
 
 pub async fn post_ask(
@@ -103,11 +149,17 @@ pub async fn post_ask(
 ) -> Result<Json<AskResponse>, ApiError> {
     validate_portfolio(&req.portfolio)?;
 
+    let portfolio = req.portfolio.clone();
     let result = state
         .backend
         .run_ask(req.portfolio, req.message, req.conversation_history)
         .await?;
-    let result_id = state.store.insert(result.clone());
+
+    let snapshot = snapshot_from_trace(&result.trace, &portfolio)?;
+    let result_id = state.store.insert(&snapshot).map_err(|e| {
+        ApiError::bad_request("internal_error", format!("failed to persist risk snapshot: {e}"))
+    })?;
+
     Ok(Json(AskResponse {
         experiment: result.experiment,
         trace: result.trace,
@@ -132,20 +184,27 @@ pub async fn get_scenarios() -> Json<serde_json::Value> {
 }
 
 /// `GET /report/{result_id}`: a one-page PDF report for a previously
-/// stored `/ask` result. 404 if `result_id` is unknown (never stored, or
-/// evicted from the fixed-capacity `ResultStore`).
-pub async fn get_report(State(state): State<AppState>, Path(result_id): Path<Uuid>) -> Response {
-    match state.store.get(&result_id) {
-        Some(result) => {
-            let bytes = crate::pdf::render_report(&result);
-            (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, "application/pdf")],
-                bytes,
-            )
-                .into_response()
+/// stored `/experiment` or `/ask` result. 404 if `result_id` is unknown
+/// (never stored, or the id is simply wrong).
+pub async fn get_report(State(state): State<AppState>, Path(result_id): Path<String>) -> Response {
+    let snapshot = match state.store.get(&result_id) {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => {
+            return ApiError::not_found("result_not_found", format!("no stored result for id {result_id}"))
+                .into_response();
         }
-        None => ApiError::not_found("result_not_found", format!("no stored result for id {result_id}"))
-            .into_response(),
-    }
+        Err(e) => {
+            return ApiError::bad_request("internal_error", format!("failed to read snapshot store: {e}"))
+                .into_response();
+        }
+    };
+    let trace: EvidenceTrace = match serde_json::from_str(&snapshot.trace_json) {
+        Ok(trace) => trace,
+        Err(e) => {
+            return ApiError::bad_request("internal_error", format!("stored trace_json is invalid: {e}"))
+                .into_response();
+        }
+    };
+    let bytes = crate::pdf::render_report(&trace);
+    (StatusCode::OK, [(header::CONTENT_TYPE, "application/pdf")], bytes).into_response()
 }

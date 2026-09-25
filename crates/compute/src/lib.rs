@@ -5,6 +5,7 @@ pub mod experiments;
 pub mod format;
 pub mod model;
 pub mod performance;
+pub mod portfolio;
 pub mod regime;
 pub mod scenarios;
 pub mod trace;
