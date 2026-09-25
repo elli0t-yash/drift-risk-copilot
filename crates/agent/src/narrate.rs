@@ -14,7 +14,8 @@ pub const NARRATE_SYSTEM_PROMPT: &str = "You are a portfolio risk analyst. Expla
 2. For FactorShock: name every implied shock separately from given shocks, and note that implied moves are model-estimated from this portfolio's return history.
 3. For RiskDecomposition: state the annualised portfolio vol first, then the top two risk contributors by factor, then specific risk.
 4. For CvarRebalance: state before and after CVaR, turnover used, and commission cost. Do not describe factor attribution \u{2014} it is not applicable here.
-5. Do not use the phrase 'based on the evidence trace' or any meta-reference to the trace.";
+5. For PortfolioPerformance: state total return and annualized return first, then annualized volatility and max drawdown. Do not describe factor attribution or a hypothetical shock \u{2014} this experiment reports realized historical performance only.
+6. Do not use the phrase 'based on the evidence trace' or any meta-reference to the trace.";
 
 #[derive(Debug, Error)]
 pub enum NarrateError {

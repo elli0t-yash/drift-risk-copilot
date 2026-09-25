@@ -5,6 +5,7 @@ use compute::cvar::run_cvar_rebalance;
 use compute::data::load_market_data;
 use compute::experiments::{run_factor_shock, run_risk_decomposition, Experiment};
 use compute::model::{fit_factor_model_with_config, ModelConfig};
+use compute::performance::run_portfolio_performance;
 use compute::trace::DataWindow;
 
 /// Runs a single experiment (FactorShock, RiskDecomposition, or
@@ -38,12 +39,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    if let Experiment::PortfolioPerformance(input) = &experiment {
+        let tickers = input.portfolio.tickers();
+        let window = input.resolved_window();
+        let data = load_market_data(&args.cache_dir, &tickers, args.refresh, input.frequency)?;
+        let data_window = DataWindow {
+            frequency: input.frequency,
+            window_periods: window,
+            start: data.dates[data.dates.len() - window],
+            end: *data.dates.last().unwrap(),
+        };
+        let (_, trace) = run_portfolio_performance(&data.quality, data_window, &data, input)?;
+        println!("{}", serde_json::to_string_pretty(&trace)?);
+        return Ok(());
+    }
+
     let (portfolio, window, frequency, regime_covariance) = match &experiment {
         Experiment::FactorShock(i) => (&i.portfolio, i.resolved_window(), i.frequency, i.regime_covariance),
         Experiment::RiskDecomposition(i) => {
             (&i.portfolio, i.resolved_window(), i.frequency, i.regime_covariance)
         }
-        Experiment::CvarRebalance(_) => unreachable!("handled above"),
+        Experiment::CvarRebalance(_) | Experiment::PortfolioPerformance(_) => {
+            unreachable!("handled above")
+        }
     };
 
     let tickers = portfolio.tickers();
@@ -70,7 +88,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (_, trace) = run_risk_decomposition(&data.quality, data_window, &model, input)?;
             trace
         }
-        Experiment::CvarRebalance(_) => unreachable!("handled above"),
+        Experiment::CvarRebalance(_) | Experiment::PortfolioPerformance(_) => {
+            unreachable!("handled above")
+        }
     };
 
     println!("{}", serde_json::to_string_pretty(&trace)?);

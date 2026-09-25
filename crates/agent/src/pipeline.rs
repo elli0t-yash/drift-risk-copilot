@@ -121,6 +121,12 @@ fn experiment_summary(trace: &EvidenceTrace) -> String {
                 _ => "CvarRebalance experiment result.".to_string(),
             }
         }
+        "PortfolioPerformance" => match number(&["total_return"]) {
+            Some(r) => format!(
+                "PortfolioPerformance experiment result: total return over the window is {r:.4}."
+            ),
+            None => "PortfolioPerformance experiment result.".to_string(),
+        },
         other => format!("{other} experiment result."),
     }
 }
@@ -186,6 +192,20 @@ pub fn compute_trace(experiment: &Experiment) -> compute::Result<EvidenceTrace> 
             let data =
                 compute::data::load_market_data(cache_dir, &tickers, false, input.frequency)?;
             let (_, trace) = compute::cvar::run_cvar_rebalance(&data.quality, &data, input)?;
+            Ok(trace)
+        }
+        Experiment::PortfolioPerformance(input) => {
+            let tickers = input.portfolio.tickers();
+            let window = input.resolved_window();
+            let data =
+                compute::data::load_market_data(cache_dir, &tickers, false, input.frequency)?;
+            let data_window = build_data_window(&data, window, input.frequency);
+            let (_, trace) = compute::performance::run_portfolio_performance(
+                &data.quality,
+                data_window,
+                &data,
+                input,
+            )?;
             Ok(trace)
         }
     }

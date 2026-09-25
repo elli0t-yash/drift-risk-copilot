@@ -49,6 +49,7 @@ pub enum Experiment {
     FactorShock(FactorShockInput),
     RiskDecomposition(RiskDecompositionInput),
     CvarRebalance(CvarRebalanceInput),
+    PortfolioPerformance(PortfolioPerformanceInput),
 }
 
 // ---------------------------------------------------------------------
@@ -758,3 +759,9 @@ pub fn run_risk_decomposition(
 // ---------------------------------------------------------------------
 
 pub use crate::cvar::CvarRebalanceInput;
+
+// ---------------------------------------------------------------------
+// (d) PortfolioPerformance — see crate::performance.
+// ---------------------------------------------------------------------
+
+pub use crate::performance::PortfolioPerformanceInput;
