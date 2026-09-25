@@ -5,11 +5,12 @@
 //! needs to be present on the (distroless, no package manager) runtime
 //! image.
 //!
-//! Not persisted here: the `/ask` pipeline's narration/suggestion text --
-//! only the `EvidenceTrace` (as `trace_json`) and a handful of denormalized
-//! summary fields pulled out of it for fast querying. See the server
-//! crate's `routes::post_ask`/`post_experiment` for what gets inserted and
-//! the README for the tradeoff this implies for `GET /report/{id}`.
+//! Also persists the `/ask` pipeline's narration/suggestion/grounding-
+//! warnings text (`POST /experiment` leaves these `NULL` -- that path never
+//! calls Gemini, so there's no narration to store), alongside the
+//! `EvidenceTrace` (as `trace_json`) and a handful of denormalized summary
+//! fields pulled out of it for fast querying. See the server crate's
+//! `routes::post_ask`/`post_experiment` for what gets inserted.
 
 use std::sync::{Arc, Mutex};
 
@@ -39,6 +40,14 @@ pub struct RiskSnapshot {
     pub portfolio_vol_annualized: Option<f64>,
     pub cvar_historical: Option<f64>,
     pub trace_json: String,
+    /// `/ask`'s grounded narration text. `None` for a `/experiment`-
+    /// originated snapshot (that path never calls Gemini).
+    pub narration: Option<String>,
+    /// `/ask`'s proactive follow-up suggestion. `None` for `/experiment`.
+    pub suggestion: Option<String>,
+    /// JSON-encoded `Vec<String>` of `/ask`'s grounding warnings; `None` if
+    /// there were none (or this is a `/experiment` snapshot).
+    pub grounding_warnings: Option<String>,
 }
 
 pub struct SnapshotStore {
@@ -56,11 +65,35 @@ CREATE TABLE IF NOT EXISTS risk_snapshots (
     smoothed_probs TEXT,
     portfolio_vol_annualized REAL,
     cvar_historical REAL,
-    trace_json TEXT NOT NULL
+    trace_json TEXT NOT NULL,
+    narration TEXT,
+    suggestion TEXT,
+    grounding_warnings TEXT
 );
 CREATE INDEX IF NOT EXISTS risk_snapshots_portfolio_hash_created_at
     ON risk_snapshots (portfolio_hash, created_at);
 ";
+
+/// Columns added after the table's initial release. SQLite has no `ALTER
+/// TABLE ... ADD COLUMN IF NOT EXISTS`, so each is added via a `pragma_table_info`
+/// existence check instead -- safe to run against a pre-existing database
+/// that predates these columns (they're simply added, existing rows get
+/// `NULL`), and a no-op against a freshly `CREATE TABLE`d one (`SCHEMA`
+/// above already declares them, so `ensure_column` finds them present).
+const ADDITIVE_COLUMNS: &[(&str, &str)] =
+    &[("narration", "TEXT"), ("suggestion", "TEXT"), ("grounding_warnings", "TEXT")];
+
+fn ensure_column(conn: &Connection, name: &str, sql_type: &str) -> rusqlite::Result<()> {
+    let exists: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info('risk_snapshots') WHERE name = ?1",
+        params![name],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        conn.execute(&format!("ALTER TABLE risk_snapshots ADD COLUMN {name} {sql_type}"), [])?;
+    }
+    Ok(())
+}
 
 impl SnapshotStore {
     /// Opens (creating if absent) the SQLite database at `path` and runs the
@@ -70,6 +103,9 @@ impl SnapshotStore {
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
+        for (name, sql_type) in ADDITIVE_COLUMNS {
+            ensure_column(&conn, name, sql_type)?;
+        }
         Ok(SnapshotStore {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -90,8 +126,9 @@ impl SnapshotStore {
         conn.execute(
             "INSERT INTO risk_snapshots (
                 id, created_at, portfolio_hash, experiment_type, engine_version,
-                regime_label, smoothed_probs, portfolio_vol_annualized, cvar_historical, trace_json
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                regime_label, smoothed_probs, portfolio_vol_annualized, cvar_historical, trace_json,
+                narration, suggestion, grounding_warnings
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 id,
                 created_at,
@@ -103,6 +140,9 @@ impl SnapshotStore {
                 snapshot.portfolio_vol_annualized,
                 snapshot.cvar_historical,
                 snapshot.trace_json,
+                snapshot.narration,
+                snapshot.suggestion,
+                snapshot.grounding_warnings,
             ],
         )?;
         Ok(id)
@@ -113,7 +153,8 @@ impl SnapshotStore {
         let row = conn
             .query_row(
                 "SELECT id, created_at, portfolio_hash, experiment_type, engine_version,
-                        regime_label, smoothed_probs, portfolio_vol_annualized, cvar_historical, trace_json
+                        regime_label, smoothed_probs, portfolio_vol_annualized, cvar_historical, trace_json,
+                        narration, suggestion, grounding_warnings
                  FROM risk_snapshots WHERE id = ?1",
                 params![id],
                 row_to_snapshot,
@@ -129,7 +170,8 @@ impl SnapshotStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, created_at, portfolio_hash, experiment_type, engine_version,
-                    regime_label, smoothed_probs, portfolio_vol_annualized, cvar_historical, trace_json
+                    regime_label, smoothed_probs, portfolio_vol_annualized, cvar_historical, trace_json,
+                    narration, suggestion, grounding_warnings
              FROM risk_snapshots WHERE portfolio_hash = ?1
              ORDER BY created_at DESC, rowid DESC LIMIT ?2",
         )?;
@@ -145,7 +187,8 @@ impl SnapshotStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, created_at, portfolio_hash, experiment_type, engine_version,
-                    regime_label, smoothed_probs, portfolio_vol_annualized, cvar_historical, trace_json
+                    regime_label, smoothed_probs, portfolio_vol_annualized, cvar_historical, trace_json,
+                    narration, suggestion, grounding_warnings
              FROM risk_snapshots ORDER BY created_at DESC, rowid DESC LIMIT ?1",
         )?;
         let rows = stmt
@@ -173,6 +216,9 @@ fn row_to_snapshot(row: &rusqlite::Row) -> rusqlite::Result<RiskSnapshot> {
         portfolio_vol_annualized: row.get(7)?,
         cvar_historical: row.get(8)?,
         trace_json: row.get(9)?,
+        narration: row.get(10)?,
+        suggestion: row.get(11)?,
+        grounding_warnings: row.get(12)?,
     })
 }
 
@@ -192,6 +238,9 @@ mod tests {
             portfolio_vol_annualized: Some(0.15),
             cvar_historical: None,
             trace_json: serde_json::json!({"experiment": experiment_type}).to_string(),
+            narration: Some("Vol is 15.5% annualised.".to_string()),
+            suggestion: Some("What if I reduce my turnover to 20%?".to_string()),
+            grounding_warnings: Some(serde_json::to_string(&vec!["unverified number '99%'".to_string()]).unwrap()),
         }
     }
 
@@ -211,6 +260,24 @@ mod tests {
         assert_eq!(fetched.portfolio_vol_annualized, Some(0.15));
         assert_eq!(fetched.cvar_historical, None);
         assert_eq!(fetched.trace_json, snapshot.trace_json);
+        assert_eq!(fetched.narration, snapshot.narration);
+        assert_eq!(fetched.suggestion, snapshot.suggestion);
+        assert_eq!(fetched.grounding_warnings, snapshot.grounding_warnings);
+    }
+
+    #[test]
+    fn narration_and_grounding_warnings_are_null_for_an_experiment_originated_snapshot() {
+        let store = SnapshotStore::open(":memory:").unwrap();
+        let mut snapshot = sample_snapshot("abc123", "RiskDecomposition");
+        snapshot.narration = None;
+        snapshot.suggestion = None;
+        snapshot.grounding_warnings = None;
+        let id = store.insert(&snapshot).unwrap();
+
+        let fetched = store.get(&id).unwrap().unwrap();
+        assert_eq!(fetched.narration, None);
+        assert_eq!(fetched.suggestion, None);
+        assert_eq!(fetched.grounding_warnings, None);
     }
 
     #[test]
@@ -251,6 +318,49 @@ mod tests {
         }
         let recent = store.list_recent(2).unwrap();
         assert_eq!(recent.len(), 2);
+    }
+
+    /// `SnapshotStore::open` must be able to add `narration`/`suggestion`/
+    /// `grounding_warnings` to a database file created before those columns
+    /// existed, without erroring or losing existing rows.
+    #[test]
+    fn open_migrates_a_pre_existing_database_missing_the_new_columns() {
+        let dir = std::env::temp_dir().join(format!("store-migration-test-{}", Uuid::new_v4()));
+        let path = dir.to_str().unwrap().to_string();
+
+        // Simulate the pre-migration schema directly (no narration/suggestion/
+        // grounding_warnings columns), with one existing row.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE risk_snapshots (
+                    id TEXT PRIMARY KEY, created_at TEXT NOT NULL, portfolio_hash TEXT NOT NULL,
+                    experiment_type TEXT NOT NULL, engine_version TEXT NOT NULL, regime_label TEXT,
+                    smoothed_probs TEXT, portfolio_vol_annualized REAL, cvar_historical REAL,
+                    trace_json TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO risk_snapshots (id, created_at, portfolio_hash, experiment_type, engine_version, trace_json)
+                 VALUES ('old-id', '2026-01-01T00:00:00Z', 'hash', 'RiskDecomposition', '0.1.0', '{}')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let store = SnapshotStore::open(&path).expect("open should migrate the pre-existing schema");
+        let old_row = store.get("old-id").unwrap().expect("pre-existing row should survive the migration");
+        assert_eq!(old_row.narration, None);
+        assert_eq!(old_row.suggestion, None);
+        assert_eq!(old_row.grounding_warnings, None);
+
+        let new_snapshot = sample_snapshot("hash2", "CvarRebalance");
+        let new_id = store.insert(&new_snapshot).unwrap();
+        let fetched = store.get(&new_id).unwrap().unwrap();
+        assert_eq!(fetched.narration, new_snapshot.narration);
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

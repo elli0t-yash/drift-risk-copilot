@@ -8,14 +8,11 @@
 //! dependency tree -- azul-core, azul-layout, hyphenation,
 //! rust-fontconfig -- none of which this module touches).
 //!
-//! Renders from `EvidenceTrace` alone, not the full `/ask` pipeline result:
-//! since `SnapshotStore` only persists `trace_json` (see `store::RiskSnapshot`
-//! -- narration/suggestion text isn't part of that schema), a report
-//! requested after the process that served the original `/ask` restarts (or
-//! for a `/experiment` result, which never had narration) has no narration
-//! to show. The "Analysis" narration section from the old
-//! `PipelineResult`-based renderer is dropped accordingly; the report is
-//! now purely the evidence trace (key numbers + invariants + data quality).
+//! Renders from the pieces `store::RiskSnapshot` persists, not the full
+//! `/ask` pipeline result directly: `trace` (the `EvidenceTrace`, always
+//! present), plus `narration`/`grounding_warnings`, which are `Some`/
+//! non-empty only for a `/ask`-originated snapshot (`/experiment` never
+//! calls Gemini, so it has none to store).
 
 use compute::format::format_inr;
 use compute::trace::EvidenceTrace;
@@ -30,7 +27,12 @@ const CONTENT_WIDTH_MM: f32 = PAGE_WIDTH_MM - LEFT_MARGIN_MM - RIGHT_MARGIN_MM; 
 const RIGHT_EDGE_MM: f32 = PAGE_WIDTH_MM - RIGHT_MARGIN_MM;
 
 /// Renders `trace` as a one-page PDF and returns the raw file bytes.
-pub fn render_report(trace: &EvidenceTrace) -> Vec<u8> {
+/// `narration` is the stored snapshot's narration text (`None` for a
+/// `/experiment`-originated snapshot); `grounding_warnings` is its
+/// grounding-warning list (empty for `/experiment`, and often empty for
+/// `/ask` too -- only non-empty when the narration still had unmatched
+/// numbers after retries).
+pub fn render_report(trace: &EvidenceTrace, narration: Option<&str>, grounding_warnings: &[String]) -> Vec<u8> {
     let mut doc = PdfDocument::new("Drift Risk Copilot Report");
     let mut page = Page::new();
 
@@ -46,14 +48,45 @@ pub fn render_report(trace: &EvidenceTrace) -> Vec<u8> {
     page.rule();
     page.advance(8.0);
 
-    // --- Section 2: key numbers ---
+    // --- Section 2: narration ---
+    page.text(LEFT_MARGIN_MM, page.y, "Analysis", BuiltinFont::HelveticaBold, 12.0);
+    page.advance(6.0);
+    match narration {
+        Some(text) => {
+            page.wrapped_text(text, BuiltinFont::Helvetica, 10.0, 5.0);
+            if !grounding_warnings.is_empty() {
+                page.advance(2.0);
+                page.text(
+                    LEFT_MARGIN_MM,
+                    page.y,
+                    "[!] Some numbers in this explanation could not be verified.",
+                    BuiltinFont::HelveticaOblique,
+                    9.0,
+                );
+                page.advance(5.0);
+            }
+        }
+        None => {
+            page.text(
+                LEFT_MARGIN_MM,
+                page.y,
+                "No narrative \u{2014} direct experiment result.",
+                BuiltinFont::HelveticaOblique,
+                10.0,
+            );
+            page.advance(5.0);
+        }
+    }
+    page.advance(4.0);
+
+    // --- Section 3: key numbers ---
     page.text(LEFT_MARGIN_MM, page.y, "Key Numbers", BuiltinFont::HelveticaBold, 12.0);
     page.advance(6.0);
     let rows = key_numbers(&trace.experiment, result_value, &trace.model_params);
     page.table(&["Metric", "Value", "Unit"], &rows);
     page.advance(4.0);
 
-    // --- Section 3: evidence trace (abridged) ---
+    // --- Section 4: evidence trace (abridged) ---
     page.text(LEFT_MARGIN_MM, page.y, "Evidence Trace", BuiltinFont::HelveticaBold, 12.0);
     page.advance(6.0);
 
@@ -387,6 +420,16 @@ impl Page {
         });
     }
 
+    /// Word-wraps `text` at `CONTENT_WIDTH_MM` and draws it, advancing `y`
+    /// by `line_height_mm` per line.
+    fn wrapped_text(&mut self, text: &str, font: BuiltinFont, size_pt: f32, line_height_mm: f32) {
+        let text = pdf_safe(text);
+        for line in wrap_text(&text, font, size_pt, CONTENT_WIDTH_MM) {
+            self.text(LEFT_MARGIN_MM, self.y, &line, font, size_pt);
+            self.advance(line_height_mm);
+        }
+    }
+
     /// A simple 3-column table: header row bold, one row per entry,
     /// columns at fixed fractions of `CONTENT_WIDTH_MM` (55% / 25% / 20%).
     fn table(&mut self, headers: &[&str; 3], rows: &[[String; 3]]) {
@@ -441,5 +484,27 @@ fn text_width_mm(text: &str, font: BuiltinFont, size_pt: f32) -> f32 {
     let em_width: f32 = text.chars().map(|c| char_width_em(c, bold)).sum();
     let width_pt = em_width * size_pt;
     width_pt * (25.4 / 72.0)
+}
+
+fn wrap_text(text: &str, font: BuiltinFont, size_pt: f32, max_width_mm: f32) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let candidate = if current.is_empty() {
+            word.to_string()
+        } else {
+            format!("{current} {word}")
+        };
+        if text_width_mm(&candidate, font, size_pt) > max_width_mm && !current.is_empty() {
+            lines.push(current);
+            current = word.to_string();
+        } else {
+            current = candidate;
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 

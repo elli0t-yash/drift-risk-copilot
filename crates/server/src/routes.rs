@@ -59,6 +59,11 @@ fn snapshot_from_trace(trace: &EvidenceTrace, portfolio: &Portfolio) -> Result<R
         portfolio_vol_annualized,
         cvar_historical,
         trace_json,
+        // Populated by `post_ask` after this snapshot is built (this path
+        // never calls Gemini, so `post_experiment` leaves them `None`).
+        narration: None,
+        suggestion: None,
+        grounding_warnings: None,
     })
 }
 
@@ -155,7 +160,16 @@ pub async fn post_ask(
         .run_ask(req.portfolio, req.message, req.conversation_history)
         .await?;
 
-    let snapshot = snapshot_from_trace(&result.trace, &portfolio)?;
+    let mut snapshot = snapshot_from_trace(&result.trace, &portfolio)?;
+    snapshot.narration = Some(result.narration.narration.clone());
+    snapshot.suggestion = Some(result.suggestion.clone());
+    snapshot.grounding_warnings = if result.narration.grounding_warnings.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&result.narration.grounding_warnings).map_err(|e| {
+            ApiError::bad_request("internal_error", format!("failed to serialize grounding warnings: {e}"))
+        })?)
+    };
     let result_id = state.store.insert(&snapshot).map_err(|e| {
         ApiError::bad_request("internal_error", format!("failed to persist risk snapshot: {e}"))
     })?;
@@ -205,6 +219,16 @@ pub async fn get_report(State(state): State<AppState>, Path(result_id): Path<Str
                 .into_response();
         }
     };
-    let bytes = crate::pdf::render_report(&trace);
+    let grounding_warnings: Vec<String> = match &snapshot.grounding_warnings {
+        Some(json) => match serde_json::from_str(json) {
+            Ok(warnings) => warnings,
+            Err(e) => {
+                return ApiError::bad_request("internal_error", format!("stored grounding_warnings is invalid: {e}"))
+                    .into_response();
+            }
+        },
+        None => Vec::new(),
+    };
+    let bytes = crate::pdf::render_report(&trace, snapshot.narration.as_deref(), &grounding_warnings);
     (StatusCode::OK, [(header::CONTENT_TYPE, "application/pdf")], bytes).into_response()
 }

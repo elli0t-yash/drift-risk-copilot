@@ -137,6 +137,18 @@ fn app_with_backend_and_store(backend: MockBackend) -> (axum::Router, Arc<store:
     (app, store)
 }
 
+/// Whether `needle` appears in a rendered PDF's actual text content.
+/// `printpdf`'s `PdfSaveOptions::default()` (used by `pdf::render_report`)
+/// FlateDecode-compresses content streams, so the raw bytes don't contain
+/// `ShowText` string literals verbatim -- `lopdf::Document::extract_text`
+/// decompresses and decodes them properly.
+fn pdf_contains_text(bytes: &[u8], needle: &str) -> bool {
+    let doc = lopdf::Document::load_mem(bytes).expect("rendered report should be a valid PDF");
+    let page_numbers: Vec<u32> = doc.get_pages().keys().copied().collect();
+    let text = doc.extract_text(&page_numbers).expect("failed to extract text from rendered PDF");
+    text.contains(needle)
+}
+
 async fn body_json(response: axum::response::Response) -> serde_json::Value {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).unwrap()
@@ -396,6 +408,10 @@ async fn report_route_returns_pdf_for_a_result_stored_by_a_prior_ask() {
     assert_eq!(content_type, "application/pdf");
     let bytes = report_response.into_body().collect().await.unwrap().to_bytes();
     assert!(bytes.starts_with(b"%PDF"), "expected a PDF file signature");
+    assert!(
+        pdf_contains_text(&bytes, "Vol is 15.5% annualised."),
+        "expected the stored /ask narration text to appear in the report PDF"
+    );
 }
 
 #[tokio::test]
@@ -537,6 +553,10 @@ async fn report_route_retrieves_an_experiment_originated_snapshot() {
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     assert!(bytes.starts_with(b"%PDF"), "expected a PDF file signature");
+    assert!(
+        pdf_contains_text(&bytes, "No narrative"),
+        "an /experiment-originated report has no narration, so should render the placeholder text"
+    );
 }
 
 #[tokio::test]
