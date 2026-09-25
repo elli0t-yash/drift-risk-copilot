@@ -29,6 +29,7 @@ pub enum PipelineError {
     Suggest(#[from] crate::suggest::SuggestError),
 }
 
+#[derive(Clone)]
 pub struct PipelineResult {
     pub experiment: Experiment,
     pub trace: EvidenceTrace,
@@ -64,10 +65,18 @@ pub async fn run<C: GeminiClient>(
         .await
         .expect("compute_trace task panicked")?;
 
-    let narration =
-        crate::grounding::grounded_narrate(client, &trace, conversation_history).await?;
+    // narrate and suggest are both independent Gemini calls that only
+    // depend on `trace` (not on each other's output -- suggest takes a
+    // short summary built from the trace directly, not the narration), so
+    // run them concurrently rather than back-to-back.
+    let summary = experiment_summary(&trace);
+    let (narration_result, suggestion_result) = tokio::join!(
+        crate::grounding::grounded_narrate(client, &trace, conversation_history),
+        suggest_follow_up(client, &summary),
+    );
+    let narration = narration_result?;
+    let suggestion = suggestion_result?;
     let assistant_turn = ConversationTurn::assistant(narration.narration.clone());
-    let suggestion = suggest_follow_up(client, &narration.narration).await?;
 
     Ok(PipelineResult {
         experiment,
@@ -76,6 +85,44 @@ pub async fn run<C: GeminiClient>(
         assistant_turn,
         suggestion,
     })
+}
+
+/// A short plain-text summary of `trace` (experiment type + one key output
+/// number), used as `suggest_follow_up`'s input instead of the narration --
+/// the two Gemini calls run concurrently (see `run`), so suggest can't wait
+/// on narrate's output.
+fn experiment_summary(trace: &EvidenceTrace) -> String {
+    let result = trace.outputs.get("result");
+    let number = |path: &[&str]| -> Option<f64> {
+        let mut v = result?;
+        for key in path {
+            v = v.get(key)?;
+        }
+        v.as_f64()
+    };
+    match trace.experiment.as_str() {
+        "FactorShock" => match number(&["portfolio_pnl_inr"]) {
+            Some(pnl) => format!("FactorShock experiment result: portfolio P&L is {pnl:.2} INR."),
+            None => "FactorShock experiment result.".to_string(),
+        },
+        "RiskDecomposition" => match number(&["portfolio_vol_annualized"]) {
+            Some(vol) => {
+                format!("RiskDecomposition experiment result: annualised portfolio vol is {vol:.6}.")
+            }
+            None => "RiskDecomposition experiment result.".to_string(),
+        },
+        "CvarRebalance" => {
+            let before = number(&["stats_before", "historical_cvar"]);
+            let after = number(&["stats_after", "historical_cvar"]);
+            match (before, after) {
+                (Some(b), Some(a)) => format!(
+                    "CvarRebalance experiment result: historical CVaR went from {b:.6} to {a:.6}."
+                ),
+                _ => "CvarRebalance experiment result.".to_string(),
+            }
+        }
+        other => format!("{other} experiment result."),
+    }
 }
 
 fn build_data_window(

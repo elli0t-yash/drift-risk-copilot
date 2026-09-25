@@ -21,7 +21,8 @@ to call the correct function -- run_factor_shock, run_risk_decomposition, or run
 -- with the parameters extracted from the user's message. Do not add explanation. Do not ask \
 clarifying questions. If the user's intent clearly maps to one of the three experiment types, \
 call the function. If it does not, return a text response with one sentence explaining what you \
-cannot extract.";
+cannot extract. For CvarRebalance: if the user does not mention a per-name cap, omit \
+per_name_cap from the function call.";
 
 #[derive(Debug, Error)]
 pub enum ParseError {

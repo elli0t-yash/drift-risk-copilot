@@ -38,6 +38,7 @@ impl GroundingCheck {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct GroundedNarration {
     pub narration: String,
     /// Empty if the narration passed grounding (on the first attempt or

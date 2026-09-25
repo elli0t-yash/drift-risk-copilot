@@ -55,6 +55,7 @@ fn sample_trace() -> EvidenceTrace {
             annualization_factor: 252.0,
             regime_state: None,
             regime_fallback_warnings: vec![],
+            cap_source: None,
         },
         outputs: serde_json::json!({ "result": { "portfolio_vol_annualized": 0.1552 } }),
         invariants: vec![],
@@ -104,6 +105,7 @@ impl Backend for MockBackend {
 fn app_with_backend(backend: MockBackend) -> axum::Router {
     build_router(AppState {
         backend: Arc::new(backend),
+        store: Arc::new(crate::store::ResultStore::new()),
     })
 }
 
@@ -247,6 +249,7 @@ async fn ask_with_mocked_pipeline_returns_grounding_warnings() {
     assert_eq!(body["assistant_turn"]["role"], "assistant");
     assert_eq!(body["assistant_turn"]["content"], "Vol is 99% (unverified).");
     assert_eq!(body["suggestion"], "What if I reduce my turnover to 20%?");
+    assert!(body["result_id"].is_string(), "expected a result_id field, got {body:?}");
 }
 
 #[tokio::test]
@@ -273,6 +276,7 @@ async fn ask_with_non_empty_conversation_history_forwards_it_to_the_backend() {
     });
     let app = build_router(AppState {
         backend: backend.clone(),
+        store: Arc::new(crate::store::ResultStore::new()),
     });
 
     let req_body = serde_json::json!({
@@ -302,6 +306,93 @@ async fn ask_with_non_empty_conversation_history_forwards_it_to_the_backend() {
     assert_eq!(history[0].role, "user");
     assert_eq!(history[1].role, "assistant");
     assert_eq!(history[1].content, "Vol is 15.5% annualised.");
+}
+
+#[tokio::test]
+async fn report_route_returns_pdf_for_a_result_stored_by_a_prior_ask() {
+    let pipeline_result = agent::pipeline::PipelineResult {
+        experiment: Experiment::RiskDecomposition(RiskDecompositionInput {
+            portfolio: sample_portfolio(),
+            frequency: Frequency::Daily,
+            window: None,
+            regime_covariance: false,
+        }),
+        trace: sample_trace(),
+        narration: agent::grounding::GroundedNarration {
+            narration: "Vol is 15.5% annualised.".to_string(),
+            grounding_warnings: vec![],
+        },
+        assistant_turn: agent::ConversationTurn::assistant("Vol is 15.5% annualised."),
+        suggestion: "Now reduce my tail risk?".to_string(),
+    };
+    let app = app_with_backend(MockBackend {
+        experiment_result: None,
+        ask_result: Some(pipeline_result),
+        received_conversation_history: Mutex::new(None),
+    });
+
+    let ask_body = serde_json::json!({
+        "portfolio": sample_portfolio(),
+        "message": "where is my risk concentrated?",
+    });
+    let ask_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ask")
+                .header("content-type", "application/json")
+                .body(Body::from(ask_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ask_response.status(), StatusCode::OK);
+    let ask_json = body_json(ask_response).await;
+    let result_id = ask_json["result_id"].as_str().expect("result_id should be a string").to_string();
+
+    let report_response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/report/{result_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report_response.status(), StatusCode::OK);
+    let content_type = report_response
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert_eq!(content_type, "application/pdf");
+    let bytes = report_response.into_body().collect().await.unwrap().to_bytes();
+    assert!(bytes.starts_with(b"%PDF"), "expected a PDF file signature");
+}
+
+#[tokio::test]
+async fn report_route_returns_404_for_an_unknown_id() {
+    let app = app_with_backend(MockBackend {
+        experiment_result: None,
+        ask_result: None,
+        received_conversation_history: Mutex::new(None),
+    });
+
+    let unknown_id = uuid::Uuid::new_v4();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/report/{unknown_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

@@ -81,7 +81,7 @@ async fn parses_cvar_rebalance_function_call() {
 
     match experiment {
         Experiment::CvarRebalance(input) => {
-            assert_eq!(input.per_name_cap, 0.2);
+            assert_eq!(input.per_name_cap, Some(0.2));
             assert_eq!(input.turnover_limit, 0.3);
             assert_eq!(input.portfolio.tickers(), portfolio.tickers());
         }

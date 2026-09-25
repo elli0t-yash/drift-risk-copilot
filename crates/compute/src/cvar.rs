@@ -22,6 +22,10 @@ fn default_confidence_level() -> f64 {
     0.95
 }
 
+/// Applied when the caller omits `per_name_cap` entirely (e.g. a `/ask`
+/// request where the user never mentioned a cap).
+pub const DEFAULT_PER_NAME_CAP: f64 = 0.20;
+
 /// Commission is charged on the traded (turnover) value; 10 bps (0.10%) is
 /// a reasonable blended default for Indian equity brokerage + STT + other
 /// statutory charges on a delivery trade, but is always caller-overridable.
@@ -36,8 +40,12 @@ pub struct CvarRebalanceInput {
     /// Confidence level beta for CVaR/VaR (e.g. 0.95 = worst 5% tail).
     #[serde(default = "default_confidence_level")]
     pub confidence_level: f64,
-    /// Per-name maximum weight (fraction, e.g. 0.20 for 20%).
-    pub per_name_cap: f64,
+    /// Per-name maximum weight (fraction, e.g. 0.20 for 20%). `None` when
+    /// the caller (or the parsed NL request) didn't specify one; defaults
+    /// to `DEFAULT_PER_NAME_CAP` (0.20), recorded as `model_params.cap_source`
+    /// in the trace (`"user-specified"` vs. `"server-default-0.20"`).
+    #[serde(default)]
+    pub per_name_cap: Option<f64>,
     /// Maximum turnover, Sum_i |w_i - w0_i| (fraction, both buys and sells
     /// counted; e.g. 0.30 allows up to 30% of the portfolio to trade).
     pub turnover_limit: f64,
@@ -199,6 +207,11 @@ pub fn run_cvar_rebalance(
     };
     let regime_portfolio_vol_annualized_before = regime_vol(&weights_before);
 
+    let (cap, cap_source) = match input.per_name_cap {
+        Some(c) => (c, "user-specified"),
+        None => (DEFAULT_PER_NAME_CAP, "server-default-0.20"),
+    };
+
     let data_window = DataWindow {
         frequency: input.frequency,
         window_periods: window,
@@ -215,6 +228,7 @@ pub fn run_cvar_rebalance(
         annualization_factor: 1.0,
         regime_state,
         regime_fallback_warnings,
+        cap_source: Some(cap_source.to_string()),
     };
 
     let make_trace = |output: &CvarRebalanceOutput, invariants: Vec<InvariantCheck>| -> Result<EvidenceTrace> {
@@ -237,7 +251,6 @@ pub fn run_cvar_rebalance(
 
     // --- Pre-solve feasibility check (necessary conditions; the LP solve
     // itself remains the authoritative feasibility check) ---
-    let cap = input.per_name_cap;
     if cap <= 0.0 || cap > 1.0 {
         return Err(ComputeError::InvalidInput(format!(
             "per_name_cap must be in (0, 1], got {cap}"

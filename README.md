@@ -981,3 +981,179 @@ the test can inspect what it captured after the request completes.
   `suggest`'s added latency (one more sequential Gemini call in `/ask`,
   per spec "sequential is fine") is therefore also unmeasured against real
   API latency in this session.
+
+## PDF reports, result store, and CVaR cap defaulting
+
+### In-memory result store (`server::store`)
+
+`ResultStore`: a fixed-capacity (`20`) ring buffer (`VecDeque<(Uuid, PipelineResult)>`
+behind a `Mutex`), keyed by a server-generated UUID v4. Every successful
+`POST /ask` inserts its `PipelineResult` and returns the id as
+`result_id` in `AskResponse`; the oldest entry is evicted once the buffer
+is full. `POST /experiment` does **not** store anything -- it has no
+narration/suggestion to report on, only a bare `EvidenceTrace`.
+`agent::pipeline::PipelineResult` and `agent::grounding::GroundedNarration`
+both gained `#[derive(Clone)]` (a small, unavoidable agent-crate touch):
+`ResultStore::get(&self, id) -> Option<PipelineResult>` hands the caller
+its own owned copy without moving the entry out of the shared queue, which
+needs `Clone`, not a reference.
+
+### `GET /report/{result_id}` (`server::pdf`)
+
+A single-page A4 PDF built on `printpdf = "=0.12.8"` (pinned exactly, see
+"Judgment calls" below for why the version matters here more than usual).
+404 (`result_not_found`) if the id was never stored or has since been
+evicted. Layout: header (title + experiment type/timestamp, rule),
+Analysis (word-wrapped narration + a grounding-warning line if any),
+key Numbers (a 3-column table, one row set per experiment type -- P&L/
+given+implied shocks/regime/crisis P&L for FactorShock; vol/top-2 factors/
+specific risk/regime for RiskDecomposition; CVaR before/after/reduction/
+turnover/commission for CvarRebalance), Evidence Trace (model params,
+data quality, invariants with pass/fail), footer (fixed regime-smoothing
+disclaimer). Single-pass, no pagination, per spec.
+
+### Shared INR formatting (`compute::format::format_inr`)
+
+`format_inr(1_177_846.39) == "\u{20b9}11,77,846"` -- Indian lakh grouping
+(last 3 digits, then pairs), Unicode minus (not ASCII hyphen) for
+negatives. Lives in `compute` (not `server`) since it's used both there
+(the PDF) and in `compute` itself: `FactorShockOutput` gained
+`formatted_pnl_inr: String`, a pre-formatted sibling of the existing raw
+`portfolio_pnl_inr: f64` field, so the agent's narration has a ready-to-
+cite string. The raw numeric field is unchanged and is still what
+grounding checks against.
+
+### CvarRebalance `per_name_cap` defaulting
+
+`CvarRebalanceInput::per_name_cap` is now `Option<f64>` (was a required
+`f64`); when omitted, `run_cvar_rebalance` defaults it to
+`cvar::DEFAULT_PER_NAME_CAP` (0.20) and records which happened as
+`model_params.cap_source`: `"user-specified"` or `"server-default-0.20"`.
+`parse::PARSE_SYSTEM_PROMPT` gained a line telling Gemini to omit
+`per_name_cap` entirely when the user doesn't mention a cap (rather than
+guessing a number), which is exactly what makes the Option/default path
+reachable from a real `/ask` request.
+
+**Judgment call, and a real spec/reality mismatch**: the checkpoint spec
+asked for this defaulting to live "in server/src/routes.rs, ... after
+deserialising AskRequest". That's not actually reachable there --
+`AskRequest` carries the raw NL `message`, not a parsed `Experiment`;
+parsing happens inside `agent::pipeline::run` (via Gemini), which
+`routes.rs` never sees mid-flight. I implemented the default (and
+`cap_source` recording) inside `compute::cvar::run_cvar_rebalance` itself
+instead, which is the one place that's guaranteed to run for *every* path
+that reaches CvarRebalance -- `/ask`, `/experiment`, and the `experiment`
+CLI alike -- so the behavior the spec actually wants (a missing cap
+defaults to 0.20, and the trace says which) holds everywhere, not just
+`/ask`. Tested at the compute level (`cvar_tests.rs`), not as a `/ask`
+integration test, since `server`'s `MockBackend` returns canned results
+regardless of input and never touches real `compute` code.
+
+### Parallelising narrate + suggest (`agent::pipeline`)
+
+`pipeline::run` now runs `grounded_narrate` and `suggest_follow_up`
+concurrently via `tokio::join!`, instead of narrate-then-suggest in
+sequence. This required `suggest_follow_up` to stop taking the
+narration text as input (narrate hasn't necessarily finished when suggest
+starts) -- it now takes a short plain-text `experiment_summary` built
+directly from the trace (`pipeline::experiment_summary`: experiment type +
+one key output number, e.g. `"CvarRebalance experiment result: historical
+CVaR went from 0.0204 to 0.0190."`), which is available as soon as the
+compute step finishes, before either Gemini call starts.
+
+**Live latency comparison**, same two-turn exchange as the previous
+checkpoint's report (10-stock Nifty portfolio, real Gemini):
+
+| | previous checkpoint (sequential) | this checkpoint (parallel) |
+|---|---|---|
+| Turn 1: "Where is my risk concentrated?" | 14.1s | 7.7s |
+| Turn 2: rebalance request | ~14-20s (had transient retries) | 7.2s |
+
+Turn 1 (clean, no retries, in both runs) is the fairest comparison: **14.1s
+-> 7.7s, about 45% faster**, consistent with removing one whole sequential
+Gemini round trip's worth of latency (narrate and suggest now overlap
+instead of stacking).
+
+### Tests
+
+`store::tests`: insert 21 items into a capacity-20 store, the oldest (index
+0) is evicted, the remaining 20 are all retrievable. `server::tests`:
+`GET /report/{id}` after a real `POST /ask` returns 200,
+`Content-Type: application/pdf`, and a body starting with the `%PDF`
+signature; `GET /report/{unknown-uuid}` returns 404; `POST /ask`'s
+response includes `result_id`. `compute::cvar_tests`: an omitted
+`per_name_cap` resolves to 0.20 and every post-rebalance weight respects
+it, with `cap_source == "server-default-0.20"`; a given `per_name_cap`
+records `cap_source == "user-specified"`. `format::tests`: the four cases
+from the spec (`1_177_846.39`, `-1_177_846.39`, `3_000.0`, `100.0`).
+
+### Judgment calls, and a printpdf finding I want to flag explicitly
+
+**`printpdf` resolved to `0.12.8`, a complete API rewrite** from the
+`PdfLayerReference`-based API most printpdf tutorials/examples still show.
+0.12 is `Op`-list based (`PdfDocument::new`, `PdfPage::new(w, h, ops)`,
+`doc.with_pages(...).save(...)`) with no `PdfLayerReference`/
+`add_builtin_font` returning a font reference to call `.use_text()` on --
+I read the crate's own source (`~/.cargo/registry/.../printpdf-0.12.8/src`)
+and its `examples/text.rs` to confirm the actual current shape before
+writing `server::pdf`, rather than assuming the older API. This version
+also pulls in a much heavier dependency tree than the name suggests
+(`azul-core`, `azul-layout`, `hyphenation`, `rust-fontconfig`) for an
+**optional HTML/CSS-to-PDF layout engine that `server::pdf` never uses** --
+only the low-level `Op` primitives (text positioning, `DrawLine`). Pinned
+exactly (`=0.12.8`) per spec, and worth pinning exactly given how much the
+API moved between versions.
+
+**Confirmed layout/encoding bug, found live, not hypothetical**: printpdf's
+built-in fonts use `/Encoding /WinAnsiEncoding` (CP1252, single-byte).
+Traced it to the byte level in a real generated PDF's content stream:
+any character outside that repertoire -- ₹ (rupee), the Unicode minus
+− that `format_inr` uses for negative amounts, ✓/✗, ⚠ -- is
+silently written as a literal `?` glyph, no error, no warning. First
+observed as `"Commission Cost | ?2,000 | ?"` in a live-generated report.
+Per this checkpoint's explicit instruction ("flag immediately ... don't
+work around silently"), I stopped and reported this verbatim before doing
+anything else, including the specific finding that a *negative* rupee
+figure (the common case -- most FactorShock P&L in this app is a loss)
+would have rendered as `"??11,77,846"`, not `"\u{2212}\u{20b9}11,77,846"`.
+Given the choice between an ASCII fallback (no new dependency), embedding
+a real Unicode font (rejected by the checkpoint spec's own "no font files"
+instruction), or shipping the `?`s, the chosen fix -- confirmed by the
+person running this session -- is a PDF-only ASCII substitution
+(`server::pdf::pdf_safe`: ₹->`"Rs."`, −->`"-"`, ✓->`"Y"`,
+✗->`"N"`, ⚠->`"!"`), applied once at the single funnel point every
+piece of PDF text passes through (`Page::text`). `compute::format_inr`
+itself, and every other consumer of it (the trace field, JSON API
+responses), is untouched -- this is a PDF-rendering-only substitution, not
+a change to what the app reports elsewhere. Re-verified live afterward: a
+real negative-P&L FactorShock report now shows `"-Rs.11,77,846"` and `"Y"`/
+`"N"` for invariants, correctly.
+
+**Word-wrap uses an approximate per-character width heuristic**
+(`server::pdf::char_width_em`), not real Helvetica AFM metrics --
+printpdf's builtin fonts expose no width/measurement API (only externally
+loaded `ParsedFont`s carry `glyph_widths`). The heuristic (narrow
+punctuation/`i`/`l` ~0.28em, wide `m`/`w`/uppercase ~0.7-0.83em, ~0.52em
+default, bold +5%) is close enough that wrapping at 170mm didn't visibly
+break in any of the live reports generated this session, but it is an
+approximation, not a measurement, and I'm flagging it as such rather than
+presenting it as exact.
+
+**Table cells are not word-wrapped** (only the Analysis section's
+narration is) -- a long `Evidence Trace` invariant `detail` string (these
+can run 60-70 characters, e.g. `"lhs=-1177846.374721108703
+rhs=-1177846.374721108703 abs_diff=0.000e0"`) draws starting at the
+Detail column's x-position and extends past the page's right margin
+uncorrected, rather than wrapping or truncating. Confirmed via `qpdf
+--check` (structurally valid) and `pdftotext`, not visually re-rendered
+end-to-end in an actual PDF viewer this session. Left as-is rather than
+building a general cell-wrapping table renderer, consistent with the
+spec's own "single-pass layout -- no pagination needed for a demo" scope,
+but noted here rather than silently accepted.
+
+**Report generation timestamp is wall-clock, not experiment-run time**:
+`EvidenceTrace` carries no "when was this computed" field, so the header's
+timestamp is `chrono::Utc::now()` at PDF-render time (which can be later
+than when the underlying `/ask` actually ran, if the result sat in the
+store for a while). Good enough for a demo; would need a real field on
+`EvidenceTrace` to be exact.

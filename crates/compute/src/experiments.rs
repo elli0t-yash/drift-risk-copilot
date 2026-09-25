@@ -164,6 +164,12 @@ pub struct FactorShockOutput {
     /// summed. Exact (not an approximation) regardless of
     /// `linear_approximation`.
     pub portfolio_pnl_inr: f64,
+    /// `portfolio_pnl_inr`, pre-formatted with Indian lakh grouping (see
+    /// `crate::format::format_inr`), so the agent's narration has a
+    /// ready-to-cite string instead of reformatting the raw number itself.
+    /// The raw `portfolio_pnl_inr` field above is unchanged -- grounding
+    /// still checks against that number, not this string.
+    pub formatted_pnl_inr: String,
     /// Value-weighted sum of log returns, Sum_i value_i * log_return_i.
     /// This is what `factor_attribution_log_inr` sums to exactly (an exact
     /// identity in log-return space); it is *not* the same number as
@@ -535,6 +541,7 @@ pub fn run_factor_shock(
         implied_shocks,
         per_holding: primary.per_holding,
         portfolio_pnl_inr: primary.portfolio_pnl_inr,
+        formatted_pnl_inr: crate::format::format_inr(primary.portfolio_pnl_inr),
         portfolio_log_pnl_inr: primary.portfolio_log_pnl_inr,
         factor_attribution_log_inr: primary.factor_attribution_log_inr,
         factor_correlation,
@@ -569,6 +576,7 @@ pub fn run_factor_shock(
             annualization_factor: model.frequency.annualization_factor(),
             regime_state: model.regime_state.clone(),
             regime_fallback_warnings: model.regime_fallback_warnings.clone(),
+            cap_source: None,
         },
         outputs: serde_json::json!({
             "result": output,
@@ -735,6 +743,7 @@ pub fn run_risk_decomposition(
             annualization_factor: model.frequency.annualization_factor(),
             regime_state: model.regime_state.clone(),
             regime_fallback_warnings: model.regime_fallback_warnings.clone(),
+            cap_source: None,
         },
         outputs: serde_json::json!({ "result": output }),
         invariants,

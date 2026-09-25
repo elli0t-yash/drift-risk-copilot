@@ -1,14 +1,17 @@
 use std::sync::Arc;
 
-use axum::extract::State;
-use axum::response::Html;
+use axum::extract::{Path, State};
+use axum::http::{header, StatusCode};
+use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
 use compute::experiments::{Experiment, Portfolio};
 use compute::trace::EvidenceTrace;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::backend::Backend;
 use crate::error::{ApiError, AppJson};
+use crate::store::ResultStore;
 use crate::validate::validate_portfolio;
 
 const INDEX_HTML: &str = include_str!("../static/index.html");
@@ -16,6 +19,7 @@ const INDEX_HTML: &str = include_str!("../static/index.html");
 #[derive(Clone)]
 pub struct AppState {
     pub backend: Arc<dyn Backend>,
+    pub store: Arc<ResultStore>,
 }
 
 #[derive(Serialize)]
@@ -88,6 +92,9 @@ pub struct AskResponse {
     pub assistant_turn: agent::ConversationTurn,
     /// One follow-up question a risk manager would naturally ask next.
     pub suggestion: String,
+    /// Stored under this id in the server's in-memory `ResultStore`;
+    /// `GET /report/{result_id}` renders it as a PDF.
+    pub result_id: Uuid,
 }
 
 pub async fn post_ask(
@@ -100,6 +107,7 @@ pub async fn post_ask(
         .backend
         .run_ask(req.portfolio, req.message, req.conversation_history)
         .await?;
+    let result_id = state.store.insert(result.clone());
     Ok(Json(AskResponse {
         experiment: result.experiment,
         trace: result.trace,
@@ -107,6 +115,7 @@ pub async fn post_ask(
         grounding_warnings: result.narration.grounding_warnings,
         assistant_turn: result.assistant_turn,
         suggestion: result.suggestion,
+        result_id,
     }))
 }
 
@@ -120,4 +129,23 @@ pub async fn static_handler() -> Html<&'static str> {
 /// authentication, no portfolio needed.
 pub async fn get_scenarios() -> Json<serde_json::Value> {
     Json(serde_json::to_value(compute::scenarios::all_scenarios()).expect("scenarios always serialize"))
+}
+
+/// `GET /report/{result_id}`: a one-page PDF report for a previously
+/// stored `/ask` result. 404 if `result_id` is unknown (never stored, or
+/// evicted from the fixed-capacity `ResultStore`).
+pub async fn get_report(State(state): State<AppState>, Path(result_id): Path<Uuid>) -> Response {
+    match state.store.get(&result_id) {
+        Some(result) => {
+            let bytes = crate::pdf::render_report(&result);
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/pdf")],
+                bytes,
+            )
+                .into_response()
+        }
+        None => ApiError::not_found("result_not_found", format!("no stored result for id {result_id}"))
+            .into_response(),
+    }
 }
