@@ -3,7 +3,7 @@
 
 use compute::experiments::{
     CvarRebalanceInput, Experiment, FactorShockInput, Portfolio, PortfolioPerformanceInput,
-    RiskDecompositionInput,
+    RiskDecompositionInput, RiskDriftInput,
 };
 use thiserror::Error;
 
@@ -11,7 +11,7 @@ use crate::conversation::{turn_to_content, ConversationTurn};
 use crate::gemini::{Content, GeminiClient, GeminiError, GeminiRequest, Part, Tool, MODEL_PARSE};
 use crate::schema::{
     experiment_function_declarations, CVAR_REBALANCE_FUNCTION, FACTOR_SHOCK_FUNCTION,
-    PORTFOLIO_PERFORMANCE_FUNCTION, RISK_DECOMPOSITION_FUNCTION,
+    PORTFOLIO_PERFORMANCE_FUNCTION, RISK_DECOMPOSITION_FUNCTION, RISK_DRIFT_FUNCTION,
 };
 
 /// Adapted from the checkpoint spec's original wording, which named a
@@ -20,12 +20,12 @@ use crate::schema::{
 /// discriminator from a `oneOf`-typed function's args), so this names the
 /// real functions instead. Everything else is unchanged.
 pub const PARSE_SYSTEM_PROMPT: &str = "You are a parameter extraction engine. Your only job is \
-to call the correct function -- run_factor_shock, run_risk_decomposition, run_cvar_rebalance, or \
-run_portfolio_performance -- with the parameters extracted from the user's message. Do not add \
-explanation. Do not ask clarifying questions. If the user's intent clearly maps to one of the \
-four experiment types, call the function. If it does not, return a text response with one \
-sentence explaining what you cannot extract. For CvarRebalance: if the user does not mention a \
-per-name cap, omit per_name_cap from the function call.";
+to call the correct function -- run_factor_shock, run_risk_decomposition, run_cvar_rebalance, \
+run_portfolio_performance, or run_risk_drift -- with the parameters extracted from the user's \
+message. Do not add explanation. Do not ask clarifying questions. If the user's intent clearly \
+maps to one of the five experiment types, call the function. If it does not, return a text \
+response with one sentence explaining what you cannot extract. For CvarRebalance: if the user \
+does not mention a per-name cap, omit per_name_cap from the function call.";
 
 #[derive(Debug, Error)]
 pub enum ParseError {
@@ -102,6 +102,9 @@ pub async fn parse_experiment<C: GeminiClient>(
                 PORTFOLIO_PERFORMANCE_FUNCTION => Experiment::PortfolioPerformance(
                     serde_json::from_value::<PortfolioPerformanceInput>(args)?,
                 ),
+                RISK_DRIFT_FUNCTION => {
+                    Experiment::RiskDrift(serde_json::from_value::<RiskDriftInput>(args)?)
+                }
                 other => return Err(ParseError::UnexpectedFunction(other.to_string())),
             };
             return Ok(experiment);

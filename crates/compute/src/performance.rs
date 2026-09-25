@@ -194,6 +194,7 @@ pub fn run_portfolio_performance(
         }),
         invariants: vec![invariant],
         engine_version: crate::trace::engine_version(),
+        baseline_model_params: None,
     };
 
     Ok((output, trace))

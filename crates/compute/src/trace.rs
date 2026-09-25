@@ -25,11 +25,14 @@ pub struct ModelParams {
     pub factor_names: Vec<String>,
     pub shrinkage_intensity: f64,
     pub annualization_factor: f64,
-    /// `Some` only when the experiment requested `regime_covariance: true`.
+    /// Always populated (regime-conditioning is unconditional -- see
+    /// `model::fit_factor_model`); `None` only for experiment types that
+    /// fit no factor model at all and whose own standalone regime fit also
+    /// failed (see `performance::run_portfolio_performance`).
     pub regime_state: Option<RegimeState>,
     /// Non-empty only when `regime_state` is `Some` and at least one
     /// regime had fewer than `model::MIN_REGIME_OBSERVATIONS` observations
-    /// in the fitted window (see `model::fit_factor_model_with_config`).
+    /// in the fitted window (see `model::fit_factor_model`).
     pub regime_fallback_warnings: Vec<String>,
     /// `Some` only for `CvarRebalance`: `"user-specified"` if the caller
     /// gave `per_name_cap`, `"server-default-0.20"` if it was defaulted
@@ -58,6 +61,18 @@ impl InvariantCheck {
     }
 }
 
+/// Key params from a `RiskDrift` baseline snapshot's own trace, carried
+/// alongside the current fit's `model_params` so a `RiskDrift` trace is
+/// self-contained (a reader doesn't have to separately fetch the baseline
+/// snapshot to know what it was fit against).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BaselineModelParams {
+    pub window_periods: usize,
+    pub frequency: Frequency,
+    pub shrinkage_intensity: f64,
+    pub regime_label: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct EvidenceTrace {
     pub experiment: String,
@@ -68,6 +83,10 @@ pub struct EvidenceTrace {
     pub outputs: serde_json::Value,
     pub invariants: Vec<InvariantCheck>,
     pub engine_version: String,
+    /// `Some` only for `RiskDrift` (see `BaselineModelParams`); `None` for
+    /// every other experiment type.
+    #[serde(default)]
+    pub baseline_model_params: Option<BaselineModelParams>,
 }
 
 pub fn engine_version() -> String {

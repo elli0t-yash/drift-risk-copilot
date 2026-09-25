@@ -31,6 +31,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "store",
  "thiserror 1.0.69",
  "tokio",
 ]
@@ -584,6 +585,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "store",
  "thiserror 1.0.69",
 ]
 

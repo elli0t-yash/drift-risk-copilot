@@ -129,5 +129,6 @@ fn sample_trace() -> compute::trace::EvidenceTrace {
         outputs: serde_json::json!({ "result": { "portfolio_vol_annualized": 0.1552 } }),
         invariants: vec![],
         engine_version: "0.1.0".to_string(),
+        baseline_model_params: None,
     }
 }

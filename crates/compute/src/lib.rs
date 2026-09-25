@@ -1,5 +1,8 @@
+pub mod context;
 pub mod cvar;
 pub mod data;
+pub mod dispatch;
+pub mod drift;
 pub mod error;
 pub mod experiments;
 pub mod format;

@@ -34,7 +34,6 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let backend: Arc<dyn Backend> = Arc::new(RealBackend::new(gemini));
     let db_path =
         std::env::var("SNAPSHOT_DB_PATH").unwrap_or_else(|_| DEFAULT_SNAPSHOT_DB_PATH.to_string());
     let store = match SnapshotStore::open(&db_path) {
@@ -44,6 +43,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let backend: Arc<dyn Backend> = Arc::new(RealBackend::new(gemini, store.clone()));
     let state = AppState { backend, store };
 
     let app = build_router(state);
@@ -71,6 +71,7 @@ fn build_router(state: AppState) -> Router {
         .route("/experiment", post(routes::post_experiment))
         .route("/ask", post(routes::post_ask))
         .route("/report/:result_id", get(routes::get_report))
+        .route("/drift", get(routes::get_drift))
         .route("/portfolio/upload", post(upload::post_portfolio_upload))
         .fallback(routes::static_handler)
         .layer(axum::middleware::from_fn(logging::log_requests))

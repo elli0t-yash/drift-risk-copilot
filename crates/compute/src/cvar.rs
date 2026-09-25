@@ -236,6 +236,7 @@ pub fn run_cvar_rebalance(
             }),
             invariants,
             engine_version: crate::trace::engine_version(),
+            baseline_model_params: None,
         })
     };
 

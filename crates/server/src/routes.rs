@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
 use compute::experiments::{Experiment, Portfolio};
 use compute::trace::EvidenceTrace;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use store::{RiskSnapshot, SnapshotStore};
 
 use crate::backend::Backend;
@@ -112,7 +113,7 @@ pub async fn post_experiment(
         ApiError::bad_request("invalid_experiment", format!("invalid experiment: {e}"))
     })?;
 
-    let trace = state.backend.run_experiment(experiment).await?;
+    let trace = state.backend.run_experiment(experiment, req.portfolio.clone()).await?;
 
     let snapshot = snapshot_from_trace(&trace, &req.portfolio)?;
     state.store.insert(&snapshot).map_err(|e| {
@@ -231,4 +232,86 @@ pub async fn get_report(State(state): State<AppState>, Path(result_id): Path<Str
     };
     let bytes = crate::pdf::render_report(&trace, snapshot.narration.as_deref(), &grounding_warnings);
     (StatusCode::OK, [(header::CONTENT_TYPE, "application/pdf")], bytes).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct DriftQuery {
+    /// A `compute::portfolio::portfolio_hash` value.
+    pub portfolio: String,
+    #[serde(default = "default_drift_limit")]
+    pub limit: usize,
+}
+
+fn default_drift_limit() -> usize {
+    10
+}
+
+#[derive(Serialize)]
+pub struct DriftSummary {
+    pub id: String,
+    pub created_at: String,
+    pub vol_before: f64,
+    pub vol_after: f64,
+    pub vol_change_pct: f64,
+    pub regime_before: String,
+    pub regime_after: String,
+    pub days_elapsed: i64,
+}
+
+#[derive(Serialize)]
+pub struct DriftListResponse {
+    pub snapshots: Vec<DriftSummary>,
+}
+
+/// The maximum number of a portfolio's recent snapshots (of any experiment
+/// type) `get_drift` scans looking for `RiskDrift` ones. `SnapshotStore`
+/// has no "list recent of this experiment type" query (out of this
+/// session's scope -- see the README), so this filters client-side over a
+/// generously-sized recent window instead; a portfolio with more than this
+/// many *non*-`RiskDrift` snapshots since its oldest relevant `RiskDrift`
+/// one could miss older entries. Fine for a hackathon-scale demo.
+const DRIFT_SCAN_WINDOW: usize = 1000;
+
+/// `GET /drift?portfolio=<hash>&limit=<n>`: the `n` most recent `RiskDrift`
+/// snapshots for a portfolio, newest first, summary fields only (not the
+/// full trace -- see `DriftSummary`). `{"snapshots": []}` (200) if none
+/// exist for that portfolio hash.
+pub async fn get_drift(
+    State(state): State<AppState>,
+    Query(query): Query<DriftQuery>,
+) -> Result<Json<DriftListResponse>, ApiError> {
+    let candidates = state.store.latest_for_portfolio(&query.portfolio, DRIFT_SCAN_WINDOW).map_err(|e| {
+        ApiError::bad_request("internal_error", format!("failed to read snapshot store: {e}"))
+    })?;
+
+    let mut snapshots = Vec::new();
+    for snapshot in candidates {
+        if snapshot.experiment_type != "RiskDrift" {
+            continue;
+        }
+        let trace: EvidenceTrace = serde_json::from_str(&snapshot.trace_json).map_err(|e| {
+            ApiError::bad_request("internal_error", format!("stored trace_json is invalid: {e}"))
+        })?;
+        let result = trace.outputs.get("result");
+        let f = |key: &str| result.and_then(|r| r.get(key)).and_then(Value::as_f64).unwrap_or(0.0);
+        let s = |key: &str| {
+            result.and_then(|r| r.get(key)).and_then(Value::as_str).map(str::to_string).unwrap_or_default()
+        };
+        let i = |key: &str| result.and_then(|r| r.get(key)).and_then(Value::as_i64).unwrap_or(0);
+        snapshots.push(DriftSummary {
+            id: snapshot.id.clone(),
+            created_at: snapshot.created_at.clone(),
+            vol_before: f("vol_before"),
+            vol_after: f("vol_after"),
+            vol_change_pct: f("vol_change_pct"),
+            regime_before: s("regime_before"),
+            regime_after: s("regime_after"),
+            days_elapsed: i("days_elapsed"),
+        });
+        if snapshots.len() >= query.limit {
+            break;
+        }
+    }
+
+    Ok(Json(DriftListResponse { snapshots }))
 }

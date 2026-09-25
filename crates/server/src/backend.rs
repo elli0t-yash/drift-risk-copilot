@@ -9,7 +9,7 @@ use compute::experiments::{Experiment, Portfolio};
 use compute::trace::EvidenceTrace;
 use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum BackendError {
     /// The NL request didn't map to a supported experiment; the model's
     /// one-sentence explanation. Maps to 422.
@@ -82,7 +82,15 @@ impl From<agent::pipeline::PipelineError> for BackendError {
 
 impl From<compute::ComputeError> for BackendError {
     fn from(err: compute::ComputeError) -> Self {
-        BackendError::Compute(err.to_string())
+        match err {
+            // RiskDrift's "no baseline to diff against" case is a request
+            // problem (the caller needs to run RiskDecomposition first, or
+            // gave a bad snapshot id), not an internal failure -- map it
+            // the same way `ParseError::Unrecognised` already is (422),
+            // not the generic 500 every other compute error gets.
+            compute::ComputeError::NoPriorSnapshot(message) => BackendError::Unrecognised(message),
+            other => BackendError::Compute(other.to_string()),
+        }
     }
 }
 
@@ -91,7 +99,16 @@ impl From<compute::ComputeError> for BackendError {
 /// `tests/support`) with canned responses.
 #[async_trait::async_trait]
 pub trait Backend: Send + Sync {
-    async fn run_experiment(&self, experiment: Experiment) -> Result<EvidenceTrace, BackendError>;
+    /// `portfolio` is passed alongside `experiment` (not just embedded in
+    /// its input, as `FactorShockInput`/etc. all do) because `RiskDrift`'s
+    /// own input carries no `portfolio` field of its own -- it diffs the
+    /// current portfolio against a *stored* baseline, not two portfolios
+    /// given inline.
+    async fn run_experiment(
+        &self,
+        experiment: Experiment,
+        portfolio: Portfolio,
+    ) -> Result<EvidenceTrace, BackendError>;
     async fn run_ask(
         &self,
         portfolio: Portfolio,
@@ -102,20 +119,33 @@ pub trait Backend: Send + Sync {
 
 pub struct RealBackend {
     gemini: agent::gemini::HttpGeminiClient,
+    store: std::sync::Arc<store::SnapshotStore>,
 }
 
 impl RealBackend {
-    pub fn new(gemini: agent::gemini::HttpGeminiClient) -> Self {
-        RealBackend { gemini }
+    pub fn new(gemini: agent::gemini::HttpGeminiClient, store: std::sync::Arc<store::SnapshotStore>) -> Self {
+        RealBackend { gemini, store }
     }
 }
 
 #[async_trait::async_trait]
 impl Backend for RealBackend {
-    async fn run_experiment(&self, experiment: Experiment) -> Result<EvidenceTrace, BackendError> {
-        let trace = tokio::task::spawn_blocking(move || agent::pipeline::compute_trace(&experiment))
-            .await
-            .map_err(|e| BackendError::Internal(format!("compute task panicked: {e}")))??;
+    async fn run_experiment(
+        &self,
+        experiment: Experiment,
+        portfolio: Portfolio,
+    ) -> Result<EvidenceTrace, BackendError> {
+        let holdings: Vec<(String, f64)> =
+            portfolio.holdings.iter().map(|h| (h.ticker.clone(), h.weight)).collect();
+        let ctx = compute::context::ExperimentContext {
+            store: self.store.clone(),
+            portfolio_hash: compute::portfolio::portfolio_hash(&holdings),
+        };
+        let trace = tokio::task::spawn_blocking(move || {
+            agent::pipeline::compute_trace(&experiment, &portfolio, &ctx)
+        })
+        .await
+        .map_err(|e| BackendError::Internal(format!("compute task panicked: {e}")))??;
         Ok(trace)
     }
 
@@ -125,8 +155,14 @@ impl Backend for RealBackend {
         message: String,
         conversation_history: Vec<ConversationTurn>,
     ) -> Result<PipelineResult, BackendError> {
-        let result =
-            agent::pipeline::run(&self.gemini, &message, portfolio, &conversation_history).await?;
+        let result = agent::pipeline::run(
+            &self.gemini,
+            &message,
+            portfolio,
+            &conversation_history,
+            self.store.clone(),
+        )
+        .await?;
         Ok(result)
     }
 }

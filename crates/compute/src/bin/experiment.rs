@@ -31,6 +31,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raw = std::fs::read_to_string(&args.input)?;
     let experiment: Experiment = serde_json::from_str(&raw)?;
 
+    if matches!(experiment, Experiment::RiskDrift(_)) {
+        return Err("RiskDrift needs a running SnapshotStore with prior experiment history to \
+                     diff against, which this one-shot CLI doesn't provide -- run it via the \
+                     server's POST /experiment instead."
+            .into());
+    }
+
     if let Experiment::CvarRebalance(input) = &experiment {
         let tickers = input.portfolio.tickers();
         let data = load_market_data(&args.cache_dir, &tickers, args.refresh, input.frequency)?;
@@ -57,7 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (portfolio, window, frequency) = match &experiment {
         Experiment::FactorShock(i) => (&i.portfolio, i.resolved_window(), i.frequency),
         Experiment::RiskDecomposition(i) => (&i.portfolio, i.resolved_window(), i.frequency),
-        Experiment::CvarRebalance(_) | Experiment::PortfolioPerformance(_) => {
+        Experiment::CvarRebalance(_) | Experiment::PortfolioPerformance(_) | Experiment::RiskDrift(_) => {
             unreachable!("handled above")
         }
     };
@@ -82,7 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (_, trace) = run_risk_decomposition(&data.quality, data_window, &model, input)?;
             trace
         }
-        Experiment::CvarRebalance(_) | Experiment::PortfolioPerformance(_) => {
+        Experiment::CvarRebalance(_) | Experiment::PortfolioPerformance(_) | Experiment::RiskDrift(_) => {
             unreachable!("handled above")
         }
     };

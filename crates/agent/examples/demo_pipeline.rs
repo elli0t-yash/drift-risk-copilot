@@ -107,11 +107,13 @@ portfolio's substantial equity beta exposure.";
         ]),
     };
 
+    let store = std::sync::Arc::new(store::SnapshotStore::open(":memory:").expect("in-memory store always opens"));
     let result = agent::pipeline::run(
         &client,
         "what if the market drops 12% and brent jumps 20%?",
         portfolio,
         &[],
+        store,
     )
     .await
     .expect("pipeline run failed");

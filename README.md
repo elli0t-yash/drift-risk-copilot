@@ -20,6 +20,10 @@ crates/
     src/regime.rs          3-state Gaussian HMM (Baum-Welch, Viterbi) for market-regime detection
     src/experiments.rs    FactorShock, RiskDecomposition
     src/cvar.rs            CvarRebalance: Rockafellar-Uryasev LP via good_lp + clarabel
+    src/drift.rs            RiskDrift: diffs current risk against a stored baseline snapshot
+    src/dispatch.rs          run_experiment: the one fetch+fit+dispatch entry point for every experiment type
+    src/context.rs            ExperimentContext (SnapshotStore + portfolio_hash), used by RiskDrift
+    src/portfolio.rs           portfolio_hash: order-independent SHA-256 of a portfolio's holdings
     src/trace.rs          EvidenceTrace and its sub-structs
     src/scenarios.rs       Fixed historical-scenario presets (COVID crash, IL&FS, taper tantrum)
     src/bin/experiment.rs CLI: runs one experiment from a JSON file
@@ -1311,3 +1315,131 @@ portfolio) and 1 new `agent` parse test (mocked Gemini calling
 folder, including the exact regression case (this question used to 422,
 now returns 200) -- full collection re-run clean, 30/30 requests, 92/92
 assertions.
+
+## Fifth experiment: RiskDrift (`compute::drift`)
+
+Explains what changed in a portfolio's risk between two points in time,
+by diffing the current factor-model fit against a prior stored
+`RiskDecomposition` snapshot: volatility, factor contributions (Euler),
+portfolio-level factor betas, factor correlations, market regime, and
+specific-risk share. `RiskDriftInput` carries no `portfolio` field of its
+own (unlike every other experiment) -- it's diffing "the current
+portfolio" against a *stored* baseline, not two portfolios given inline --
+so the portfolio now flows into the compute layer as an explicit parameter
+everywhere, not just embedded in each variant's own input.
+
+### `ExperimentContext` and the new dispatch layer (`compute::dispatch`, `compute::context`)
+
+`RiskDrift` needs read access to `store::SnapshotStore` to resolve its
+baseline, so `store` is now a dependency of `compute` (previously only
+`server` depended on it). The per-variant fetch/fit/dispatch logic that
+used to live in `agent::pipeline::compute_trace` moved into
+`compute::dispatch::run_experiment(experiment, portfolio, ctx)` --
+`agent::pipeline::compute_trace` is now a thin wrapper around it.
+`ExperimentContext { store, portfolio_hash }` is threaded through for
+every experiment type but only `RiskDrift` actually reads it; the other
+four ignore it (reserved for a later session's policy checks, per the
+original spec). This cascaded through:
+- `agent::pipeline::run` gained a `store: Arc<SnapshotStore>` parameter.
+- `server::backend::Backend::run_experiment` gained a `portfolio: Portfolio`
+  parameter (needed since `RiskDriftInput` has none of its own to read).
+- `server::backend::RealBackend` gained a `store` field, built once in
+  `main.rs` and shared with `AppState`.
+
+### Baseline compatibility: `portfolio_betas` and `factor_correlation`
+
+Diffing betas/correlations requires the *baseline's own* per-stock betas
+and factor correlation matrix -- neither was ever persisted anywhere in
+`EvidenceTrace` before this session (only `by_factor`'s Euler
+contributions and `portfolio_vol_annualized` were). `RiskDecompositionOutput`
+gained two new fields, `portfolio_betas: BTreeMap<String, f64>` (portfolio-level
+factor exposure, `Sum_i w_i * beta_ik`) and `factor_correlation: CorrelationMatrix`,
+populated by `run_risk_decomposition`. **This means a `RiskDecomposition`
+snapshot stored *before* this change cannot serve as a `RiskDrift`
+baseline** -- `run_risk_drift` detects the absence of these fields (an
+empty map/matrix when read back from JSON) and returns a clear
+`ComputeError::InvalidInput` naming the stored snapshot's `engine_version`
+and asking the caller to rerun `RiskDecomposition`, rather than silently
+producing zeroed deltas.
+
+### Judgment calls
+
+- **Baseline resolution when `baseline_snapshot_id` is omitted uses the
+  single most recent stored snapshot**, not "the second entry" of a
+  2-item `latest_for_portfolio` query as an earlier draft of this spec
+  described. At the point baseline resolution runs, `RiskDrift`'s own
+  result has not yet been stored (that happens afterward, via the same
+  generic `SnapshotStore::insert` path `/experiment`/`/ask` already use
+  for every experiment type -- `RiskDrift` needed no special insertion
+  code of its own), so there is no "current" entry in the store to skip
+  past yet. Taking the second entry literally would require *two* prior
+  snapshots to exist before `RiskDrift` could run even once, which
+  contradicts the required live-run flow (a single prior
+  `RiskDecomposition` snapshot must be usable immediately as a baseline
+  for the very next `RiskDrift` call) -- confirmed by the live run below,
+  which does exactly that.
+- **`run_risk_drift` is split into a thin data-fetching wrapper and a
+  hermetic `compute_risk_drift`** (pure diff logic: baseline snapshot +
+  an already-computed "current" `RiskDecompositionOutput`/`EvidenceTrace`
+  in, `RiskDriftOutputs`/`EvidenceTrace` out), matching every other
+  experiment function's convention of taking pre-fetched data/model
+  rather than reaching out to the network itself. This is what makes the
+  five required `compute` tests possible without live Yahoo data.
+- **`GET /drift` filters client-side over a capped recent window**
+  (`DRIFT_SCAN_WINDOW = 1000`) rather than the store having a "list
+  recent of this experiment type" query -- out of this session's declared
+  scope ("no changes to the store crate"). A portfolio with more than
+  1000 *non*-`RiskDrift` snapshots since its oldest relevant `RiskDrift`
+  one could miss older entries; fine for a hackathon-scale demo, but a
+  real "risk drift history" UI would want the store itself to support
+  filtering by `experiment_type`.
+- **`ComputeError::NoPriorSnapshot` maps to 422**, not the generic 500
+  every other compute error gets (`server::backend`'s
+  `From<compute::ComputeError>` now matches on this variant specifically)
+  -- matching how `ParseError::Unrecognised` (a request problem, not an
+  internal failure) is already mapped.
+- **`days_elapsed` compares data-window end dates, not wall-clock
+  `created_at` timestamps** -- it answers "how much did the underlying
+  market data advance between the two fits," which is what a risk-drift
+  narrative actually cares about, not how long ago someone happened to
+  click a button.
+
+### Live run (10-stock... actually 2-stock demo portfolio, RELIANCE.NS/TCS.NS)
+
+1. `POST /experiment` `RiskDecomposition` (window 252) to create a
+   baseline: `200`, regime `Bull`, `portfolio_vol_annualized: 0.18447555218792452`.
+2. `POST /experiment` `RiskDrift` with `baseline_snapshot_id: null`,
+   run seconds later against the same live data: `200`,
+   `vol_before: 0.18447555218792452`, `vol_after: 0.18447555218792452`,
+   `vol_change_pct: 0.0`, `regime_before: "Bull"`, `regime_after: "Bull"`,
+   `top_growing_risk_factor: "USDINR"`. Vol and regime are identical
+   because the underlying market data hadn't changed in the few seconds
+   between the two calls -- exactly the expected, correct result, not a
+   bug (a real drift narrative would show non-trivial deltas across a
+   longer gap between snapshots).
+3. `GET /drift?portfolio=<hash>` (hash computed the same way
+   `compute::portfolio::portfolio_hash` does): `200`, `snapshots` contains
+   exactly the one `RiskDrift` result from step 2, with the same
+   `vol_before`/`vol_after`/`regime_before`/`regime_after` fields.
+
+### Tests
+
+`compute`: 5 new hermetic tests in `drift_tests.rs` against
+`compute_risk_drift` directly (no network) -- `vol_change_abs`/
+`vol_change_pct` computed correctly; the Euler-additivity residual is
+recorded (not errored) when factor deltas don't sum exactly to
+`vol_change_abs`; `regime_changed`/`regime_worsened` true/false in both
+directions; `risk_became_more_concentrated`'s 5-percentage-point
+threshold (50%->60% true, 50%->52% false); and
+`run_risk_drift` (the thin wrapper, exercising real baseline resolution
+against an empty in-memory store) returns `ComputeError::NoPriorSnapshot`
+with the exact required message when nothing exists yet. `agent`: 2 new
+`parse_tests.rs` cases (`RiskDrift` with a `null` and with a specific
+`baseline_snapshot_id`). `server`: 4 new `tests.rs` cases (`RiskDrift`
+with a pre-inserted baseline returns 200 with a non-null `vol_change_abs`;
+no prior snapshot returns 422 with the exact message; `GET /drift` with
+no snapshots returns `{"snapshots": []}`, 200; `GET /drift` after
+inserting two `RiskDrift` snapshots -- plus one deliberately-inserted
+`RiskDecomposition` snapshot for the same portfolio, to confirm it's
+excluded -- returns exactly the 2 summaries, with no `trace_json`/
+`outputs` field present).

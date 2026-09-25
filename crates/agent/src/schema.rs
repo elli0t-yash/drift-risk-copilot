@@ -20,6 +20,7 @@ use std::collections::HashMap;
 
 use compute::experiments::{
     CvarRebalanceInput, FactorShockInput, PortfolioPerformanceInput, RiskDecompositionInput,
+    RiskDriftInput,
 };
 use serde_json::Value;
 
@@ -29,6 +30,7 @@ pub const FACTOR_SHOCK_FUNCTION: &str = "run_factor_shock";
 pub const RISK_DECOMPOSITION_FUNCTION: &str = "run_risk_decomposition";
 pub const CVAR_REBALANCE_FUNCTION: &str = "run_cvar_rebalance";
 pub const PORTFOLIO_PERFORMANCE_FUNCTION: &str = "run_portfolio_performance";
+pub const RISK_DRIFT_FUNCTION: &str = "run_risk_drift";
 
 /// Fields the caller supplies out-of-band (portfolio holdings/weights) and
 /// that are therefore stripped from the schema shown to Gemini, so a small
@@ -88,6 +90,15 @@ pub fn experiment_function_declarations() -> Vec<FunctionDeclaration> {
                 current risk breakdown, or a rebalance."
                 .to_string(),
             parameters: sanitized_schema::<PortfolioPerformanceInput>(),
+        },
+        FunctionDeclaration {
+            name: RISK_DRIFT_FUNCTION.to_string(),
+            description: "Compare current portfolio risk against a prior snapshot. Use when \
+                the user asks what has changed in their risk, whether risk has increased, or \
+                how their exposure has shifted over time. Leave baseline_snapshot_id empty to \
+                use the most recent prior snapshot automatically."
+                .to_string(),
+            parameters: sanitized_schema::<RiskDriftInput>(),
         },
     ]
 }

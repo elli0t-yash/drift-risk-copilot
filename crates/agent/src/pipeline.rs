@@ -2,10 +2,12 @@
 //! in, a parsed `Experiment` + computed `EvidenceTrace` + grounded
 //! narration out.
 
-use std::path::Path;
+use std::sync::Arc;
 
+use compute::context::ExperimentContext;
 use compute::experiments::{Experiment, Portfolio};
-use compute::trace::{DataWindow, EvidenceTrace};
+use compute::trace::EvidenceTrace;
+use store::SnapshotStore;
 use thiserror::Error;
 
 use crate::conversation::ConversationTurn;
@@ -14,8 +16,6 @@ use crate::grounding::GroundedNarration;
 use crate::narrate::NarrateError;
 use crate::parse::{parse_experiment, ParseError};
 use crate::suggest::suggest_follow_up;
-
-const CACHE_DIR: &str = "data/cache";
 
 #[derive(Debug, Error)]
 pub enum PipelineError {
@@ -48,20 +48,28 @@ pub struct PipelineResult {
 /// follow-up. `conversation_history` (if any) is threaded through both the
 /// parse and narrate Gemini calls so multi-turn references resolve
 /// correctly; an empty history behaves exactly as before it existed.
+/// `store` is threaded into the compute layer as part of an
+/// `ExperimentContext` -- only `RiskDrift` actually uses it (to resolve its
+/// baseline snapshot), every other experiment type ignores it.
 pub async fn run<C: GeminiClient>(
     client: &C,
     user_message: &str,
     portfolio: Portfolio,
     conversation_history: &[ConversationTurn],
+    store: Arc<SnapshotStore>,
 ) -> Result<PipelineResult, PipelineError> {
-    let experiment = parse_experiment(client, user_message, portfolio, conversation_history).await?;
+    let holdings: Vec<(String, f64)> =
+        portfolio.holdings.iter().map(|h| (h.ticker.clone(), h.weight)).collect();
+    let ctx = ExperimentContext { store, portfolio_hash: compute::portfolio::portfolio_hash(&holdings) };
+
+    let experiment = parse_experiment(client, user_message, portfolio.clone(), conversation_history).await?;
 
     // The compute layer's data/model-fitting path is synchronous
     // (blocking HTTP + CPU-bound linear algebra); run it on a blocking
     // thread so it doesn't stall the async executor running the Gemini
     // calls.
     let experiment_for_compute = experiment.clone();
-    let trace = tokio::task::spawn_blocking(move || compute_trace(&experiment_for_compute))
+    let trace = tokio::task::spawn_blocking(move || compute_trace(&experiment_for_compute, &portfolio, &ctx))
         .await
         .expect("compute_trace task panicked")?;
 
@@ -127,20 +135,11 @@ fn experiment_summary(trace: &EvidenceTrace) -> String {
             ),
             None => "PortfolioPerformance experiment result.".to_string(),
         },
+        "RiskDrift" => match number(&["vol_change_pct"]) {
+            Some(pct) => format!("RiskDrift experiment result: portfolio vol changed by {pct:.2}%."),
+            None => "RiskDrift experiment result.".to_string(),
+        },
         other => format!("{other} experiment result."),
-    }
-}
-
-fn build_data_window(
-    data: &compute::data::MarketData,
-    window: usize,
-    frequency: compute::model::Frequency,
-) -> DataWindow {
-    DataWindow {
-        frequency,
-        window_periods: window,
-        start: data.dates[data.dates.len() - window],
-        end: *data.dates.last().unwrap(),
     }
 }
 
@@ -148,63 +147,16 @@ fn build_data_window(
 /// experiment) for `experiment`. Synchronous/blocking (see the module-level
 /// note in `run`'s body about `spawn_blocking`); exposed so `server`'s
 /// direct `/experiment` route can reuse it without a Gemini round trip.
-pub fn compute_trace(experiment: &Experiment) -> compute::Result<EvidenceTrace> {
-    let cache_dir = Path::new(CACHE_DIR);
-    match experiment {
-        Experiment::FactorShock(input) => {
-            let tickers = input.portfolio.tickers();
-            let window = input.resolved_window();
-            let data =
-                compute::data::load_market_data(cache_dir, &tickers, false, input.frequency)?;
-            let model = compute::model::fit_factor_model(
-                &data,
-                &tickers,
-                compute::model::ModelConfig::new(window, input.frequency),
-            )?;
-            let data_window = build_data_window(&data, window, input.frequency);
-            let (_, trace) =
-                compute::experiments::run_factor_shock(&data.quality, data_window, &model, input)?;
-            Ok(trace)
-        }
-        Experiment::RiskDecomposition(input) => {
-            let tickers = input.portfolio.tickers();
-            let window = input.resolved_window();
-            let data =
-                compute::data::load_market_data(cache_dir, &tickers, false, input.frequency)?;
-            let model = compute::model::fit_factor_model(
-                &data,
-                &tickers,
-                compute::model::ModelConfig::new(window, input.frequency),
-            )?;
-            let data_window = build_data_window(&data, window, input.frequency);
-            let (_, trace) = compute::experiments::run_risk_decomposition(
-                &data.quality,
-                data_window,
-                &model,
-                input,
-            )?;
-            Ok(trace)
-        }
-        Experiment::CvarRebalance(input) => {
-            let tickers = input.portfolio.tickers();
-            let data =
-                compute::data::load_market_data(cache_dir, &tickers, false, input.frequency)?;
-            let (_, trace) = compute::cvar::run_cvar_rebalance(&data.quality, &data, input)?;
-            Ok(trace)
-        }
-        Experiment::PortfolioPerformance(input) => {
-            let tickers = input.portfolio.tickers();
-            let window = input.resolved_window();
-            let data =
-                compute::data::load_market_data(cache_dir, &tickers, false, input.frequency)?;
-            let data_window = build_data_window(&data, window, input.frequency);
-            let (_, trace) = compute::performance::run_portfolio_performance(
-                &data.quality,
-                data_window,
-                &data,
-                input,
-            )?;
-            Ok(trace)
-        }
-    }
+///
+/// A thin wrapper over `compute::dispatch::run_experiment` -- the fetch/
+/// fit/dispatch logic itself lives in `compute` now, not here, since
+/// `RiskDrift` needs read access to the snapshot store (`ctx.store`) to
+/// resolve its baseline, and `store` is a dependency of `compute`, not of
+/// this (narrower, Gemini-facing) crate.
+pub fn compute_trace(
+    experiment: &Experiment,
+    portfolio: &Portfolio,
+    ctx: &ExperimentContext,
+) -> compute::Result<EvidenceTrace> {
+    compute::dispatch::run_experiment(experiment, portfolio, ctx)
 }

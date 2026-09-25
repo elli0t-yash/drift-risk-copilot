@@ -22,6 +22,17 @@ pub enum ComputeError {
 
     #[error("invalid input: {0}")]
     InvalidInput(String),
+
+    #[error("snapshot store error: {0}")]
+    Store(#[from] store::StoreError),
+
+    /// `RiskDrift` couldn't resolve a baseline: no prior snapshot exists for
+    /// this portfolio (or a specific `baseline_snapshot_id` was given but
+    /// not found / belongs to a different portfolio). Distinct from
+    /// `InvalidInput` so callers (e.g. `server::backend`) can map it to its
+    /// own HTTP status instead of a generic 500.
+    #[error("{0}")]
+    NoPriorSnapshot(String),
 }
 
 pub type Result<T> = std::result::Result<T, ComputeError>;

@@ -50,6 +50,7 @@ pub enum Experiment {
     RiskDecomposition(RiskDecompositionInput),
     CvarRebalance(CvarRebalanceInput),
     PortfolioPerformance(PortfolioPerformanceInput),
+    RiskDrift(RiskDriftInput),
 }
 
 // ---------------------------------------------------------------------
@@ -575,6 +576,7 @@ pub fn run_factor_shock(
         }),
         invariants,
         engine_version: crate::trace::engine_version(),
+        baseline_model_params: None,
     };
 
     Ok((output, trace))
@@ -622,6 +624,15 @@ pub struct RiskDecompositionOutput {
     pub by_factor: Vec<FactorContribution>,
     pub specific_risk_contribution: f64,
     pub specific_risk_fraction_of_vol: f64,
+    /// Portfolio-level factor exposure, `Sum_i w_i * beta_ik`, per factor.
+    /// Added so `RiskDrift` can compare beta exposure across two
+    /// snapshots without re-fitting the baseline's own factor model (which
+    /// the trace alone doesn't retain enough to do -- see the `drift`
+    /// module doc).
+    pub portfolio_betas: BTreeMap<String, f64>,
+    /// Factor correlation matrix at fit time. Added for the same reason as
+    /// `portfolio_betas` -- `RiskDrift`'s correlation-drift comparison.
+    pub factor_correlation: CorrelationMatrix,
 }
 
 pub fn run_risk_decomposition(
@@ -688,6 +699,16 @@ pub fn run_risk_decomposition(
         0.0
     };
 
+    let portfolio_betas: BTreeMap<String, f64> =
+        factor_names.iter().enumerate().map(|(k, name)| (name.clone(), x[k])).collect();
+    let corr = model.factor_correlation();
+    let factor_correlation = CorrelationMatrix {
+        factor_names: factor_names.clone(),
+        rows: (0..factor_names.len())
+            .map(|i| (0..factor_names.len()).map(|j| corr[(i, j)]).collect())
+            .collect(),
+    };
+
     let stock_sum: f64 = by_stock.iter().map(|s| s.contribution).sum();
     let factor_plus_specific: f64 =
         by_factor.iter().map(|f| f.contribution).sum::<f64>() + specific_risk_contribution;
@@ -712,6 +733,8 @@ pub fn run_risk_decomposition(
         } else {
             0.0
         },
+        portfolio_betas,
+        factor_correlation,
     };
 
     let trace = EvidenceTrace {
@@ -732,6 +755,7 @@ pub fn run_risk_decomposition(
         outputs: serde_json::json!({ "result": output }),
         invariants,
         engine_version: crate::trace::engine_version(),
+        baseline_model_params: None,
     };
 
     Ok((output, trace))
@@ -748,3 +772,9 @@ pub use crate::cvar::CvarRebalanceInput;
 // ---------------------------------------------------------------------
 
 pub use crate::performance::PortfolioPerformanceInput;
+
+// ---------------------------------------------------------------------
+// (e) RiskDrift — see crate::drift.
+// ---------------------------------------------------------------------
+
+pub use crate::drift::RiskDriftInput;

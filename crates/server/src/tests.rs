@@ -78,6 +78,7 @@ fn sample_trace() -> EvidenceTrace {
         outputs: serde_json::json!({ "result": { "portfolio_vol_annualized": 0.1552 } }),
         invariants: vec![],
         engine_version: "0.1.0".to_string(),
+        baseline_model_params: None,
     }
 }
 
@@ -85,13 +86,25 @@ fn sample_trace() -> EvidenceTrace {
 /// network access to Yahoo Finance or Gemini.
 struct MockBackend {
     experiment_result: Option<EvidenceTrace>,
+    /// Takes priority over `experiment_result` when set -- lets a test
+    /// exercise the `BackendError` -> HTTP status/code mapping (e.g.
+    /// `RiskDrift`'s "no prior snapshot" 422) without needing a real
+    /// backend to actually produce that error.
+    experiment_error: Option<BackendError>,
     ask_result: Option<agent::pipeline::PipelineResult>,
     received_conversation_history: Mutex<Option<Vec<agent::ConversationTurn>>>,
 }
 
 #[async_trait::async_trait]
 impl Backend for MockBackend {
-    async fn run_experiment(&self, _experiment: Experiment) -> Result<EvidenceTrace, BackendError> {
+    async fn run_experiment(
+        &self,
+        _experiment: Experiment,
+        _portfolio: Portfolio,
+    ) -> Result<EvidenceTrace, BackendError> {
+        if let Some(err) = &self.experiment_error {
+            return Err(err.clone());
+        }
         self.experiment_result
             .clone()
             .ok_or_else(|| BackendError::Internal("no mock experiment result configured".to_string()))
@@ -158,6 +171,7 @@ async fn body_json(response: axum::response::Response) -> serde_json::Value {
 async fn health_returns_200_and_expected_json() {
     let app = app_with_backend(MockBackend {
         experiment_result: None,
+        experiment_error: None,
         ask_result: None,
         received_conversation_history: Mutex::new(None),
     });
@@ -177,6 +191,7 @@ async fn health_returns_200_and_expected_json() {
 async fn experiment_with_valid_request_returns_a_trace() {
     let app = app_with_backend(MockBackend {
         experiment_result: Some(sample_trace()),
+        experiment_error: None,
         ask_result: None,
         received_conversation_history: Mutex::new(None),
     });
@@ -207,6 +222,7 @@ async fn experiment_with_valid_request_returns_a_trace() {
 async fn experiment_with_weights_not_summing_to_one_returns_400() {
     let app = app_with_backend(MockBackend {
         experiment_result: Some(sample_trace()),
+        experiment_error: None,
         ask_result: None,
         received_conversation_history: Mutex::new(None),
     });
@@ -260,6 +276,7 @@ async fn ask_with_mocked_pipeline_returns_grounding_warnings() {
     };
     let app = app_with_backend(MockBackend {
         experiment_result: None,
+        experiment_error: None,
         ask_result: Some(pipeline_result),
         received_conversation_history: Mutex::new(None),
     });
@@ -309,6 +326,7 @@ async fn ask_with_non_empty_conversation_history_forwards_it_to_the_backend() {
     };
     let backend = Arc::new(MockBackend {
         experiment_result: None,
+        experiment_error: None,
         ask_result: Some(pipeline_result),
         received_conversation_history: Mutex::new(None),
     });
@@ -364,6 +382,7 @@ async fn report_route_returns_pdf_for_a_result_stored_by_a_prior_ask() {
     };
     let app = app_with_backend(MockBackend {
         experiment_result: None,
+        experiment_error: None,
         ask_result: Some(pipeline_result),
         received_conversation_history: Mutex::new(None),
     });
@@ -418,6 +437,7 @@ async fn report_route_returns_pdf_for_a_result_stored_by_a_prior_ask() {
 async fn report_route_returns_404_for_an_unknown_id() {
     let app = app_with_backend(MockBackend {
         experiment_result: None,
+        experiment_error: None,
         ask_result: None,
         received_conversation_history: Mutex::new(None),
     });
@@ -440,6 +460,7 @@ async fn report_route_returns_404_for_an_unknown_id() {
 async fn scenarios_route_returns_three_scenarios_with_expected_fields() {
     let app = app_with_backend(MockBackend {
         experiment_result: None,
+        experiment_error: None,
         ask_result: None,
         received_conversation_history: Mutex::new(None),
     });
@@ -464,6 +485,7 @@ async fn scenarios_route_returns_three_scenarios_with_expected_fields() {
 async fn static_route_returns_200_and_html_content_type() {
     let app = app_with_backend(MockBackend {
         experiment_result: None,
+        experiment_error: None,
         ask_result: None,
         received_conversation_history: Mutex::new(None),
     });
@@ -487,6 +509,7 @@ async fn static_route_returns_200_and_html_content_type() {
 async fn experiment_still_works_end_to_end_with_snapshot_store() {
     let (app, store) = app_with_backend_and_store(MockBackend {
         experiment_result: Some(sample_trace()),
+        experiment_error: None,
         ask_result: None,
         received_conversation_history: Mutex::new(None),
     });
@@ -524,6 +547,7 @@ async fn experiment_still_works_end_to_end_with_snapshot_store() {
 async fn report_route_retrieves_an_experiment_originated_snapshot() {
     let (app, store) = app_with_backend_and_store(MockBackend {
         experiment_result: Some(sample_trace()),
+        experiment_error: None,
         ask_result: None,
         received_conversation_history: Mutex::new(None),
     });
@@ -563,6 +587,7 @@ async fn report_route_retrieves_an_experiment_originated_snapshot() {
 async fn regime_state_is_non_null_in_every_experiment_response() {
     let app = app_with_backend(MockBackend {
         experiment_result: Some(sample_trace()),
+        experiment_error: None,
         ask_result: None,
         received_conversation_history: Mutex::new(None),
     });
@@ -621,6 +646,7 @@ async fn upload(app: axum::Router, filename: &str, content_type: &str, bytes: &[
 fn empty_backend_app() -> axum::Router {
     app_with_backend(MockBackend {
         experiment_result: None,
+        experiment_error: None,
         ask_result: None,
         received_conversation_history: Mutex::new(None),
     })
@@ -700,4 +726,166 @@ async fn upload_single_holding_returns_400() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = body_json(response).await;
     assert_eq!(body["code"], "invalid_portfolio");
+}
+
+fn sample_risk_drift_trace(vol_before: f64, vol_after: f64, regime_before: &str, regime_after: &str) -> EvidenceTrace {
+    let mut trace = sample_trace();
+    trace.experiment = "RiskDrift".to_string();
+    trace.outputs = serde_json::json!({
+        "result": {
+            "vol_before": vol_before,
+            "vol_after": vol_after,
+            "vol_change_abs": vol_after - vol_before,
+            "vol_change_pct": (vol_after / vol_before - 1.0) * 100.0,
+            "regime_before": regime_before,
+            "regime_after": regime_after,
+            "days_elapsed": 14,
+        }
+    });
+    trace
+}
+
+fn risk_drift_snapshot(portfolio_hash: &str, vol_before: f64, vol_after: f64) -> store::RiskSnapshot {
+    let trace = sample_risk_drift_trace(vol_before, vol_after, "Bull", "Bear");
+    store::RiskSnapshot {
+        id: String::new(),
+        created_at: String::new(),
+        portfolio_hash: portfolio_hash.to_string(),
+        experiment_type: "RiskDrift".to_string(),
+        engine_version: "0.1.0".to_string(),
+        regime_label: Some("Bear".to_string()),
+        smoothed_probs: Some([0.2, 0.7, 0.1]),
+        portfolio_vol_annualized: None,
+        cvar_historical: None,
+        trace_json: serde_json::to_string(&trace).unwrap(),
+        narration: None,
+        suggestion: None,
+        grounding_warnings: None,
+    }
+}
+
+#[tokio::test]
+async fn experiment_risk_drift_with_a_pre_inserted_baseline_returns_200_with_non_null_vol_change() {
+    // The baseline snapshot's presence in the store isn't exercised by
+    // MockBackend (it never calls compute::drift itself -- that logic is
+    // covered hermetically by compute's own drift_tests.rs); this test
+    // covers the HTTP plumbing: a RiskDrift-shaped trace flows through
+    // POST /experiment untouched and is stored/returned correctly.
+    let (app, store) = app_with_backend_and_store(MockBackend {
+        experiment_result: Some(sample_risk_drift_trace(0.12, 0.18, "Bull", "Bear")),
+        experiment_error: None,
+        ask_result: None,
+        received_conversation_history: Mutex::new(None),
+    });
+    store.insert(&risk_drift_snapshot("baseline-hash", 0.10, 0.12)).unwrap();
+
+    let req_body = serde_json::json!({
+        "portfolio": sample_portfolio(),
+        "experiment": { "type": "RiskDrift", "baseline_snapshot_id": null },
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/experiment")
+                .header("content-type", "application/json")
+                .body(Body::from(req_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["experiment"], "RiskDrift");
+    assert!(!body["outputs"]["result"]["vol_change_abs"].is_null());
+    assert_eq!(body["outputs"]["result"]["vol_before"], 0.12);
+    assert_eq!(body["outputs"]["result"]["vol_after"], 0.18);
+}
+
+#[tokio::test]
+async fn experiment_risk_drift_with_no_prior_snapshot_returns_422() {
+    let app = app_with_backend(MockBackend {
+        experiment_result: None,
+        experiment_error: Some(crate::backend::BackendError::Unrecognised(
+            "No prior snapshot found for this portfolio. Run a RiskDecomposition first to \
+             establish a baseline."
+                .to_string(),
+        )),
+        ask_result: None,
+        received_conversation_history: Mutex::new(None),
+    });
+
+    let req_body = serde_json::json!({
+        "portfolio": sample_portfolio(),
+        "experiment": { "type": "RiskDrift" },
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/experiment")
+                .header("content-type", "application/json")
+                .body(Body::from(req_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = body_json(response).await;
+    assert!(body["error"].as_str().unwrap().contains("No prior snapshot found"));
+}
+
+#[tokio::test]
+async fn drift_route_returns_200_and_empty_snapshots_when_none_exist() {
+    let app = empty_backend_app();
+
+    let response = app
+        .oneshot(Request::builder().uri("/drift?portfolio=unknown-hash").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["snapshots"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn drift_route_returns_summaries_not_full_traces_after_inserting_two_snapshots() {
+    let (app, store) = app_with_backend_and_store(MockBackend {
+        experiment_result: None,
+        experiment_error: None,
+        ask_result: None,
+        received_conversation_history: Mutex::new(None),
+    });
+    store.insert(&risk_drift_snapshot("drift-hash", 0.10, 0.12)).unwrap();
+    store.insert(&risk_drift_snapshot("drift-hash", 0.12, 0.20)).unwrap();
+    // A non-RiskDrift snapshot for the same portfolio must be excluded.
+    let mut other = risk_drift_snapshot("drift-hash", 0.0, 0.0);
+    other.experiment_type = "RiskDecomposition".to_string();
+    store.insert(&other).unwrap();
+
+    let response = app
+        .oneshot(Request::builder().uri("/drift?portfolio=drift-hash").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    let snapshots = body["snapshots"].as_array().unwrap();
+    assert_eq!(snapshots.len(), 2, "expected exactly the 2 RiskDrift snapshots, got {snapshots:?}");
+    for snapshot in snapshots {
+        assert!(snapshot["id"].is_string());
+        assert!(snapshot["created_at"].is_string());
+        assert!(snapshot["vol_before"].is_number());
+        assert!(snapshot["vol_after"].is_number());
+        assert!(snapshot["vol_change_pct"].is_number());
+        assert_eq!(snapshot["regime_before"], "Bull");
+        assert_eq!(snapshot["regime_after"], "Bear");
+        assert!(snapshot["days_elapsed"].is_number());
+        // Summary only -- no full trace/outputs object present.
+        assert!(snapshot.get("trace_json").is_none());
+        assert!(snapshot.get("outputs").is_none());
+    }
 }

@@ -24,5 +24,6 @@ csv.workspace = true
 clap.workspace = true
 good_lp = { version = "1.15.3", default-features = false, features = ["clarabel"] }
 sha2.workspace = true
+store = { path = "../store" }
 
 [dev-dependencies]
