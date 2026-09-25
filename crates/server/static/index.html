@@ -399,7 +399,7 @@
       btn.textContent = SCENARIO_BUTTON_LABELS[scenario.id] || scenario.name;
       btn.title = scenario.description;
       btn.addEventListener("click", function () {
-        const text = "What would the " + scenario.name + " have done to my portfolio?";
+        const text = scenarioMessage(scenario);
         messageInput.value = text;
         sendMessage(text);
       });
@@ -408,6 +408,23 @@
   }).catch(function () {
     scenarioBar.innerHTML = '<span class="empty-state">Could not load scenarios.</span>';
   });
+
+  // The parser (agent::parse) extracts FactorShock parameters from the
+  // message text via Gemini function-calling -- it has no access to
+  // /scenarios data itself, so naming the scenario alone ("What would the
+  // COVID Crash have done...") gives Gemini nothing to extract and it
+  // correctly refuses (422 unrecognised_request). The message has to state
+  // the actual shock numbers already fetched into `scenario.shocks_pct`.
+  const FACTOR_ORDER = ["MARKET", "USDINR", "BRENT", "GOLD_USD", "RATES_PROXY"];
+  function scenarioMessage(scenario) {
+    const parts = FACTOR_ORDER
+      .filter(function (f) { return scenario.shocks_pct[f] !== undefined; })
+      .map(function (f) {
+        const v = scenario.shocks_pct[f];
+        return f + " " + (v > 0 ? "+" : "") + v + "%";
+      });
+    return "Apply the " + scenario.name + " scenario to my portfolio: " + parts.join(", ") + ".";
+  }
 
   function setScenarioButtonsDisabled(disabled) {
     scenarioBar.querySelectorAll(".scenario-btn").forEach(function (b) { b.disabled = disabled; });
