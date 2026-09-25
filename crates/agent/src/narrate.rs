@@ -5,7 +5,8 @@
 use compute::trace::EvidenceTrace;
 use thiserror::Error;
 
-use crate::gemini::{GeminiClient, GeminiError, GeminiRequest};
+use crate::conversation::{turn_to_content, ConversationTurn};
+use crate::gemini::{Content, GeminiClient, GeminiError, GeminiRequest, Part};
 
 /// Verbatim per spec; do not paraphrase.
 pub const NARRATE_SYSTEM_PROMPT: &str = "You are a portfolio risk analyst. Explain the following risk experiment result to an investment professional in 3\u{2013}5 sentences. Rules you must follow exactly:
@@ -29,12 +30,18 @@ pub enum NarrateError {
 
 /// Narrates `trace`, optionally appending `extra_instructions` to the
 /// system prompt (used by `grounding::grounded_narrate` to ask for a
-/// grounding-corrected rewrite). The trace is injected as a JSON user-turn
-/// message after the system prompt, per spec.
+/// grounding-corrected rewrite). `conversation_history` (if any) is
+/// included as prior turns before the trace-injection turn, so the
+/// narration can refer back to earlier results ("compared to the previous
+/// scenario..."); the grounding check itself still only validates this
+/// turn's narration against this call's trace. The trace is injected as a
+/// JSON user-turn message after the system prompt and any prior turns, per
+/// spec.
 pub async fn narrate_with_instructions<C: GeminiClient>(
     client: &C,
     trace: &EvidenceTrace,
     extra_instructions: Option<&str>,
+    conversation_history: &[ConversationTurn],
 ) -> Result<String, NarrateError> {
     let mut system_prompt = NARRATE_SYSTEM_PROMPT.to_string();
     if let Some(extra) = extra_instructions {
@@ -42,17 +49,32 @@ pub async fn narrate_with_instructions<C: GeminiClient>(
         system_prompt.push_str(extra);
     }
     let trace_json = serde_json::to_string(trace)?;
-    let request = GeminiRequest::user_turn(system_prompt, trace_json);
+
+    let mut contents: Vec<Content> = conversation_history.iter().map(turn_to_content).collect();
+    contents.push(Content {
+        role: Some("user".to_string()),
+        parts: vec![Part::text(trace_json)],
+    });
+
+    let request = GeminiRequest {
+        contents,
+        system_instruction: Some(Content {
+            role: None,
+            parts: vec![Part::text(system_prompt)],
+        }),
+        tools: None,
+    };
 
     let response = client.generate(&request).await?;
     let part = response.first_part().ok_or(NarrateError::NoCandidates)?;
     part.text.clone().ok_or(NarrateError::NoText)
 }
 
-/// Narrates `trace` with the base system prompt only (no grounding retry).
+/// Narrates `trace` with the base system prompt only (no grounding retry,
+/// no conversation history).
 pub async fn narrate<C: GeminiClient>(
     client: &C,
     trace: &EvidenceTrace,
 ) -> Result<String, NarrateError> {
-    narrate_with_instructions(client, trace, None).await
+    narrate_with_instructions(client, trace, None, &[]).await
 }

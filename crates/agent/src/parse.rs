@@ -4,6 +4,7 @@
 use compute::experiments::{CvarRebalanceInput, Experiment, FactorShockInput, Portfolio, RiskDecompositionInput};
 use thiserror::Error;
 
+use crate::conversation::{turn_to_content, ConversationTurn};
 use crate::gemini::{Content, GeminiClient, GeminiError, GeminiRequest, Part, Tool};
 use crate::schema::{
     experiment_function_declarations, CVAR_REBALANCE_FUNCTION, FACTOR_SHOCK_FUNCTION,
@@ -20,7 +21,8 @@ to call the correct function -- run_factor_shock, run_risk_decomposition, or run
 -- with the parameters extracted from the user's message. Do not add explanation. Do not ask \
 clarifying questions. If the user's intent clearly maps to one of the three experiment types, \
 call the function. If it does not, return a text response with one sentence explaining what you \
-cannot extract.";
+cannot extract. For CvarRebalance: if the user does not mention a per-name cap, omit \
+per_name_cap from the function call.";
 
 #[derive(Debug, Error)]
 pub enum ParseError {
@@ -41,7 +43,11 @@ pub enum ParseError {
 }
 
 /// Sends `user_message` to Gemini with the three per-experiment function
-/// declarations (see `schema`'s module doc). On a function-call response,
+/// declarations (see `schema`'s module doc). `conversation_history` (if
+/// any) is included as prior turns before the current user message, so the
+/// model can resolve references like "now try with 25% turnover" without
+/// the caller re-stating prior context; an empty history produces the same
+/// request shape as before it existed. On a function-call response,
 /// deserializes the args into the matching `Experiment` variant and
 /// overwrites its `portfolio` field with the caller's `portfolio` (Gemini
 /// is never given portfolio data — see `schema::CALLER_SUPPLIED_FIELDS` —
@@ -52,12 +58,16 @@ pub async fn parse_experiment<C: GeminiClient>(
     client: &C,
     user_message: &str,
     portfolio: Portfolio,
+    conversation_history: &[ConversationTurn],
 ) -> Result<Experiment, ParseError> {
+    let mut contents: Vec<Content> = conversation_history.iter().map(turn_to_content).collect();
+    contents.push(Content {
+        role: Some("user".to_string()),
+        parts: vec![Part::text(user_message)],
+    });
+
     let request = GeminiRequest {
-        contents: vec![Content {
-            role: Some("user".to_string()),
-            parts: vec![Part::text(user_message)],
-        }],
+        contents,
         system_instruction: Some(Content {
             role: None,
             parts: vec![Part::text(PARSE_SYSTEM_PROMPT)],

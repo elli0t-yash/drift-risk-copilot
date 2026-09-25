@@ -4,6 +4,7 @@
 
 use agent::gemini::GeminiError;
 use agent::pipeline::PipelineResult;
+use agent::ConversationTurn;
 use compute::experiments::{Experiment, Portfolio};
 use compute::trace::EvidenceTrace;
 use thiserror::Error;
@@ -59,12 +60,22 @@ impl From<agent::narrate::NarrateError> for BackendError {
     }
 }
 
+impl From<agent::suggest::SuggestError> for BackendError {
+    fn from(err: agent::suggest::SuggestError) -> Self {
+        match err {
+            agent::suggest::SuggestError::Gemini(g) => BackendError::from(g),
+            other => BackendError::Internal(other.to_string()),
+        }
+    }
+}
+
 impl From<agent::pipeline::PipelineError> for BackendError {
     fn from(err: agent::pipeline::PipelineError) -> Self {
         match err {
             agent::pipeline::PipelineError::Parse(p) => BackendError::from(p),
             agent::pipeline::PipelineError::Compute(c) => BackendError::Compute(c.to_string()),
             agent::pipeline::PipelineError::Narrate(n) => BackendError::from(n),
+            agent::pipeline::PipelineError::Suggest(s) => BackendError::from(s),
         }
     }
 }
@@ -85,6 +96,7 @@ pub trait Backend: Send + Sync {
         &self,
         portfolio: Portfolio,
         message: String,
+        conversation_history: Vec<ConversationTurn>,
     ) -> Result<PipelineResult, BackendError>;
 }
 
@@ -111,8 +123,10 @@ impl Backend for RealBackend {
         &self,
         portfolio: Portfolio,
         message: String,
+        conversation_history: Vec<ConversationTurn>,
     ) -> Result<PipelineResult, BackendError> {
-        let result = agent::pipeline::run(&self.gemini, &message, portfolio).await?;
+        let result =
+            agent::pipeline::run(&self.gemini, &message, portfolio, &conversation_history).await?;
         Ok(result)
     }
 }

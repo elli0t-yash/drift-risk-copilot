@@ -1,6 +1,6 @@
 mod common;
 
-use compute::model::{fit_factor_model, ledoit_wolf_shrink_identity};
+use compute::model::{fit_factor_model, fit_factor_model_with_config, ledoit_wolf_shrink_identity, Frequency, ModelConfig};
 use nalgebra::DMatrix;
 
 #[test]
@@ -67,6 +67,43 @@ fn ledoit_wolf_shrinks_pure_noise_toward_identity() {
     let (shrunk, intensity) = ledoit_wolf_shrink_identity(&data);
     assert!(intensity > 0.0, "expected nonzero shrinkage on a short noisy window");
     assert!(is_symmetric(&shrunk, 1e-9));
+}
+
+/// Requires network access to Yahoo Finance (real NSEI + factor + stock
+/// data), so it's `#[ignore]`d by default -- run explicitly with
+/// `cargo test -p compute --test model_tests -- --ignored`. Every other
+/// test in this crate is hermetic (synthetic data only); this is the one
+/// deliberate exception the checkpoint spec asks for ("PSD ... on real
+/// NSEI data").
+#[test]
+#[ignore]
+fn regime_conditional_f_is_psd_for_all_three_regimes_on_real_nsei_data() {
+    let cache_dir = std::path::Path::new("data/cache");
+    let tickers = vec!["RELIANCE.NS".to_string(), "TCS.NS".to_string()];
+    let data = compute::data::load_market_data(cache_dir, &tickers, false, Frequency::Daily)
+        .expect("live Yahoo fetch failed");
+    let model = fit_factor_model_with_config(
+        &data,
+        &tickers,
+        ModelConfig::new(252, Frequency::Daily).with_regime_covariance(true),
+    )
+    .expect("regime-conditional fit failed on real data");
+
+    let regime_fs = model
+        .regime_factor_covariance_daily
+        .as_ref()
+        .expect("regime_covariance was requested, regime_factor_covariance_daily must be Some");
+
+    for (regime_idx, f) in regime_fs.iter().enumerate() {
+        assert!(is_symmetric(f, 1e-9), "F for regime {regime_idx} is not symmetric");
+        let eig = f.clone().symmetric_eigenvalues();
+        for lambda in eig.iter() {
+            assert!(
+                *lambda >= -1e-8,
+                "F for regime {regime_idx} has a negative eigenvalue: {lambda}"
+            );
+        }
+    }
 }
 
 fn is_symmetric(m: &DMatrix<f64>, tol: f64) -> bool {

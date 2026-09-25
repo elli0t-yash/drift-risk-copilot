@@ -74,7 +74,7 @@ async fn retry_path_is_invoked_exactly_once_on_a_single_failure() {
         text_response("Vol is 0.1552 annualised."),
     ]);
 
-    let result = grounded_narrate(&client, &trace).await.unwrap();
+    let result = grounded_narrate(&client, &trace, &[]).await.unwrap();
     assert_eq!(client.call_count(), 2, "expected exactly one retry (2 calls total)");
     assert!(result.grounding_warnings.is_empty());
     assert_eq!(result.narration, "Vol is 0.1552 annualised.");
@@ -89,7 +89,7 @@ async fn still_failing_after_max_retries_surfaces_warnings_without_suppressing_t
         text_response("Vol is 99% (attempt 3)."),
     ]);
 
-    let result = grounded_narrate(&client, &trace).await.unwrap();
+    let result = grounded_narrate(&client, &trace, &[]).await.unwrap();
     assert_eq!(client.call_count(), 3, "1 initial + 2 retries = 3 calls");
     assert!(!result.grounding_warnings.is_empty());
     assert_eq!(result.narration, "Vol is 99% (attempt 3).");
@@ -122,6 +122,9 @@ fn sample_trace() -> compute::trace::EvidenceTrace {
             factor_names: vec!["MARKET".to_string()],
             shrinkage_intensity: 0.0374,
             annualization_factor: 252.0,
+            regime_state: None,
+            regime_fallback_warnings: vec![],
+            cap_source: None,
         },
         outputs: serde_json::json!({ "result": { "portfolio_vol_annualized": 0.1552 } }),
         invariants: vec![],

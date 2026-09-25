@@ -16,25 +16,29 @@ it. The backend is deployable and demo-ready as of this checkpoint.
 crates/
   compute/   # data layer, factor model, experiments, evidence trace
     src/data.rs         Yahoo fetch + cache + NSE calendar alignment + log returns
-    src/model.rs         OLS factor fits, Ledoit-Wolf shrinkage, stock covariance
+    src/model.rs         OLS factor fits, Ledoit-Wolf shrinkage, stock covariance, regime-conditional F
+    src/regime.rs          3-state Gaussian HMM (Baum-Welch, Viterbi) for market-regime detection
     src/experiments.rs    FactorShock, RiskDecomposition
     src/cvar.rs            CvarRebalance: Rockafellar-Uryasev LP via good_lp + clarabel
     src/trace.rs          EvidenceTrace and its sub-structs
+    src/scenarios.rs       Fixed historical-scenario presets (COVID crash, IL&FS, taper tantrum)
     src/bin/experiment.rs CLI: runs one experiment from a JSON file
     examples/              FactorShock / RiskDecomposition / CvarRebalance inputs, 10-stock Nifty portfolio
     tests/                  Synthetic-data unit/integration tests (no network required)
   agent/     # NL -> Experiment -> EvidenceTrace -> grounded narration
     src/gemini.rs        Async Gemini client: request/response types, retrying HTTP transport
-    src/schema.rs         JSON Schema (via schemars) for the run_experiment function declaration
-    src/parse.rs           NL -> Experiment via a single Gemini function-calling turn
-    src/narrate.rs          EvidenceTrace -> plain-language narration via Gemini
+    src/conversation.rs   ConversationTurn (user/assistant) + Gemini role mapping
+    src/schema.rs         JSON Schema (via schemars) for the three per-experiment function declarations
+    src/parse.rs           NL -> Experiment via a Gemini function-calling turn, conversation-history aware
+    src/narrate.rs          EvidenceTrace -> plain-language narration via Gemini, conversation-history aware
     src/grounding.rs        Verbatim-number check on narration vs. trace, with retry
+    src/suggest.rs           One proactive follow-up question via a plain-text Gemini call
     src/pipeline.rs          agent::pipeline::run: the one function `server` calls
     examples/demo_pipeline.rs  One-off demo: mocked Gemini + a real compute call (see below)
     tests/                    Mocked-Gemini unit/integration tests (no network to Gemini)
   server/    # axum HTTP API + embedded UI
     src/main.rs           Router, tracing setup, GEMINI_API_KEY startup check
-    src/routes.rs          /health, /experiment, /ask, static-file fallback handlers
+    src/routes.rs          /health, /scenarios, /experiment, /ask, static-file fallback handlers
     src/backend.rs          Backend trait (RealBackend wraps compute+agent) + error mapping
     src/validate.rs          Portfolio validation shared by /experiment and /ask
     src/error.rs             ApiError ({error, code} JSON responses) + AppJson extractor
@@ -696,3 +700,460 @@ then up to 2 grounding-retry narrate calls, each itself retrying up to 3x
 internally on 429/503 -- which routinely exceeds 60s under real API
 latency/rate-limiting, well beyond just the cold-start compute call the
 original 60s was sized for).
+
+## Regime-conditional factor covariance (`compute::regime`, `model::ModelConfig`)
+
+A 3-state Gaussian HMM (`compute::regime`, Baum-Welch fit from scratch, no
+external HMM crate) on Nifty (`^NSEI`) daily log returns, used to split the
+factor covariance `F` by market regime instead of always pooling the full
+window. Default is unchanged behaviour (`regime_covariance: false`
+everywhere) — this is purely opt-in.
+
+### The model
+
+- **States, always reported in ascending-emission-variance order**: 0 =
+  Bull (lowest vol), 1 = Bear (medium), 2 = Crisis (highest). The relabel
+  happens once, after Baum-Welch converges, by sorting the three fitted
+  states by their final emission variance — so which *internal* state index
+  the EM fit happened to land on for "the high-vol regime" never matters;
+  the label always does.
+- **Forward/backward**: scaled (Rabiner 1989) — `alpha_hat_t(k)` normalized
+  to sum to 1 at every `t`, with `log P(O) = sum_t ln(c_t)`; `beta` scaled
+  by the *same* `c` array so `alpha_hat_t(k) * beta_t(k) == gamma_t(k)`
+  exactly, verified by a test that checks this sums to 1 (within 1e-9) at
+  every `t`, not just the final one.
+- **Convergence**: log-likelihood improvement `< 1e-6` or 500 iterations.
+- **Viterbi**: log-space, for the full regime-assignment sequence used to
+  split factor returns.
+- `smoothed_probs` (`gamma_T`, the *current* regime distribution) come with
+  `smoothing_note: "full-history smoothed, not suitable for live trading
+  signals"` — a full-history smoother uses future information (everything
+  up to `T`) to estimate the state at `T`, which is fine as a point-in-time
+  snapshot but not what a causal, real-time signal would look like.
+
+### Wiring into the factor model
+
+`model::ModelConfig { window, frequency, regime_covariance }` replaces the
+old bare `(window, frequency)` pair for the regime-aware path
+(`fit_factor_model_with_config`); the original `fit_factor_model(data,
+tickers, window, frequency)` is kept as a thin non-regime wrapper so
+**nothing outside `compute`'s own CLI/experiments/cvar needed to change**
+— `agent`/`server` still call the old signature and compile unmodified.
+
+When `regime_covariance: true`: the HMM fits on the *same* window's `MARKET`
+factor series (already Nifty's own log returns, no separate fetch), factor
+returns are split by the Viterbi sequence, and each regime gets its own
+Ledoit-Wolf `F_k`. `FactorModel.factor_covariance_daily` — the field every
+existing `factor_covariance()`/`stock_covariance()` call already reads —
+becomes `F_{current_regime}`, so **RiskDecomposition needed zero changes to
+its own math**: it was already just calling those methods. All three
+regimes' `F_k` remain available via `factor_covariance_for_regime(k)` /
+`stock_covariance_for_regime(k)`, which is what `FactorShock`'s
+`crisis_comparison` uses.
+
+**Fallback**: a regime with fewer than `MIN_REGIME_OBSERVATIONS` (30) days
+in the window uses the full-window `F` instead of its own (too few
+observations to shrink meaningfully), and a warning is recorded in
+`model_params.regime_fallback_warnings`. This is a real, live-observed
+case, not just a hypothetical — see the live run below.
+
+### Per-experiment behaviour
+
+- **RiskDecomposition**: `regime_covariance: bool` field; when true, vol
+  and Euler contributions use `F_{current_regime}` automatically (see
+  above). `model_params.regime_state` records which regime.
+- **FactorShock**: `regime_covariance: bool` field; when true *and* the
+  current regime isn't already Crisis, `outputs.result.crisis_comparison`
+  reruns the same shock (including conditional propagation) using
+  `F_crisis` instead of `F_current`, so a reader can see "how much worse
+  would this look under crisis-regime correlations" without a second
+  request. Absent (not zeroed) when the current regime already is Crisis,
+  since that comparison would be a no-op.
+- **CvarRebalance**: `regime_covariance: bool` field; per the design note,
+  the LP and feasibility checks always use historical scenarios directly,
+  *never* a factor-model covariance — so this can't gate optimality. It
+  instead fits a regime-conditional factor model purely to report
+  `regime_portfolio_vol_annualized_{before,after}` (`sqrt(w' Sigma_regime
+  w)` for `weights_before`/`weights_after`) as a parametric cross-check
+  alongside the historical CVaR/VaR, with `model_params.regime_state`
+  recording which regime.
+
+### Live run (10-stock Nifty portfolio)
+
+**HMM fit**: `n_iter: 329`, `log_likelihood: 884.996`.
+
+**Current regime**: **Bull** — `smoothed_probs: [0.907, 0.090, 0.003]`
+(Bull/Bear/Crisis), `obs_count_per_regime: [184, 10, 58]` (Viterbi, out of
+the 252-day window).
+
+**Fallback warning actually fired** (not just tested synthetically):
+`"regime_1 (Bear) has only 10 observations, fell back to full-window
+covariance"` — Bear was too thin a slice of this particular 252-day window
+to shrink its own `F`.
+
+**RiskDecomposition, `portfolio_vol_annualized`**:
+
+| | value |
+|---|---|
+| `regime_covariance: false` | 0.1549 |
+| `regime_covariance: true` (Bull) | 0.1174 |
+
+Meaningfully lower under the Bull-regime `F` than the full-window `F`, as
+expected — the window's Bear/Crisis days pull the full-window covariance up.
+
+**FactorShock (Nifty −12%, Brent +20%, `regime_covariance: true`)**,
+current regime Bull, so `crisis_comparison` is present:
+
+| | current regime (Bull) | `crisis_comparison` |
+|---|---|---|
+| `portfolio_pnl_inr` | −1,224,017 | −1,164,320 |
+| implied `USDINR` | +2.05% | +2.17% |
+| implied `GOLD_USD` | −4.15% | −6.02% |
+| implied `RATES_PROXY` | +0.02% | −2.38% |
+
+Both invariants passed in both runs. Reproduce: `cargo run --bin
+experiment -- crates/compute/examples/risk_decomposition_nifty10_regime.json`
+/ `factor_shock_nifty10_regime.json`.
+
+### Tests
+
+`compute::regime`'s own unit tests (synthetic 3-segment low/medium/high-vol
+data): `gamma` sums to 1 at every `t`; Viterbi recovers each segment with
+>85% accuracy; state labels come out variance-ordered regardless of which
+order the segments appear in the data (a deliberately *not* variance-sorted
+order — high, low, medium). `model`'s own tests inject a synthetic Viterbi
+sequence directly (rather than coaxing a real HMM fit into an unlucky
+split) to test the <30-obs fallback deterministically. `experiment_tests.rs`
+covers RiskDecomposition's vol actually differing with/without
+`regime_covariance`, and FactorShock's `crisis_comparison` presence/absence
+by regime. One test — `F` is PSD for all three regimes on real NSEI data —
+needs network and is `#[ignore]`d by default; run with `cargo test -p
+compute --test model_tests -- --ignored`. Confirmed passing.
+
+### Judgment calls
+
+- **k-means init clusters on `|returns|`, not raw signed returns** — found
+  live, not anticipated: since all three regimes are roughly zero-mean,
+  clustering on signed values just splits points by *direction*
+  ("very negative" / "near zero" / "very positive"), which has nothing to
+  do with volatility regime. This made Baum-Welch converge to a poor local
+  optimum on the very first synthetic test run (two of three fitted states
+  ended up with similar variances, differentiated mostly by mean, on data
+  with three well-separated *true* variances and zero true mean
+  everywhere). Clustering on magnitude fixed it immediately; final
+  per-state means/variances are still computed from the original signed
+  data within each magnitude-assigned cluster.
+- **30-observation fallback threshold**: not derived from anything more
+  principled than "Ledoit-Wolf shrinkage needs enough observations to
+  estimate a 5x5 sample covariance's off-diagonal structure at all" — 30
+  points for 5 factors is already a thin sample (6 obs/factor), but Ledoit-
+  Wolf shrinkage is specifically designed to be robust in exactly that
+  small-T regime (it's the paper's whole point), so this is closer to "no
+  smaller than this" than a precisely justified number. The live run above
+  shows it firing in practice (Bear regime, 10 obs), which is reassuring
+  that the threshold isn't so low it never triggers.
+- **CvarRebalance's regime output is informational-only by design**,
+  per the checkpoint spec's explicit "not in the LP itself" — it would be
+  straightforward to instead use `Sigma_regime` in the pre-solve
+  feasibility checks too, but those checks don't reference any covariance
+  at all currently (they're pure cap/turnover arithmetic), so doing that
+  would be a bigger, unrequested change to what "feasible" means for this
+  experiment.
+- **Regime HMM window for CvarRebalance** defaults to
+  `frequency.default_window()` (252 daily), independent of CvarRebalance's
+  own `window` (which defaults to *full available history* for scenarios) —
+  these are two different jobs (regime detection wants a recent window;
+  historical CVaR wants as much data as possible), so tying them together
+  would have been actively wrong.
+- **`fit_factor_model` (old signature) kept as a thin wrapper** rather than
+  changing its signature and updating every call site across `agent`/
+  `server`, per this checkpoint's explicit scope ("no other crate changes
+  in this session").
+
+## Historical scenario presets and multi-turn `/ask`
+
+### `GET /scenarios` (`compute::scenarios`)
+
+Three fixed historical-scenario presets (`compute::scenarios::all_scenarios()`),
+static reference data (not fit from live data): COVID Crash (Mar 2020),
+IL&FS Contagion (Sep-Oct 2018), Taper Tantrum (May-Aug 2013). Each is a
+`shocks_pct` map in the same simple-% units `FactorShockInput` already
+takes, `propagate: false` since all five factors are given (propagation
+would be a no-op). No portfolio or auth needed -- served directly off
+static data. Verified with the server running locally:
+
+```json
+[
+  {
+    "id": "covid_crash",
+    "name": "COVID Crash (Mar 2020)",
+    "date_range": "Feb 19 – Mar 23, 2020",
+    "shocks_pct": {"BRENT": -55.0, "GOLD_USD": 3.0, "MARKET": -38.0, "RATES_PROXY": -6.0, "USDINR": 8.5},
+    "propagate": false
+  },
+  {
+    "id": "ilfs_contagion",
+    "name": "IL&FS Contagion (Sep–Oct 2018)",
+    "shocks_pct": {"BRENT": 15.0, "GOLD_USD": 2.5, "MARKET": -15.0, "RATES_PROXY": 4.0, "USDINR": 7.0},
+    "propagate": false
+  },
+  {
+    "id": "taper_tantrum_2013",
+    "name": "Taper Tantrum (May–Aug 2013)",
+    "shocks_pct": {"BRENT": -5.0, "GOLD_USD": -18.0, "MARKET": -12.0, "RATES_PROXY": 5.0, "USDINR": 18.0},
+    "propagate": false
+  }
+]
+```
+
+(Full descriptions/date ranges omitted above for brevity; see `crates/compute/src/scenarios.rs`.)
+
+### Multi-turn `/ask` (`agent::conversation`, `agent::suggest`)
+
+`AskRequest` gains an optional `conversation_history: Vec<ConversationTurn>`
+(`role: "user" | "assistant"`, default empty -- an empty history produces
+the exact same Gemini request shape as before this checkpoint, verified by
+`empty_conversation_history_matches_pre_existing_request_shape`). Both the
+`parse` (function-calling) and `narrate` Gemini calls prepend history as
+prior turns before their own current-turn message, with `"assistant"`
+mapped onto Gemini's own `"model"` role (`conversation::turn_to_content`).
+This lets a second request like "now try with 25% turnover" resolve
+against the first request's portfolio/experiment context without the
+caller re-stating it, and lets narration refer back to a prior result
+("compared to the previous scenario..."). **The grounding check itself is
+unchanged** -- it only ever validates the current turn's narration against
+the current turn's trace, never anything from history.
+
+`AskResponse` gains `assistant_turn` (this turn's narration, pre-wrapped as
+a `ConversationTurn` the caller appends to its own history for the next
+request) and `suggestion` (see below).
+
+### Proactive follow-up (`agent::suggest`)
+
+After grounded narration, `pipeline::run` makes one more Gemini call
+(`suggest::suggest_follow_up`) -- plain text, no function calling, no
+grounding check (a question isn't a factual claim to verify) -- asking for
+one actionable follow-up question a risk manager would naturally ask next.
+Verified with a mocked pipeline end-to-end
+(`cargo run -p agent --example demo_pipeline`):
+
+> "A -12% shock to MARKET combined with a +20% shock to BRENT produces a
+> portfolio loss of approximately -1,177,846 INR on this ten-stock Nifty
+> portfolio. ... The loss is dominated by the MARKET shock, given the
+> portfolio's substantial equity beta exposure."
+>
+> **suggestion:** "What if I cut my turnover budget to 20% instead?"
+
+### Tests
+
+`compute::scenarios`: exactly 3 scenarios; every `shocks_pct` key is a
+valid `FACTOR_NAMES` entry. `agent`: `parse_experiment` passes
+`conversation_history` as prior turns in the correct order (asserted via
+`MockGeminiClient::last_request()`, a new test-support accessor that
+records every request sent, not just responses returned); an empty history
+produces the pre-existing single-turn request shape; `suggest_follow_up`
+returns the mock's text as-is, including an empty string without erroring.
+`server`: `GET /scenarios` returns 200 and an array of 3, each with
+`id`/`name`/`shocks_pct`; `POST /ask` with a non-empty
+`conversation_history` succeeds and the mock backend's received history is
+asserted directly (2 turns, correct roles/content) via a `MockBackend` held
+outside the router as `Arc<MockBackend>` (not just `Arc<dyn Backend>`) so
+the test can inspect what it captured after the request completes.
+
+### Judgment calls
+
+- **`suggest` failures propagate as a `PipelineError`/500**, same as
+  parse/narrate, rather than degrading `/ask` to a response with an empty
+  `suggestion` on Gemini failure -- consistent with how this codebase
+  already treats every other Gemini-dependent step as load-bearing, not
+  best-effort, and keeps `BackendError`'s existing 503-on-Gemini-failure
+  mapping meaningful for this call too.
+- **`suggest_follow_up` is a free function** (`agent::suggest`), not a
+  method needing an accumulating "grounding" abstraction, since per spec
+  it deliberately has none of grounding's retry/verification machinery --
+  reusing that machinery would have been the wrong shape for a call that
+  isn't checking a factual claim.
+- **A live two-turn `/ask` exchange against real Gemini was not run in
+  this session** -- no `GEMINI_API_KEY` is available in this environment,
+  and fetching the deployed Cloud Run service's key from Secret Manager to
+  run one was declined (see report). `GET /scenarios` and the mocked
+  end-to-end pipeline (above) were both verified live/running instead;
+  `suggest`'s added latency (one more sequential Gemini call in `/ask`,
+  per spec "sequential is fine") is therefore also unmeasured against real
+  API latency in this session.
+
+## PDF reports, result store, and CVaR cap defaulting
+
+### In-memory result store (`server::store`)
+
+`ResultStore`: a fixed-capacity (`20`) ring buffer (`VecDeque<(Uuid, PipelineResult)>`
+behind a `Mutex`), keyed by a server-generated UUID v4. Every successful
+`POST /ask` inserts its `PipelineResult` and returns the id as
+`result_id` in `AskResponse`; the oldest entry is evicted once the buffer
+is full. `POST /experiment` does **not** store anything -- it has no
+narration/suggestion to report on, only a bare `EvidenceTrace`.
+`agent::pipeline::PipelineResult` and `agent::grounding::GroundedNarration`
+both gained `#[derive(Clone)]` (a small, unavoidable agent-crate touch):
+`ResultStore::get(&self, id) -> Option<PipelineResult>` hands the caller
+its own owned copy without moving the entry out of the shared queue, which
+needs `Clone`, not a reference.
+
+### `GET /report/{result_id}` (`server::pdf`)
+
+A single-page A4 PDF built on `printpdf = "=0.12.8"` (pinned exactly, see
+"Judgment calls" below for why the version matters here more than usual).
+404 (`result_not_found`) if the id was never stored or has since been
+evicted. Layout: header (title + experiment type/timestamp, rule),
+Analysis (word-wrapped narration + a grounding-warning line if any),
+key Numbers (a 3-column table, one row set per experiment type -- P&L/
+given+implied shocks/regime/crisis P&L for FactorShock; vol/top-2 factors/
+specific risk/regime for RiskDecomposition; CVaR before/after/reduction/
+turnover/commission for CvarRebalance), Evidence Trace (model params,
+data quality, invariants with pass/fail), footer (fixed regime-smoothing
+disclaimer). Single-pass, no pagination, per spec.
+
+### Shared INR formatting (`compute::format::format_inr`)
+
+`format_inr(1_177_846.39) == "\u{20b9}11,77,846"` -- Indian lakh grouping
+(last 3 digits, then pairs), Unicode minus (not ASCII hyphen) for
+negatives. Lives in `compute` (not `server`) since it's used both there
+(the PDF) and in `compute` itself: `FactorShockOutput` gained
+`formatted_pnl_inr: String`, a pre-formatted sibling of the existing raw
+`portfolio_pnl_inr: f64` field, so the agent's narration has a ready-to-
+cite string. The raw numeric field is unchanged and is still what
+grounding checks against.
+
+### CvarRebalance `per_name_cap` defaulting
+
+`CvarRebalanceInput::per_name_cap` is now `Option<f64>` (was a required
+`f64`); when omitted, `run_cvar_rebalance` defaults it to
+`cvar::DEFAULT_PER_NAME_CAP` (0.20) and records which happened as
+`model_params.cap_source`: `"user-specified"` or `"server-default-0.20"`.
+`parse::PARSE_SYSTEM_PROMPT` gained a line telling Gemini to omit
+`per_name_cap` entirely when the user doesn't mention a cap (rather than
+guessing a number), which is exactly what makes the Option/default path
+reachable from a real `/ask` request.
+
+**Judgment call, and a real spec/reality mismatch**: the checkpoint spec
+asked for this defaulting to live "in server/src/routes.rs, ... after
+deserialising AskRequest". That's not actually reachable there --
+`AskRequest` carries the raw NL `message`, not a parsed `Experiment`;
+parsing happens inside `agent::pipeline::run` (via Gemini), which
+`routes.rs` never sees mid-flight. I implemented the default (and
+`cap_source` recording) inside `compute::cvar::run_cvar_rebalance` itself
+instead, which is the one place that's guaranteed to run for *every* path
+that reaches CvarRebalance -- `/ask`, `/experiment`, and the `experiment`
+CLI alike -- so the behavior the spec actually wants (a missing cap
+defaults to 0.20, and the trace says which) holds everywhere, not just
+`/ask`. Tested at the compute level (`cvar_tests.rs`), not as a `/ask`
+integration test, since `server`'s `MockBackend` returns canned results
+regardless of input and never touches real `compute` code.
+
+### Parallelising narrate + suggest (`agent::pipeline`)
+
+`pipeline::run` now runs `grounded_narrate` and `suggest_follow_up`
+concurrently via `tokio::join!`, instead of narrate-then-suggest in
+sequence. This required `suggest_follow_up` to stop taking the
+narration text as input (narrate hasn't necessarily finished when suggest
+starts) -- it now takes a short plain-text `experiment_summary` built
+directly from the trace (`pipeline::experiment_summary`: experiment type +
+one key output number, e.g. `"CvarRebalance experiment result: historical
+CVaR went from 0.0204 to 0.0190."`), which is available as soon as the
+compute step finishes, before either Gemini call starts.
+
+**Live latency comparison**, same two-turn exchange as the previous
+checkpoint's report (10-stock Nifty portfolio, real Gemini):
+
+| | previous checkpoint (sequential) | this checkpoint (parallel) |
+|---|---|---|
+| Turn 1: "Where is my risk concentrated?" | 14.1s | 7.7s |
+| Turn 2: rebalance request | ~14-20s (had transient retries) | 7.2s |
+
+Turn 1 (clean, no retries, in both runs) is the fairest comparison: **14.1s
+-> 7.7s, about 45% faster**, consistent with removing one whole sequential
+Gemini round trip's worth of latency (narrate and suggest now overlap
+instead of stacking).
+
+### Tests
+
+`store::tests`: insert 21 items into a capacity-20 store, the oldest (index
+0) is evicted, the remaining 20 are all retrievable. `server::tests`:
+`GET /report/{id}` after a real `POST /ask` returns 200,
+`Content-Type: application/pdf`, and a body starting with the `%PDF`
+signature; `GET /report/{unknown-uuid}` returns 404; `POST /ask`'s
+response includes `result_id`. `compute::cvar_tests`: an omitted
+`per_name_cap` resolves to 0.20 and every post-rebalance weight respects
+it, with `cap_source == "server-default-0.20"`; a given `per_name_cap`
+records `cap_source == "user-specified"`. `format::tests`: the four cases
+from the spec (`1_177_846.39`, `-1_177_846.39`, `3_000.0`, `100.0`).
+
+### Judgment calls, and a printpdf finding I want to flag explicitly
+
+**`printpdf` resolved to `0.12.8`, a complete API rewrite** from the
+`PdfLayerReference`-based API most printpdf tutorials/examples still show.
+0.12 is `Op`-list based (`PdfDocument::new`, `PdfPage::new(w, h, ops)`,
+`doc.with_pages(...).save(...)`) with no `PdfLayerReference`/
+`add_builtin_font` returning a font reference to call `.use_text()` on --
+I read the crate's own source (`~/.cargo/registry/.../printpdf-0.12.8/src`)
+and its `examples/text.rs` to confirm the actual current shape before
+writing `server::pdf`, rather than assuming the older API. This version
+also pulls in a much heavier dependency tree than the name suggests
+(`azul-core`, `azul-layout`, `hyphenation`, `rust-fontconfig`) for an
+**optional HTML/CSS-to-PDF layout engine that `server::pdf` never uses** --
+only the low-level `Op` primitives (text positioning, `DrawLine`). Pinned
+exactly (`=0.12.8`) per spec, and worth pinning exactly given how much the
+API moved between versions.
+
+**Confirmed layout/encoding bug, found live, not hypothetical**: printpdf's
+built-in fonts use `/Encoding /WinAnsiEncoding` (CP1252, single-byte).
+Traced it to the byte level in a real generated PDF's content stream:
+any character outside that repertoire -- ₹ (rupee), the Unicode minus
+− that `format_inr` uses for negative amounts, ✓/✗, ⚠ -- is
+silently written as a literal `?` glyph, no error, no warning. First
+observed as `"Commission Cost | ?2,000 | ?"` in a live-generated report.
+Per this checkpoint's explicit instruction ("flag immediately ... don't
+work around silently"), I stopped and reported this verbatim before doing
+anything else, including the specific finding that a *negative* rupee
+figure (the common case -- most FactorShock P&L in this app is a loss)
+would have rendered as `"??11,77,846"`, not `"\u{2212}\u{20b9}11,77,846"`.
+Given the choice between an ASCII fallback (no new dependency), embedding
+a real Unicode font (rejected by the checkpoint spec's own "no font files"
+instruction), or shipping the `?`s, the chosen fix -- confirmed by the
+person running this session -- is a PDF-only ASCII substitution
+(`server::pdf::pdf_safe`: ₹->`"Rs."`, −->`"-"`, ✓->`"Y"`,
+✗->`"N"`, ⚠->`"!"`), applied once at the single funnel point every
+piece of PDF text passes through (`Page::text`). `compute::format_inr`
+itself, and every other consumer of it (the trace field, JSON API
+responses), is untouched -- this is a PDF-rendering-only substitution, not
+a change to what the app reports elsewhere. Re-verified live afterward: a
+real negative-P&L FactorShock report now shows `"-Rs.11,77,846"` and `"Y"`/
+`"N"` for invariants, correctly.
+
+**Word-wrap uses an approximate per-character width heuristic**
+(`server::pdf::char_width_em`), not real Helvetica AFM metrics --
+printpdf's builtin fonts expose no width/measurement API (only externally
+loaded `ParsedFont`s carry `glyph_widths`). The heuristic (narrow
+punctuation/`i`/`l` ~0.28em, wide `m`/`w`/uppercase ~0.7-0.83em, ~0.52em
+default, bold +5%) is close enough that wrapping at 170mm didn't visibly
+break in any of the live reports generated this session, but it is an
+approximation, not a measurement, and I'm flagging it as such rather than
+presenting it as exact.
+
+**Table cells are not word-wrapped** (only the Analysis section's
+narration is) -- a long `Evidence Trace` invariant `detail` string (these
+can run 60-70 characters, e.g. `"lhs=-1177846.374721108703
+rhs=-1177846.374721108703 abs_diff=0.000e0"`) draws starting at the
+Detail column's x-position and extends past the page's right margin
+uncorrected, rather than wrapping or truncating. Confirmed via `qpdf
+--check` (structurally valid) and `pdftotext`, not visually re-rendered
+end-to-end in an actual PDF viewer this session. Left as-is rather than
+building a general cell-wrapping table renderer, consistent with the
+spec's own "single-pass layout -- no pagination needed for a demo" scope,
+but noted here rather than silently accepted.
+
+**Report generation timestamp is wall-clock, not experiment-run time**:
+`EvidenceTrace` carries no "when was this computed" field, so the header's
+timestamp is `chrono::Utc::now()` at PDF-render time (which can be later
+than when the underlying `/ask` actually ran, if the result sat in the
+store for a while). Good enough for a demo; would need a real field on
+`EvidenceTrace` to be exact.

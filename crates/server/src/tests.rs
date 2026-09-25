@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -53,6 +53,9 @@ fn sample_trace() -> EvidenceTrace {
             factor_names: vec!["MARKET".to_string()],
             shrinkage_intensity: 0.0374,
             annualization_factor: 252.0,
+            regime_state: None,
+            regime_fallback_warnings: vec![],
+            cap_source: None,
         },
         outputs: serde_json::json!({ "result": { "portfolio_vol_annualized": 0.1552 } }),
         invariants: vec![],
@@ -65,6 +68,7 @@ fn sample_trace() -> EvidenceTrace {
 struct MockBackend {
     experiment_result: Option<EvidenceTrace>,
     ask_result: Option<agent::pipeline::PipelineResult>,
+    received_conversation_history: Mutex<Option<Vec<agent::ConversationTurn>>>,
 }
 
 #[async_trait::async_trait]
@@ -79,7 +83,9 @@ impl Backend for MockBackend {
         &self,
         _portfolio: Portfolio,
         _message: String,
+        conversation_history: Vec<agent::ConversationTurn>,
     ) -> Result<agent::pipeline::PipelineResult, BackendError> {
+        *self.received_conversation_history.lock().unwrap() = Some(conversation_history);
         self.ask_result
             .as_ref()
             .map(|r| agent::pipeline::PipelineResult {
@@ -89,6 +95,8 @@ impl Backend for MockBackend {
                     narration: r.narration.narration.clone(),
                     grounding_warnings: r.narration.grounding_warnings.clone(),
                 },
+                assistant_turn: r.assistant_turn.clone(),
+                suggestion: r.suggestion.clone(),
             })
             .ok_or_else(|| BackendError::Internal("no mock ask result configured".to_string()))
     }
@@ -97,6 +105,7 @@ impl Backend for MockBackend {
 fn app_with_backend(backend: MockBackend) -> axum::Router {
     build_router(AppState {
         backend: Arc::new(backend),
+        store: Arc::new(crate::store::ResultStore::new()),
     })
 }
 
@@ -110,6 +119,7 @@ async fn health_returns_200_and_expected_json() {
     let app = app_with_backend(MockBackend {
         experiment_result: None,
         ask_result: None,
+        received_conversation_history: Mutex::new(None),
     });
 
     let response = app
@@ -128,6 +138,7 @@ async fn experiment_with_valid_request_returns_a_trace() {
     let app = app_with_backend(MockBackend {
         experiment_result: Some(sample_trace()),
         ask_result: None,
+        received_conversation_history: Mutex::new(None),
     });
 
     let req_body = serde_json::json!({
@@ -157,6 +168,7 @@ async fn experiment_with_weights_not_summing_to_one_returns_400() {
     let app = app_with_backend(MockBackend {
         experiment_result: Some(sample_trace()),
         ask_result: None,
+        received_conversation_history: Mutex::new(None),
     });
 
     let bad_portfolio = serde_json::json!({
@@ -195,6 +207,7 @@ async fn ask_with_mocked_pipeline_returns_grounding_warnings() {
             portfolio: sample_portfolio(),
             frequency: Frequency::Daily,
             window: None,
+            regime_covariance: false,
         }),
         trace: sample_trace(),
         narration: agent::grounding::GroundedNarration {
@@ -203,10 +216,13 @@ async fn ask_with_mocked_pipeline_returns_grounding_warnings() {
                 "unverified number '99%' at byte position 7 in the narration".to_string(),
             ],
         },
+        assistant_turn: agent::ConversationTurn::assistant("Vol is 99% (unverified)."),
+        suggestion: "What if I reduce my turnover to 20%?".to_string(),
     };
     let app = app_with_backend(MockBackend {
         experiment_result: None,
         ask_result: Some(pipeline_result),
+        received_conversation_history: Mutex::new(None),
     });
 
     let req_body = serde_json::json!({
@@ -230,6 +246,177 @@ async fn ask_with_mocked_pipeline_returns_grounding_warnings() {
     assert_eq!(body["narration"], "Vol is 99% (unverified).");
     assert_eq!(body["grounding_warnings"].as_array().unwrap().len(), 1);
     assert_eq!(body["experiment"]["type"], "RiskDecomposition");
+    assert_eq!(body["assistant_turn"]["role"], "assistant");
+    assert_eq!(body["assistant_turn"]["content"], "Vol is 99% (unverified).");
+    assert_eq!(body["suggestion"], "What if I reduce my turnover to 20%?");
+    assert!(body["result_id"].is_string(), "expected a result_id field, got {body:?}");
+}
+
+#[tokio::test]
+async fn ask_with_non_empty_conversation_history_forwards_it_to_the_backend() {
+    let pipeline_result = agent::pipeline::PipelineResult {
+        experiment: Experiment::RiskDecomposition(RiskDecompositionInput {
+            portfolio: sample_portfolio(),
+            frequency: Frequency::Daily,
+            window: None,
+            regime_covariance: false,
+        }),
+        trace: sample_trace(),
+        narration: agent::grounding::GroundedNarration {
+            narration: "Vol is 15.5% annualised.".to_string(),
+            grounding_warnings: vec![],
+        },
+        assistant_turn: agent::ConversationTurn::assistant("Vol is 15.5% annualised."),
+        suggestion: "Now reduce my tail risk with 20% turnover?".to_string(),
+    };
+    let backend = Arc::new(MockBackend {
+        experiment_result: None,
+        ask_result: Some(pipeline_result),
+        received_conversation_history: Mutex::new(None),
+    });
+    let app = build_router(AppState {
+        backend: backend.clone(),
+        store: Arc::new(crate::store::ResultStore::new()),
+    });
+
+    let req_body = serde_json::json!({
+        "portfolio": sample_portfolio(),
+        "message": "now reduce my tail risk, I can tolerate 20% turnover",
+        "conversation_history": [
+            {"role": "user", "content": "where is my risk concentrated?"},
+            {"role": "assistant", "content": "Vol is 15.5% annualised."},
+        ],
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ask")
+                .header("content-type", "application/json")
+                .body(Body::from(req_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let received = backend.received_conversation_history.lock().unwrap();
+    let history = received.as_ref().expect("run_ask should have been called");
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].role, "user");
+    assert_eq!(history[1].role, "assistant");
+    assert_eq!(history[1].content, "Vol is 15.5% annualised.");
+}
+
+#[tokio::test]
+async fn report_route_returns_pdf_for_a_result_stored_by_a_prior_ask() {
+    let pipeline_result = agent::pipeline::PipelineResult {
+        experiment: Experiment::RiskDecomposition(RiskDecompositionInput {
+            portfolio: sample_portfolio(),
+            frequency: Frequency::Daily,
+            window: None,
+            regime_covariance: false,
+        }),
+        trace: sample_trace(),
+        narration: agent::grounding::GroundedNarration {
+            narration: "Vol is 15.5% annualised.".to_string(),
+            grounding_warnings: vec![],
+        },
+        assistant_turn: agent::ConversationTurn::assistant("Vol is 15.5% annualised."),
+        suggestion: "Now reduce my tail risk?".to_string(),
+    };
+    let app = app_with_backend(MockBackend {
+        experiment_result: None,
+        ask_result: Some(pipeline_result),
+        received_conversation_history: Mutex::new(None),
+    });
+
+    let ask_body = serde_json::json!({
+        "portfolio": sample_portfolio(),
+        "message": "where is my risk concentrated?",
+    });
+    let ask_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ask")
+                .header("content-type", "application/json")
+                .body(Body::from(ask_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ask_response.status(), StatusCode::OK);
+    let ask_json = body_json(ask_response).await;
+    let result_id = ask_json["result_id"].as_str().expect("result_id should be a string").to_string();
+
+    let report_response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/report/{result_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report_response.status(), StatusCode::OK);
+    let content_type = report_response
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert_eq!(content_type, "application/pdf");
+    let bytes = report_response.into_body().collect().await.unwrap().to_bytes();
+    assert!(bytes.starts_with(b"%PDF"), "expected a PDF file signature");
+}
+
+#[tokio::test]
+async fn report_route_returns_404_for_an_unknown_id() {
+    let app = app_with_backend(MockBackend {
+        experiment_result: None,
+        ask_result: None,
+        received_conversation_history: Mutex::new(None),
+    });
+
+    let unknown_id = uuid::Uuid::new_v4();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/report/{unknown_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn scenarios_route_returns_three_scenarios_with_expected_fields() {
+    let app = app_with_backend(MockBackend {
+        experiment_result: None,
+        ask_result: None,
+        received_conversation_history: Mutex::new(None),
+    });
+
+    let response = app
+        .oneshot(Request::builder().uri("/scenarios").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    let scenarios = body.as_array().expect("expected a JSON array");
+    assert_eq!(scenarios.len(), 3);
+    for scenario in scenarios {
+        assert!(scenario["id"].is_string());
+        assert!(scenario["name"].is_string());
+        assert!(scenario["shocks_pct"].is_object());
+    }
 }
 
 #[tokio::test]
@@ -237,6 +424,7 @@ async fn static_route_returns_200_and_html_content_type() {
     let app = app_with_backend(MockBackend {
         experiment_result: None,
         ask_result: None,
+        received_conversation_history: Mutex::new(None),
     });
 
     let response = app

@@ -8,6 +8,7 @@ use serde::Serialize;
 
 use crate::data::DataQuality;
 use crate::model::Frequency;
+use crate::regime::RegimeState;
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct DataWindow {
@@ -24,6 +25,17 @@ pub struct ModelParams {
     pub factor_names: Vec<String>,
     pub shrinkage_intensity: f64,
     pub annualization_factor: f64,
+    /// `Some` only when the experiment requested `regime_covariance: true`.
+    pub regime_state: Option<RegimeState>,
+    /// Non-empty only when `regime_state` is `Some` and at least one
+    /// regime had fewer than `model::MIN_REGIME_OBSERVATIONS` observations
+    /// in the fitted window (see `model::fit_factor_model_with_config`).
+    pub regime_fallback_warnings: Vec<String>,
+    /// `Some` only for `CvarRebalance`: `"user-specified"` if the caller
+    /// gave `per_name_cap`, `"server-default-0.20"` if it was defaulted
+    /// (see `cvar::CvarRebalanceInput::per_name_cap`). `None` for
+    /// `FactorShock`/`RiskDecomposition`, which have no such field.
+    pub cap_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]

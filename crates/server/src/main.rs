@@ -1,7 +1,9 @@
 mod backend;
 mod error;
 mod logging;
+mod pdf;
 mod routes;
+mod store;
 mod validate;
 
 use std::sync::Arc;
@@ -11,6 +13,7 @@ use axum::Router;
 
 use backend::{Backend, RealBackend};
 use routes::AppState;
+use store::ResultStore;
 
 #[tokio::main]
 async fn main() {
@@ -24,7 +27,8 @@ async fn main() {
         }
     };
     let backend: Arc<dyn Backend> = Arc::new(RealBackend::new(gemini));
-    let state = AppState { backend };
+    let store = Arc::new(ResultStore::new());
+    let state = AppState { backend, store };
 
     let app = build_router(state);
 
@@ -47,8 +51,10 @@ async fn main() {
 fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(routes::health))
+        .route("/scenarios", get(routes::get_scenarios))
         .route("/experiment", post(routes::post_experiment))
         .route("/ask", post(routes::post_ask))
+        .route("/report/:result_id", get(routes::get_report))
         .fallback(routes::static_handler)
         .layer(axum::middleware::from_fn(logging::log_requests))
         .with_state(state)
