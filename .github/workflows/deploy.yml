@@ -71,7 +71,11 @@ jobs:
             .)
           echo "Cloud Build ID: ${BUILD_ID}"
 
-          for i in $(seq 1 90); do
+          # This is a Rust workspace build; a clean Cloud Build run has taken
+          # upwards of 17 minutes (see the run for PR #4), so the poll
+          # budget needs real headroom above that, not just above the
+          # median build time.
+          for i in $(seq 1 180); do
             STATUS=$(gcloud builds describe "${BUILD_ID}" \
               --project="${{ vars.GCP_PROJECT_ID }}" \
               --format="value(status)")
@@ -83,7 +87,7 @@ jobs:
                 exit 1
                 ;;
             esac
-            if [ "$i" -eq 90 ]; then
+            if [ "$i" -eq 180 ]; then
               echo "Timed out waiting for Cloud Build ${BUILD_ID}" >&2
               exit 1
             fi
