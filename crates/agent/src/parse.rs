@@ -8,7 +8,7 @@ use compute::experiments::{
 use thiserror::Error;
 
 use crate::conversation::{turn_to_content, ConversationTurn};
-use crate::gemini::{Content, GeminiClient, GeminiError, GeminiRequest, Part, Tool};
+use crate::gemini::{Content, GeminiClient, GeminiError, GeminiRequest, Part, Tool, MODEL_PARSE};
 use crate::schema::{
     experiment_function_declarations, CVAR_REBALANCE_FUNCTION, FACTOR_SHOCK_FUNCTION,
     PORTFOLIO_PERFORMANCE_FUNCTION, RISK_DECOMPOSITION_FUNCTION,
@@ -80,7 +80,7 @@ pub async fn parse_experiment<C: GeminiClient>(
         }]),
     };
 
-    let response = client.generate(&request).await?;
+    let response = client.generate(MODEL_PARSE, &request).await?;
     let candidate = response.candidates.first().ok_or(ParseError::NoCandidates)?;
 
     for part in &candidate.content.parts {

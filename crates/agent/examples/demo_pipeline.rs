@@ -19,7 +19,11 @@ struct ScriptedClient {
 
 #[async_trait::async_trait]
 impl GeminiClient for ScriptedClient {
-    async fn generate(&self, _request: &GeminiRequest) -> Result<GeminiResponse, GeminiError> {
+    async fn generate(
+        &self,
+        _model: &str,
+        _request: &GeminiRequest,
+    ) -> Result<GeminiResponse, GeminiError> {
         Ok(self
             .responses
             .lock()

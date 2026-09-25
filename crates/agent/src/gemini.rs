@@ -9,12 +9,18 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/models";
-// The checkpoint spec that introduced this client named gemini-2.0-flash.
-// Confirmed live (2026-09-24) that model has been retired: the API now
-// returns 404 NOT_FOUND for it, with the response body itself pointing to
-// gemini-3.8-flash as the replacement ("This model models/gemini-2.0-flash
-// is no longer available... use models/gemini-3.8-flash").
-const MODEL: &str = "gemini-3.8-flash";
+// Cheap models for the two non-narration calls; the narration call keeps the
+// stronger flash model since its output is user-facing prose that also has
+// to survive the grounding check in `grounding::grounded_narrate`.
+//
+// Both gemini-2.5-flash-lite and gemini-2.5-flash are documented as still
+// valid but return live 404s for this project ("no longer available to new
+// users... use models/gemini-3.5-flash-lite" / "...models/gemini-3.8-flash"
+// — confirmed 2026-09-26), so this uses Google's own suggested replacements
+// instead.
+pub const MODEL_PARSE: &str = "gemini-3.5-flash-lite";
+pub const MODEL_SUGGEST: &str = "gemini-3.5-flash-lite";
+pub const MODEL_NARRATE: &str = "gemini-3.8-flash";
 const MAX_ATTEMPTS: u32 = 3;
 
 #[derive(Debug, Error)]
@@ -136,7 +142,11 @@ impl GeminiResponse {
 /// making network calls.
 #[async_trait::async_trait]
 pub trait GeminiClient: Send + Sync {
-    async fn generate(&self, request: &GeminiRequest) -> Result<GeminiResponse, GeminiError>;
+    async fn generate(
+        &self,
+        model: &str,
+        request: &GeminiRequest,
+    ) -> Result<GeminiResponse, GeminiError>;
 }
 
 /// The real client: POSTs to Gemini's `generateContent` endpoint, retrying
@@ -144,7 +154,6 @@ pub trait GeminiClient: Send + Sync {
 pub struct HttpGeminiClient {
     http: reqwest::Client,
     api_key: String,
-    model: String,
 }
 
 impl HttpGeminiClient {
@@ -154,15 +163,18 @@ impl HttpGeminiClient {
         Ok(HttpGeminiClient {
             http: reqwest::Client::new(),
             api_key,
-            model: MODEL.to_string(),
         })
     }
 }
 
 #[async_trait::async_trait]
 impl GeminiClient for HttpGeminiClient {
-    async fn generate(&self, request: &GeminiRequest) -> Result<GeminiResponse, GeminiError> {
-        let url = format!("{API_BASE}/{}:generateContent", self.model);
+    async fn generate(
+        &self,
+        model: &str,
+        request: &GeminiRequest,
+    ) -> Result<GeminiResponse, GeminiError> {
+        let url = format!("{API_BASE}/{model}:generateContent");
         let mut attempt = 0u32;
         loop {
             attempt += 1;
@@ -198,7 +210,8 @@ impl GeminiClient for HttpGeminiClient {
 /// `generate(client, request) -> Result<GeminiResponse, GeminiError>` shape.
 pub async fn generate<C: GeminiClient>(
     client: &C,
+    model: &str,
     request: &GeminiRequest,
 ) -> Result<GeminiResponse, GeminiError> {
-    client.generate(request).await
+    client.generate(model, request).await
 }

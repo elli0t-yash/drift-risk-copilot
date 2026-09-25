@@ -6,7 +6,7 @@ use compute::trace::EvidenceTrace;
 use thiserror::Error;
 
 use crate::conversation::{turn_to_content, ConversationTurn};
-use crate::gemini::{Content, GeminiClient, GeminiError, GeminiRequest, Part};
+use crate::gemini::{Content, GeminiClient, GeminiError, GeminiRequest, Part, MODEL_NARRATE};
 
 /// Verbatim per spec; do not paraphrase.
 pub const NARRATE_SYSTEM_PROMPT: &str = "You are a portfolio risk analyst. Explain the following risk experiment result to an investment professional in 3\u{2013}5 sentences. Rules you must follow exactly:
@@ -66,7 +66,7 @@ pub async fn narrate_with_instructions<C: GeminiClient>(
         tools: None,
     };
 
-    let response = client.generate(&request).await?;
+    let response = client.generate(MODEL_NARRATE, &request).await?;
     let part = response.first_part().ok_or(NarrateError::NoCandidates)?;
     part.text.clone().ok_or(NarrateError::NoText)
 }
