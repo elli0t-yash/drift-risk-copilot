@@ -88,6 +88,10 @@ portfolio's substantial equity beta exposure.";
 
     let client = ScriptedClient {
         responses: Mutex::new(vec![
+            // Popped last-in-first-out, so this list is in reverse call
+            // order: parse (function call), then narrate (text), then
+            // suggest (text).
+            text("What if I cut my turnover budget to 20% instead?"),
             text(narration_text),
             function_call(
                 agent::schema::FACTOR_SHOCK_FUNCTION,
@@ -99,9 +103,14 @@ portfolio's substantial equity beta exposure.";
         ]),
     };
 
-    let result = agent::pipeline::run(&client, "what if the market drops 12% and brent jumps 20%?", portfolio)
-        .await
-        .expect("pipeline run failed");
+    let result = agent::pipeline::run(
+        &client,
+        "what if the market drops 12% and brent jumps 20%?",
+        portfolio,
+        &[],
+    )
+    .await
+    .expect("pipeline run failed");
 
     println!("=== experiment (parsed) ===");
     println!("{}", serde_json::to_string_pretty(&result.experiment).unwrap());
@@ -113,4 +122,6 @@ portfolio's substantial equity beta exposure.";
     println!("{}", result.narration.narration);
     println!("\n=== grounding_warnings ===");
     println!("{:?}", result.narration.grounding_warnings);
+    println!("\n=== suggestion ===");
+    println!("{}", result.suggestion);
 }

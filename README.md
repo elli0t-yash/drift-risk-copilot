@@ -21,21 +21,24 @@ crates/
     src/experiments.rs    FactorShock, RiskDecomposition
     src/cvar.rs            CvarRebalance: Rockafellar-Uryasev LP via good_lp + clarabel
     src/trace.rs          EvidenceTrace and its sub-structs
+    src/scenarios.rs       Fixed historical-scenario presets (COVID crash, IL&FS, taper tantrum)
     src/bin/experiment.rs CLI: runs one experiment from a JSON file
     examples/              FactorShock / RiskDecomposition / CvarRebalance inputs, 10-stock Nifty portfolio
     tests/                  Synthetic-data unit/integration tests (no network required)
   agent/     # NL -> Experiment -> EvidenceTrace -> grounded narration
     src/gemini.rs        Async Gemini client: request/response types, retrying HTTP transport
+    src/conversation.rs   ConversationTurn (user/assistant) + Gemini role mapping
     src/schema.rs         JSON Schema (via schemars) for the three per-experiment function declarations
-    src/parse.rs           NL -> Experiment via a single Gemini function-calling turn
-    src/narrate.rs          EvidenceTrace -> plain-language narration via Gemini
+    src/parse.rs           NL -> Experiment via a Gemini function-calling turn, conversation-history aware
+    src/narrate.rs          EvidenceTrace -> plain-language narration via Gemini, conversation-history aware
     src/grounding.rs        Verbatim-number check on narration vs. trace, with retry
+    src/suggest.rs           One proactive follow-up question via a plain-text Gemini call
     src/pipeline.rs          agent::pipeline::run: the one function `server` calls
     examples/demo_pipeline.rs  One-off demo: mocked Gemini + a real compute call (see below)
     tests/                    Mocked-Gemini unit/integration tests (no network to Gemini)
   server/    # axum HTTP API + embedded UI
     src/main.rs           Router, tracing setup, GEMINI_API_KEY startup check
-    src/routes.rs          /health, /experiment, /ask, static-file fallback handlers
+    src/routes.rs          /health, /scenarios, /experiment, /ask, static-file fallback handlers
     src/backend.rs          Backend trait (RealBackend wraps compute+agent) + error mapping
     src/validate.rs          Portfolio validation shared by /experiment and /ask
     src/error.rs             ApiError ({error, code} JSON responses) + AppJson extractor
@@ -866,3 +869,115 @@ compute --test model_tests -- --ignored`. Confirmed passing.
   changing its signature and updating every call site across `agent`/
   `server`, per this checkpoint's explicit scope ("no other crate changes
   in this session").
+
+## Historical scenario presets and multi-turn `/ask`
+
+### `GET /scenarios` (`compute::scenarios`)
+
+Three fixed historical-scenario presets (`compute::scenarios::all_scenarios()`),
+static reference data (not fit from live data): COVID Crash (Mar 2020),
+IL&FS Contagion (Sep-Oct 2018), Taper Tantrum (May-Aug 2013). Each is a
+`shocks_pct` map in the same simple-% units `FactorShockInput` already
+takes, `propagate: false` since all five factors are given (propagation
+would be a no-op). No portfolio or auth needed -- served directly off
+static data. Verified with the server running locally:
+
+```json
+[
+  {
+    "id": "covid_crash",
+    "name": "COVID Crash (Mar 2020)",
+    "date_range": "Feb 19 – Mar 23, 2020",
+    "shocks_pct": {"BRENT": -55.0, "GOLD_USD": 3.0, "MARKET": -38.0, "RATES_PROXY": -6.0, "USDINR": 8.5},
+    "propagate": false
+  },
+  {
+    "id": "ilfs_contagion",
+    "name": "IL&FS Contagion (Sep–Oct 2018)",
+    "shocks_pct": {"BRENT": 15.0, "GOLD_USD": 2.5, "MARKET": -15.0, "RATES_PROXY": 4.0, "USDINR": 7.0},
+    "propagate": false
+  },
+  {
+    "id": "taper_tantrum_2013",
+    "name": "Taper Tantrum (May–Aug 2013)",
+    "shocks_pct": {"BRENT": -5.0, "GOLD_USD": -18.0, "MARKET": -12.0, "RATES_PROXY": 5.0, "USDINR": 18.0},
+    "propagate": false
+  }
+]
+```
+
+(Full descriptions/date ranges omitted above for brevity; see `crates/compute/src/scenarios.rs`.)
+
+### Multi-turn `/ask` (`agent::conversation`, `agent::suggest`)
+
+`AskRequest` gains an optional `conversation_history: Vec<ConversationTurn>`
+(`role: "user" | "assistant"`, default empty -- an empty history produces
+the exact same Gemini request shape as before this checkpoint, verified by
+`empty_conversation_history_matches_pre_existing_request_shape`). Both the
+`parse` (function-calling) and `narrate` Gemini calls prepend history as
+prior turns before their own current-turn message, with `"assistant"`
+mapped onto Gemini's own `"model"` role (`conversation::turn_to_content`).
+This lets a second request like "now try with 25% turnover" resolve
+against the first request's portfolio/experiment context without the
+caller re-stating it, and lets narration refer back to a prior result
+("compared to the previous scenario..."). **The grounding check itself is
+unchanged** -- it only ever validates the current turn's narration against
+the current turn's trace, never anything from history.
+
+`AskResponse` gains `assistant_turn` (this turn's narration, pre-wrapped as
+a `ConversationTurn` the caller appends to its own history for the next
+request) and `suggestion` (see below).
+
+### Proactive follow-up (`agent::suggest`)
+
+After grounded narration, `pipeline::run` makes one more Gemini call
+(`suggest::suggest_follow_up`) -- plain text, no function calling, no
+grounding check (a question isn't a factual claim to verify) -- asking for
+one actionable follow-up question a risk manager would naturally ask next.
+Verified with a mocked pipeline end-to-end
+(`cargo run -p agent --example demo_pipeline`):
+
+> "A -12% shock to MARKET combined with a +20% shock to BRENT produces a
+> portfolio loss of approximately -1,177,846 INR on this ten-stock Nifty
+> portfolio. ... The loss is dominated by the MARKET shock, given the
+> portfolio's substantial equity beta exposure."
+>
+> **suggestion:** "What if I cut my turnover budget to 20% instead?"
+
+### Tests
+
+`compute::scenarios`: exactly 3 scenarios; every `shocks_pct` key is a
+valid `FACTOR_NAMES` entry. `agent`: `parse_experiment` passes
+`conversation_history` as prior turns in the correct order (asserted via
+`MockGeminiClient::last_request()`, a new test-support accessor that
+records every request sent, not just responses returned); an empty history
+produces the pre-existing single-turn request shape; `suggest_follow_up`
+returns the mock's text as-is, including an empty string without erroring.
+`server`: `GET /scenarios` returns 200 and an array of 3, each with
+`id`/`name`/`shocks_pct`; `POST /ask` with a non-empty
+`conversation_history` succeeds and the mock backend's received history is
+asserted directly (2 turns, correct roles/content) via a `MockBackend` held
+outside the router as `Arc<MockBackend>` (not just `Arc<dyn Backend>`) so
+the test can inspect what it captured after the request completes.
+
+### Judgment calls
+
+- **`suggest` failures propagate as a `PipelineError`/500**, same as
+  parse/narrate, rather than degrading `/ask` to a response with an empty
+  `suggestion` on Gemini failure -- consistent with how this codebase
+  already treats every other Gemini-dependent step as load-bearing, not
+  best-effort, and keeps `BackendError`'s existing 503-on-Gemini-failure
+  mapping meaningful for this call too.
+- **`suggest_follow_up` is a free function** (`agent::suggest`), not a
+  method needing an accumulating "grounding" abstraction, since per spec
+  it deliberately has none of grounding's retry/verification machinery --
+  reusing that machinery would have been the wrong shape for a call that
+  isn't checking a factual claim.
+- **A live two-turn `/ask` exchange against real Gemini was not run in
+  this session** -- no `GEMINI_API_KEY` is available in this environment,
+  and fetching the deployed Cloud Run service's key from Secret Manager to
+  run one was declined (see report). `GET /scenarios` and the mocked
+  end-to-end pipeline (above) were both verified live/running instead;
+  `suggest`'s added latency (one more sequential Gemini call in `/ask`,
+  per spec "sequential is fine") is therefore also unmeasured against real
+  API latency in this session.

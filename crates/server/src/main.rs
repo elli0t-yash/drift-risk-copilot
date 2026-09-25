@@ -47,6 +47,7 @@ async fn main() {
 fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(routes::health))
+        .route("/scenarios", get(routes::get_scenarios))
         .route("/experiment", post(routes::post_experiment))
         .route("/ask", post(routes::post_ask))
         .fallback(routes::static_handler)

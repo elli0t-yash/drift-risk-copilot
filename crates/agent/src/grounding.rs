@@ -6,6 +6,7 @@ use compute::trace::EvidenceTrace;
 use regex::Regex;
 use std::sync::OnceLock;
 
+use crate::conversation::ConversationTurn;
 use crate::gemini::GeminiClient;
 use crate::narrate::{narrate_with_instructions, NarrateError};
 
@@ -214,16 +215,19 @@ fn retry_instructions(unmatched: &[UnmatchedNumber]) -> String {
 pub async fn grounded_narrate<C: GeminiClient>(
     client: &C,
     trace: &EvidenceTrace,
+    conversation_history: &[ConversationTurn],
 ) -> Result<GroundedNarration, NarrateError> {
     let trace_value = serde_json::to_value(trace)?;
     let trace_numbers = numeric_leaves(&trace_value);
 
-    let mut narration = narrate_with_instructions(client, trace, None).await?;
+    let mut narration =
+        narrate_with_instructions(client, trace, None, conversation_history).await?;
     let mut check = check_grounding(&narration, &trace_numbers);
     let mut retries = 0;
     while !check.passed() && retries < MAX_RETRIES {
         let extra = retry_instructions(&check.unmatched);
-        narration = narrate_with_instructions(client, trace, Some(&extra)).await?;
+        narration =
+            narrate_with_instructions(client, trace, Some(&extra), conversation_history).await?;
         check = check_grounding(&narration, &trace_numbers);
         retries += 1;
     }

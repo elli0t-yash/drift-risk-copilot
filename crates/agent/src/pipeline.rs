@@ -8,10 +8,12 @@ use compute::experiments::{Experiment, Portfolio};
 use compute::trace::{DataWindow, EvidenceTrace};
 use thiserror::Error;
 
+use crate::conversation::ConversationTurn;
 use crate::gemini::GeminiClient;
 use crate::grounding::GroundedNarration;
 use crate::narrate::NarrateError;
 use crate::parse::{parse_experiment, ParseError};
+use crate::suggest::suggest_follow_up;
 
 const CACHE_DIR: &str = "data/cache";
 
@@ -23,21 +25,35 @@ pub enum PipelineError {
     Compute(#[from] compute::ComputeError),
     #[error("narration error: {0}")]
     Narrate(#[from] NarrateError),
+    #[error("suggestion error: {0}")]
+    Suggest(#[from] crate::suggest::SuggestError),
 }
 
 pub struct PipelineResult {
     pub experiment: Experiment,
     pub trace: EvidenceTrace,
     pub narration: GroundedNarration,
+    /// This turn's narration, as an `assistant` `ConversationTurn` ready
+    /// for the caller to append to its `conversation_history` before the
+    /// next request.
+    pub assistant_turn: ConversationTurn,
+    /// One follow-up question a risk manager would naturally ask next
+    /// (see `suggest`). Not grounding-checked -- it's a question, not a
+    /// factual claim about the trace.
+    pub suggestion: String,
 }
 
-/// parse -> compute -> narrate (with grounding check).
+/// parse -> compute -> narrate (with grounding check) -> suggest a
+/// follow-up. `conversation_history` (if any) is threaded through both the
+/// parse and narrate Gemini calls so multi-turn references resolve
+/// correctly; an empty history behaves exactly as before it existed.
 pub async fn run<C: GeminiClient>(
     client: &C,
     user_message: &str,
     portfolio: Portfolio,
+    conversation_history: &[ConversationTurn],
 ) -> Result<PipelineResult, PipelineError> {
-    let experiment = parse_experiment(client, user_message, portfolio).await?;
+    let experiment = parse_experiment(client, user_message, portfolio, conversation_history).await?;
 
     // The compute layer's data/model-fitting path is synchronous
     // (blocking HTTP + CPU-bound linear algebra); run it on a blocking
@@ -48,12 +64,17 @@ pub async fn run<C: GeminiClient>(
         .await
         .expect("compute_trace task panicked")?;
 
-    let narration = crate::grounding::grounded_narrate(client, &trace).await?;
+    let narration =
+        crate::grounding::grounded_narrate(client, &trace, conversation_history).await?;
+    let assistant_turn = ConversationTurn::assistant(narration.narration.clone());
+    let suggestion = suggest_follow_up(client, &narration.narration).await?;
 
     Ok(PipelineResult {
         experiment,
         trace,
         narration,
+        assistant_turn,
+        suggestion,
     })
 }
 

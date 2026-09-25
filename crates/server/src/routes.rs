@@ -71,6 +71,10 @@ pub async fn post_experiment(
 pub struct AskRequest {
     pub portfolio: Portfolio,
     pub message: String,
+    /// Prior turns of this conversation, oldest first; empty by default.
+    /// See `agent::conversation::ConversationTurn`.
+    #[serde(default)]
+    pub conversation_history: Vec<agent::ConversationTurn>,
 }
 
 #[derive(Serialize)]
@@ -79,6 +83,11 @@ pub struct AskResponse {
     pub trace: EvidenceTrace,
     pub narration: String,
     pub grounding_warnings: Vec<String>,
+    /// This turn's narration as an `assistant` turn, ready for the caller
+    /// to append to `conversation_history` for the next request.
+    pub assistant_turn: agent::ConversationTurn,
+    /// One follow-up question a risk manager would naturally ask next.
+    pub suggestion: String,
 }
 
 pub async fn post_ask(
@@ -87,12 +96,17 @@ pub async fn post_ask(
 ) -> Result<Json<AskResponse>, ApiError> {
     validate_portfolio(&req.portfolio)?;
 
-    let result = state.backend.run_ask(req.portfolio, req.message).await?;
+    let result = state
+        .backend
+        .run_ask(req.portfolio, req.message, req.conversation_history)
+        .await?;
     Ok(Json(AskResponse {
         experiment: result.experiment,
         trace: result.trace,
         narration: result.narration.narration,
         grounding_warnings: result.narration.grounding_warnings,
+        assistant_turn: result.assistant_turn,
+        suggestion: result.suggestion,
     }))
 }
 
@@ -100,4 +114,10 @@ pub async fn post_ask(
 /// binary needs no separate static-file directory at runtime.
 pub async fn static_handler() -> Html<&'static str> {
     Html(INDEX_HTML)
+}
+
+/// `GET /scenarios`: the fixed set of historical scenario presets. No
+/// authentication, no portfolio needed.
+pub async fn get_scenarios() -> Json<serde_json::Value> {
+    Json(serde_json::to_value(compute::scenarios::all_scenarios()).expect("scenarios always serialize"))
 }
