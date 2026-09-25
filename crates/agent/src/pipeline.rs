@@ -150,8 +150,12 @@ pub fn compute_trace(experiment: &Experiment) -> compute::Result<EvidenceTrace> 
             let window = input.resolved_window();
             let data =
                 compute::data::load_market_data(cache_dir, &tickers, false, input.frequency)?;
-            let model =
-                compute::model::fit_factor_model(&data, &tickers, window, input.frequency)?;
+            let model = compute::model::fit_factor_model_with_config(
+                &data,
+                &tickers,
+                compute::model::ModelConfig::new(window, input.frequency)
+                    .with_regime_covariance(input.regime_covariance),
+            )?;
             let data_window = build_data_window(&data, window, input.frequency);
             let (_, trace) =
                 compute::experiments::run_factor_shock(&data.quality, data_window, &model, input)?;
@@ -162,8 +166,12 @@ pub fn compute_trace(experiment: &Experiment) -> compute::Result<EvidenceTrace> 
             let window = input.resolved_window();
             let data =
                 compute::data::load_market_data(cache_dir, &tickers, false, input.frequency)?;
-            let model =
-                compute::model::fit_factor_model(&data, &tickers, window, input.frequency)?;
+            let model = compute::model::fit_factor_model_with_config(
+                &data,
+                &tickers,
+                compute::model::ModelConfig::new(window, input.frequency)
+                    .with_regime_covariance(input.regime_covariance),
+            )?;
             let data_window = build_data_window(&data, window, input.frequency);
             let (_, trace) = compute::experiments::run_risk_decomposition(
                 &data.quality,
