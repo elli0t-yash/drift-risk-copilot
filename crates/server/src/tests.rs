@@ -53,6 +53,8 @@ fn sample_trace() -> EvidenceTrace {
             factor_names: vec!["MARKET".to_string()],
             shrinkage_intensity: 0.0374,
             annualization_factor: 252.0,
+            regime_state: None,
+            regime_fallback_warnings: vec![],
         },
         outputs: serde_json::json!({ "result": { "portfolio_vol_annualized": 0.1552 } }),
         invariants: vec![],
@@ -195,6 +197,7 @@ async fn ask_with_mocked_pipeline_returns_grounding_warnings() {
             portfolio: sample_portfolio(),
             frequency: Frequency::Daily,
             window: None,
+            regime_covariance: false,
         }),
         trace: sample_trace(),
         narration: agent::grounding::GroundedNarration {

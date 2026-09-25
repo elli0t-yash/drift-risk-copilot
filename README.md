@@ -16,7 +16,8 @@ it. The backend is deployable and demo-ready as of this checkpoint.
 crates/
   compute/   # data layer, factor model, experiments, evidence trace
     src/data.rs         Yahoo fetch + cache + NSE calendar alignment + log returns
-    src/model.rs         OLS factor fits, Ledoit-Wolf shrinkage, stock covariance
+    src/model.rs         OLS factor fits, Ledoit-Wolf shrinkage, stock covariance, regime-conditional F
+    src/regime.rs          3-state Gaussian HMM (Baum-Welch, Viterbi) for market-regime detection
     src/experiments.rs    FactorShock, RiskDecomposition
     src/cvar.rs            CvarRebalance: Rockafellar-Uryasev LP via good_lp + clarabel
     src/trace.rs          EvidenceTrace and its sub-structs
@@ -25,7 +26,7 @@ crates/
     tests/                  Synthetic-data unit/integration tests (no network required)
   agent/     # NL -> Experiment -> EvidenceTrace -> grounded narration
     src/gemini.rs        Async Gemini client: request/response types, retrying HTTP transport
-    src/schema.rs         JSON Schema (via schemars) for the run_experiment function declaration
+    src/schema.rs         JSON Schema (via schemars) for the three per-experiment function declarations
     src/parse.rs           NL -> Experiment via a single Gemini function-calling turn
     src/narrate.rs          EvidenceTrace -> plain-language narration via Gemini
     src/grounding.rs        Verbatim-number check on narration vs. trace, with retry
@@ -696,3 +697,172 @@ then up to 2 grounding-retry narrate calls, each itself retrying up to 3x
 internally on 429/503 -- which routinely exceeds 60s under real API
 latency/rate-limiting, well beyond just the cold-start compute call the
 original 60s was sized for).
+
+## Regime-conditional factor covariance (`compute::regime`, `model::ModelConfig`)
+
+A 3-state Gaussian HMM (`compute::regime`, Baum-Welch fit from scratch, no
+external HMM crate) on Nifty (`^NSEI`) daily log returns, used to split the
+factor covariance `F` by market regime instead of always pooling the full
+window. Default is unchanged behaviour (`regime_covariance: false`
+everywhere) — this is purely opt-in.
+
+### The model
+
+- **States, always reported in ascending-emission-variance order**: 0 =
+  Bull (lowest vol), 1 = Bear (medium), 2 = Crisis (highest). The relabel
+  happens once, after Baum-Welch converges, by sorting the three fitted
+  states by their final emission variance — so which *internal* state index
+  the EM fit happened to land on for "the high-vol regime" never matters;
+  the label always does.
+- **Forward/backward**: scaled (Rabiner 1989) — `alpha_hat_t(k)` normalized
+  to sum to 1 at every `t`, with `log P(O) = sum_t ln(c_t)`; `beta` scaled
+  by the *same* `c` array so `alpha_hat_t(k) * beta_t(k) == gamma_t(k)`
+  exactly, verified by a test that checks this sums to 1 (within 1e-9) at
+  every `t`, not just the final one.
+- **Convergence**: log-likelihood improvement `< 1e-6` or 500 iterations.
+- **Viterbi**: log-space, for the full regime-assignment sequence used to
+  split factor returns.
+- `smoothed_probs` (`gamma_T`, the *current* regime distribution) come with
+  `smoothing_note: "full-history smoothed, not suitable for live trading
+  signals"` — a full-history smoother uses future information (everything
+  up to `T`) to estimate the state at `T`, which is fine as a point-in-time
+  snapshot but not what a causal, real-time signal would look like.
+
+### Wiring into the factor model
+
+`model::ModelConfig { window, frequency, regime_covariance }` replaces the
+old bare `(window, frequency)` pair for the regime-aware path
+(`fit_factor_model_with_config`); the original `fit_factor_model(data,
+tickers, window, frequency)` is kept as a thin non-regime wrapper so
+**nothing outside `compute`'s own CLI/experiments/cvar needed to change**
+— `agent`/`server` still call the old signature and compile unmodified.
+
+When `regime_covariance: true`: the HMM fits on the *same* window's `MARKET`
+factor series (already Nifty's own log returns, no separate fetch), factor
+returns are split by the Viterbi sequence, and each regime gets its own
+Ledoit-Wolf `F_k`. `FactorModel.factor_covariance_daily` — the field every
+existing `factor_covariance()`/`stock_covariance()` call already reads —
+becomes `F_{current_regime}`, so **RiskDecomposition needed zero changes to
+its own math**: it was already just calling those methods. All three
+regimes' `F_k` remain available via `factor_covariance_for_regime(k)` /
+`stock_covariance_for_regime(k)`, which is what `FactorShock`'s
+`crisis_comparison` uses.
+
+**Fallback**: a regime with fewer than `MIN_REGIME_OBSERVATIONS` (30) days
+in the window uses the full-window `F` instead of its own (too few
+observations to shrink meaningfully), and a warning is recorded in
+`model_params.regime_fallback_warnings`. This is a real, live-observed
+case, not just a hypothetical — see the live run below.
+
+### Per-experiment behaviour
+
+- **RiskDecomposition**: `regime_covariance: bool` field; when true, vol
+  and Euler contributions use `F_{current_regime}` automatically (see
+  above). `model_params.regime_state` records which regime.
+- **FactorShock**: `regime_covariance: bool` field; when true *and* the
+  current regime isn't already Crisis, `outputs.result.crisis_comparison`
+  reruns the same shock (including conditional propagation) using
+  `F_crisis` instead of `F_current`, so a reader can see "how much worse
+  would this look under crisis-regime correlations" without a second
+  request. Absent (not zeroed) when the current regime already is Crisis,
+  since that comparison would be a no-op.
+- **CvarRebalance**: `regime_covariance: bool` field; per the design note,
+  the LP and feasibility checks always use historical scenarios directly,
+  *never* a factor-model covariance — so this can't gate optimality. It
+  instead fits a regime-conditional factor model purely to report
+  `regime_portfolio_vol_annualized_{before,after}` (`sqrt(w' Sigma_regime
+  w)` for `weights_before`/`weights_after`) as a parametric cross-check
+  alongside the historical CVaR/VaR, with `model_params.regime_state`
+  recording which regime.
+
+### Live run (10-stock Nifty portfolio)
+
+**HMM fit**: `n_iter: 329`, `log_likelihood: 884.996`.
+
+**Current regime**: **Bull** — `smoothed_probs: [0.907, 0.090, 0.003]`
+(Bull/Bear/Crisis), `obs_count_per_regime: [184, 10, 58]` (Viterbi, out of
+the 252-day window).
+
+**Fallback warning actually fired** (not just tested synthetically):
+`"regime_1 (Bear) has only 10 observations, fell back to full-window
+covariance"` — Bear was too thin a slice of this particular 252-day window
+to shrink its own `F`.
+
+**RiskDecomposition, `portfolio_vol_annualized`**:
+
+| | value |
+|---|---|
+| `regime_covariance: false` | 0.1549 |
+| `regime_covariance: true` (Bull) | 0.1174 |
+
+Meaningfully lower under the Bull-regime `F` than the full-window `F`, as
+expected — the window's Bear/Crisis days pull the full-window covariance up.
+
+**FactorShock (Nifty −12%, Brent +20%, `regime_covariance: true`)**,
+current regime Bull, so `crisis_comparison` is present:
+
+| | current regime (Bull) | `crisis_comparison` |
+|---|---|---|
+| `portfolio_pnl_inr` | −1,224,017 | −1,164,320 |
+| implied `USDINR` | +2.05% | +2.17% |
+| implied `GOLD_USD` | −4.15% | −6.02% |
+| implied `RATES_PROXY` | +0.02% | −2.38% |
+
+Both invariants passed in both runs. Reproduce: `cargo run --bin
+experiment -- crates/compute/examples/risk_decomposition_nifty10_regime.json`
+/ `factor_shock_nifty10_regime.json`.
+
+### Tests
+
+`compute::regime`'s own unit tests (synthetic 3-segment low/medium/high-vol
+data): `gamma` sums to 1 at every `t`; Viterbi recovers each segment with
+>85% accuracy; state labels come out variance-ordered regardless of which
+order the segments appear in the data (a deliberately *not* variance-sorted
+order — high, low, medium). `model`'s own tests inject a synthetic Viterbi
+sequence directly (rather than coaxing a real HMM fit into an unlucky
+split) to test the <30-obs fallback deterministically. `experiment_tests.rs`
+covers RiskDecomposition's vol actually differing with/without
+`regime_covariance`, and FactorShock's `crisis_comparison` presence/absence
+by regime. One test — `F` is PSD for all three regimes on real NSEI data —
+needs network and is `#[ignore]`d by default; run with `cargo test -p
+compute --test model_tests -- --ignored`. Confirmed passing.
+
+### Judgment calls
+
+- **k-means init clusters on `|returns|`, not raw signed returns** — found
+  live, not anticipated: since all three regimes are roughly zero-mean,
+  clustering on signed values just splits points by *direction*
+  ("very negative" / "near zero" / "very positive"), which has nothing to
+  do with volatility regime. This made Baum-Welch converge to a poor local
+  optimum on the very first synthetic test run (two of three fitted states
+  ended up with similar variances, differentiated mostly by mean, on data
+  with three well-separated *true* variances and zero true mean
+  everywhere). Clustering on magnitude fixed it immediately; final
+  per-state means/variances are still computed from the original signed
+  data within each magnitude-assigned cluster.
+- **30-observation fallback threshold**: not derived from anything more
+  principled than "Ledoit-Wolf shrinkage needs enough observations to
+  estimate a 5x5 sample covariance's off-diagonal structure at all" — 30
+  points for 5 factors is already a thin sample (6 obs/factor), but Ledoit-
+  Wolf shrinkage is specifically designed to be robust in exactly that
+  small-T regime (it's the paper's whole point), so this is closer to "no
+  smaller than this" than a precisely justified number. The live run above
+  shows it firing in practice (Bear regime, 10 obs), which is reassuring
+  that the threshold isn't so low it never triggers.
+- **CvarRebalance's regime output is informational-only by design**,
+  per the checkpoint spec's explicit "not in the LP itself" — it would be
+  straightforward to instead use `Sigma_regime` in the pre-solve
+  feasibility checks too, but those checks don't reference any covariance
+  at all currently (they're pure cap/turnover arithmetic), so doing that
+  would be a bigger, unrequested change to what "feasible" means for this
+  experiment.
+- **Regime HMM window for CvarRebalance** defaults to
+  `frequency.default_window()` (252 daily), independent of CvarRebalance's
+  own `window` (which defaults to *full available history* for scenarios) —
+  these are two different jobs (regime detection wants a recent window;
+  historical CVaR wants as much data as possible), so tying them together
+  would have been actively wrong.
+- **`fit_factor_model` (old signature) kept as a thin wrapper** rather than
+  changing its signature and updating every call site across `agent`/
+  `server`, per this checkpoint's explicit scope ("no other crate changes
+  in this session").

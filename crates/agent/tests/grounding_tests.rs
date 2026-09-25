@@ -122,6 +122,8 @@ fn sample_trace() -> compute::trace::EvidenceTrace {
             factor_names: vec!["MARKET".to_string()],
             shrinkage_intensity: 0.0374,
             annualization_factor: 252.0,
+            regime_state: None,
+            regime_fallback_warnings: vec![],
         },
         outputs: serde_json::json!({ "result": { "portfolio_vol_annualized": 0.1552 } }),
         invariants: vec![],

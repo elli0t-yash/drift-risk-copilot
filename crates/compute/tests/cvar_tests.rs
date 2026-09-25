@@ -54,6 +54,7 @@ fn heavy_tail_asset_is_cut_to_near_zero_when_turnover_allows() {
         commission_bps: 10.0,
         frequency: compute::model::Frequency::Daily,
         window: None,
+        regime_covariance: false,
     };
 
     let (output, trace) = run_cvar_rebalance(&data.quality, &data, &input).unwrap();
@@ -109,6 +110,7 @@ fn zero_turnover_limit_returns_starting_weights_unchanged() {
         commission_bps: 10.0,
         frequency: compute::model::Frequency::Daily,
         window: None,
+        regime_covariance: false,
     };
 
     let (output, _trace) = run_cvar_rebalance(&data.quality, &data, &input).unwrap();
@@ -146,6 +148,7 @@ fn cap_too_tight_for_full_investment_is_reported_as_infeasible() {
         commission_bps: 10.0,
         frequency: compute::model::Frequency::Daily,
         window: None,
+        regime_covariance: false,
     };
 
     let (output, trace) = run_cvar_rebalance(&data.quality, &data, &input).unwrap();

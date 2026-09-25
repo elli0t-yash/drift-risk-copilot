@@ -81,6 +81,13 @@ pub struct FactorShockInput {
     /// `frequency.default_window()` (252 daily, 156 weekly) when omitted.
     #[serde(default)]
     pub window: Option<usize>,
+    /// When true, the model this experiment runs against is fit with
+    /// regime-conditional covariance (see `model::ModelConfig`), and
+    /// (unless the current regime already *is* Crisis) the trace also
+    /// includes `crisis_comparison`: the same shock rerun using the
+    /// crisis-regime factor covariance instead of the current regime's.
+    #[serde(default)]
+    pub regime_covariance: bool,
 }
 
 fn default_true() -> bool {
@@ -185,6 +192,30 @@ pub struct FactorShockOutput {
     /// fitted factor) does not include the rupee move a domestic gold
     /// holder actually realizes.
     pub gold_inr_implied_move: ShockValue,
+    /// Present when `regime_covariance: true` and the current regime is
+    /// not already Crisis: the same shock rerun using the crisis-regime
+    /// factor covariance (`F_crisis`) instead of whichever regime is
+    /// current, to show tail-scenario sensitivity. Absent (not just
+    /// zeroed) when the current regime already is Crisis, since a "crisis
+    /// vs. crisis" comparison would be a no-op.
+    pub crisis_comparison: Option<CrisisComparisonOutput>,
+    pub crisis_comparison_note: Option<&'static str>,
+}
+
+/// The alternative shock outcome under crisis-regime covariance —
+/// everything from the primary `FactorShockOutput` that actually depends
+/// on which factor covariance was used (implied shocks depend on it via
+/// conditional expectation; P&L and attribution depend on it only insofar
+/// as they depend on the implied shocks). `given_shocks` isn't repeated
+/// here since it's identical to the primary result's (given shocks are
+/// user input, not derived from the covariance).
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct CrisisComparisonOutput {
+    pub implied_shocks: BTreeMap<String, ShockValue>,
+    pub per_holding: Vec<HoldingShockResult>,
+    pub portfolio_pnl_inr: f64,
+    pub portfolio_log_pnl_inr: f64,
+    pub factor_attribution_log_inr: BTreeMap<String, f64>,
 }
 
 /// A labelled square matrix, `FACTOR_NAMES` order, for JSON output.
@@ -236,67 +267,41 @@ fn conditional_expectation(
     Ok((s_u.iter().copied().collect(), coefficients))
 }
 
-pub fn run_factor_shock(
-    data_quality: &DataQuality,
-    data_window: DataWindow,
+/// Everything from a single shock-propagation-and-pricing pass that
+/// depends on which factor covariance was used. Computed once against the
+/// model's own (current-regime, if `regime_covariance`) `F`, and again
+/// against `F_crisis` when a crisis comparison is requested.
+struct ShockComputation {
+    full_shock: Vec<f64>,
+    implied_computation: BTreeMap<String, f64>,
+    conditional_coefficients: BTreeMap<String, BTreeMap<String, f64>>,
+    per_holding: Vec<HoldingShockResult>,
+    portfolio_pnl_inr: f64,
+    portfolio_log_pnl_inr: f64,
+    factor_attribution_log_inr: BTreeMap<String, f64>,
+    invariants: Vec<InvariantCheck>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn propagate_and_price(
+    f_annual: &DMatrix<f64>,
     model: &FactorModel,
     input: &FactorShockInput,
-) -> Result<(FactorShockOutput, EvidenceTrace)> {
-    let factor_names: Vec<String> = FACTOR_NAMES.iter().map(|s| s.to_string()).collect();
-
-    for key in input.shocks_pct.keys() {
-        if !factor_names.contains(key) {
-            return Err(ComputeError::InvalidInput(format!(
-                "unknown factor '{key}', expected one of {factor_names:?}"
-            )));
-        }
-    }
-
-    // "Computation space" values: simple (decimal) shocks directly under
-    // `linear_approximation`, or log-converted shocks otherwise. Betas were
-    // fit on log returns, so propagation and beta application are only
-    // exact in log space; `linear_approximation` reproduces the original
-    // (less correct, but simpler) checkpoint behaviour on request.
-    let given_computation: BTreeMap<String, f64> = input
-        .shocks_pct
-        .iter()
-        .map(|(k, v)| {
-            let simple = v / 100.0;
-            let value = if input.linear_approximation {
-                simple
-            } else {
-                simple_to_log(simple)
-            };
-            (k.clone(), value)
-        })
-        .collect();
-
-    let known_idx: Vec<usize> = factor_names
-        .iter()
-        .enumerate()
-        .filter(|(_, n)| given_computation.contains_key(*n))
-        .map(|(i, _)| i)
-        .collect();
-    let unknown_idx: Vec<usize> = (0..factor_names.len())
-        .filter(|i| !known_idx.contains(i))
-        .collect();
-    let known_vals: Vec<f64> = known_idx
-        .iter()
-        .map(|i| given_computation[&factor_names[*i]])
-        .collect();
-
+    factor_names: &[String],
+    known_idx: &[usize],
+    known_vals: &[f64],
+    unknown_idx: &[usize],
+) -> Result<ShockComputation> {
     let mut full_shock = vec![0.0; factor_names.len()];
     for (i, v) in known_idx.iter().zip(known_vals.iter()) {
         full_shock[*i] = *v;
     }
 
     let mut implied_computation = BTreeMap::new();
-    let mut conditional_coefficients_out: BTreeMap<String, BTreeMap<String, f64>> =
-        BTreeMap::new();
+    let mut conditional_coefficients_out: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
     if input.propagate && !unknown_idx.is_empty() && !known_idx.is_empty() {
-        let f = model.factor_covariance();
         let (implied, coefficients) =
-            conditional_expectation(&f, &known_idx, &known_vals, &unknown_idx)?;
+            conditional_expectation(f_annual, known_idx, known_vals, unknown_idx)?;
         for (idx, val) in unknown_idx.iter().zip(implied.iter()) {
             full_shock[*idx] = *val;
             implied_computation.insert(factor_names[*idx].clone(), *val);
@@ -308,48 +313,6 @@ pub fn run_factor_shock(
             }
             conditional_coefficients_out.insert(factor_names[unknown_factor_idx].clone(), row);
         }
-    }
-
-    let to_shock_value = |v: f64| -> ShockValue {
-        if input.linear_approximation {
-            ShockValue::from_simple(v)
-        } else {
-            ShockValue::from_log(v)
-        }
-    };
-    let given_shocks: BTreeMap<String, ShockValue> = given_computation
-        .iter()
-        .map(|(k, v)| (k.clone(), to_shock_value(*v)))
-        .collect();
-    let implied_shocks: BTreeMap<String, ShockValue> = implied_computation
-        .iter()
-        .map(|(k, v)| (k.clone(), to_shock_value(*v)))
-        .collect();
-
-    let log_shock_at = |idx: usize| -> f64 {
-        if input.linear_approximation {
-            simple_to_log(full_shock[idx])
-        } else {
-            full_shock[idx]
-        }
-    };
-    let gold_idx = factor_names.iter().position(|n| n == "GOLD_USD").unwrap();
-    let usdinr_idx = factor_names.iter().position(|n| n == "USDINR").unwrap();
-    let gold_inr_implied_move =
-        ShockValue::from_log(log_shock_at(gold_idx) + log_shock_at(usdinr_idx));
-
-    let corr = model.factor_correlation();
-    let factor_correlation = CorrelationMatrix {
-        factor_names: factor_names.clone(),
-        rows: (0..factor_names.len())
-            .map(|i| (0..factor_names.len()).map(|j| corr[(i, j)]).collect())
-            .collect(),
-    };
-
-    if input.portfolio.tickers() != model.tickers {
-        return Err(ComputeError::InvalidInput(
-            "portfolio holdings and fitted model tickers must match 1:1, in order".to_string(),
-        ));
     }
 
     let mut per_holding = Vec::with_capacity(model.fits.len());
@@ -412,17 +375,173 @@ pub fn run_factor_shock(
         ));
     }
 
-    let output = FactorShockOutput {
-        linear_approximation: input.linear_approximation,
-        given_shocks,
-        implied_shocks,
+    Ok(ShockComputation {
+        full_shock,
+        implied_computation,
+        conditional_coefficients: conditional_coefficients_out,
         per_holding,
         portfolio_pnl_inr,
         portfolio_log_pnl_inr,
         factor_attribution_log_inr,
+        invariants,
+    })
+}
+
+pub fn run_factor_shock(
+    data_quality: &DataQuality,
+    data_window: DataWindow,
+    model: &FactorModel,
+    input: &FactorShockInput,
+) -> Result<(FactorShockOutput, EvidenceTrace)> {
+    let factor_names: Vec<String> = FACTOR_NAMES.iter().map(|s| s.to_string()).collect();
+
+    for key in input.shocks_pct.keys() {
+        if !factor_names.contains(key) {
+            return Err(ComputeError::InvalidInput(format!(
+                "unknown factor '{key}', expected one of {factor_names:?}"
+            )));
+        }
+    }
+
+    if input.portfolio.tickers() != model.tickers {
+        return Err(ComputeError::InvalidInput(
+            "portfolio holdings and fitted model tickers must match 1:1, in order".to_string(),
+        ));
+    }
+
+    // "Computation space" values: simple (decimal) shocks directly under
+    // `linear_approximation`, or log-converted shocks otherwise. Betas were
+    // fit on log returns, so propagation and beta application are only
+    // exact in log space; `linear_approximation` reproduces the original
+    // (less correct, but simpler) checkpoint behaviour on request.
+    let given_computation: BTreeMap<String, f64> = input
+        .shocks_pct
+        .iter()
+        .map(|(k, v)| {
+            let simple = v / 100.0;
+            let value = if input.linear_approximation {
+                simple
+            } else {
+                simple_to_log(simple)
+            };
+            (k.clone(), value)
+        })
+        .collect();
+
+    let known_idx: Vec<usize> = factor_names
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| given_computation.contains_key(*n))
+        .map(|(i, _)| i)
+        .collect();
+    let unknown_idx: Vec<usize> = (0..factor_names.len())
+        .filter(|i| !known_idx.contains(i))
+        .collect();
+    let known_vals: Vec<f64> = known_idx
+        .iter()
+        .map(|i| given_computation[&factor_names[*i]])
+        .collect();
+
+    let to_shock_value = |v: f64| -> ShockValue {
+        if input.linear_approximation {
+            ShockValue::from_simple(v)
+        } else {
+            ShockValue::from_log(v)
+        }
+    };
+    let given_shocks: BTreeMap<String, ShockValue> = given_computation
+        .iter()
+        .map(|(k, v)| (k.clone(), to_shock_value(*v)))
+        .collect();
+
+    let primary = propagate_and_price(
+        &model.factor_covariance(),
+        model,
+        input,
+        &factor_names,
+        &known_idx,
+        &known_vals,
+        &unknown_idx,
+    )?;
+    let implied_shocks: BTreeMap<String, ShockValue> = primary
+        .implied_computation
+        .iter()
+        .map(|(k, v)| (k.clone(), to_shock_value(*v)))
+        .collect();
+
+    let log_shock_at = |idx: usize| -> f64 {
+        if input.linear_approximation {
+            simple_to_log(primary.full_shock[idx])
+        } else {
+            primary.full_shock[idx]
+        }
+    };
+    let gold_idx = factor_names.iter().position(|n| n == "GOLD_USD").unwrap();
+    let usdinr_idx = factor_names.iter().position(|n| n == "USDINR").unwrap();
+    let gold_inr_implied_move =
+        ShockValue::from_log(log_shock_at(gold_idx) + log_shock_at(usdinr_idx));
+
+    let corr = model.factor_correlation();
+    let factor_correlation = CorrelationMatrix {
+        factor_names: factor_names.clone(),
+        rows: (0..factor_names.len())
+            .map(|i| (0..factor_names.len()).map(|j| corr[(i, j)]).collect())
+            .collect(),
+    };
+
+    let invariants = primary.invariants;
+
+    const CRISIS_REGIME: usize = 2;
+    let (crisis_comparison, crisis_comparison_note) = if input.regime_covariance {
+        match &model.regime_state {
+            Some(state) if state.current_regime as usize != CRISIS_REGIME => {
+                let f_crisis = model
+                    .factor_covariance_for_regime(CRISIS_REGIME)
+                    .expect("regime_covariance requested and regime_state present implies regime_factor_covariance_daily present");
+                let crisis = propagate_and_price(
+                    &f_crisis,
+                    model,
+                    input,
+                    &factor_names,
+                    &known_idx,
+                    &known_vals,
+                    &unknown_idx,
+                )?;
+                let crisis_implied_shocks: BTreeMap<String, ShockValue> = crisis
+                    .implied_computation
+                    .iter()
+                    .map(|(k, v)| (k.clone(), to_shock_value(*v)))
+                    .collect();
+                (
+                    Some(CrisisComparisonOutput {
+                        implied_shocks: crisis_implied_shocks,
+                        per_holding: crisis.per_holding,
+                        portfolio_pnl_inr: crisis.portfolio_pnl_inr,
+                        portfolio_log_pnl_inr: crisis.portfolio_log_pnl_inr,
+                        factor_attribution_log_inr: crisis.factor_attribution_log_inr,
+                    }),
+                    Some("Rerun using crisis-regime covariance to show tail-scenario sensitivity"),
+                )
+            }
+            _ => (None, None),
+        }
+    } else {
+        (None, None)
+    };
+
+    let output = FactorShockOutput {
+        linear_approximation: input.linear_approximation,
+        given_shocks,
+        implied_shocks,
+        per_holding: primary.per_holding,
+        portfolio_pnl_inr: primary.portfolio_pnl_inr,
+        portfolio_log_pnl_inr: primary.portfolio_log_pnl_inr,
+        factor_attribution_log_inr: primary.factor_attribution_log_inr,
         factor_correlation,
-        conditional_coefficients: conditional_coefficients_out,
+        conditional_coefficients: primary.conditional_coefficients,
         gold_inr_implied_move,
+        crisis_comparison,
+        crisis_comparison_note,
     };
 
     let note = if input.linear_approximation {
@@ -448,6 +567,8 @@ pub fn run_factor_shock(
             factor_names: factor_names.clone(),
             shrinkage_intensity: model.shrinkage_intensity,
             annualization_factor: model.frequency.annualization_factor(),
+            regime_state: model.regime_state.clone(),
+            regime_fallback_warnings: model.regime_fallback_warnings.clone(),
         },
         outputs: serde_json::json!({
             "result": output,
@@ -473,6 +594,13 @@ pub struct RiskDecompositionInput {
     /// `frequency.default_window()` (252 daily, 156 weekly) when omitted.
     #[serde(default)]
     pub window: Option<usize>,
+    /// When true, the model this experiment runs against is fit with
+    /// regime-conditional covariance (see `model::ModelConfig`): vol and
+    /// Euler contributions then use the *current* regime's factor
+    /// covariance rather than the full window's. Which regime that was is
+    /// recorded in the trace's `model_params.regime_state`.
+    #[serde(default)]
+    pub regime_covariance: bool,
 }
 
 impl RiskDecompositionInput {
@@ -605,6 +733,8 @@ pub fn run_risk_decomposition(
             factor_names,
             shrinkage_intensity: model.shrinkage_intensity,
             annualization_factor: model.frequency.annualization_factor(),
+            regime_state: model.regime_state.clone(),
+            regime_fallback_warnings: model.regime_fallback_warnings.clone(),
         },
         outputs: serde_json::json!({ "result": output }),
         invariants,

@@ -9,10 +9,13 @@ use good_lp::{clarabel, variable, Expression, ProblemVariables, ResolutionError,
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use nalgebra::DVector;
+
 use crate::data::DataQuality;
 use crate::error::{ComputeError, Result};
 use crate::experiments::{log_to_simple, Portfolio};
-use crate::model::Frequency;
+use crate::model::{Frequency, ModelConfig};
+use crate::regime::RegimeState;
 use crate::trace::{DataWindow, EvidenceTrace, InvariantCheck, ModelParams};
 
 fn default_confidence_level() -> f64 {
@@ -46,6 +49,14 @@ pub struct CvarRebalanceInput {
     /// Scenario window in periods; omit for the full available history.
     #[serde(default)]
     pub window: Option<usize>,
+    /// When true, fits a regime-conditional factor model (see
+    /// `model::ModelConfig`) purely for a reported sanity check —
+    /// `regime_portfolio_vol_annualized_{before,after}` in the output —
+    /// alongside the historical-scenario CVaR. This does **not** feed into
+    /// the LP or the feasibility checks: the LP always uses historical
+    /// scenarios directly, per the design note.
+    #[serde(default)]
+    pub regime_covariance: bool,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -85,6 +96,14 @@ pub struct CvarRebalanceOutput {
     /// reported alongside `stats_after.historical_cvar` (computed
     /// independently from the scenario matrix) so the two can be compared.
     pub lp_objective_cvar: Option<f64>,
+    /// `Some` only when `regime_covariance: true`: annualized portfolio
+    /// vol under the current-regime factor covariance (`sqrt(w' Sigma_regime w)`),
+    /// for `weights_before`. An informational cross-check against the
+    /// historical-scenario CVaR/VaR above, not used in the LP/feasibility.
+    pub regime_portfolio_vol_annualized_before: Option<f64>,
+    /// Same as `regime_portfolio_vol_annualized_before`, for `weights_after`
+    /// (only when `status == "optimal"`).
+    pub regime_portfolio_vol_annualized_after: Option<f64>,
 }
 
 /// Historical VaR/CVaR of the scenario-weighted loss distribution
@@ -151,6 +170,35 @@ pub fn run_cvar_rebalance(
     let weights_before: BTreeMap<String, f64> =
         tickers.iter().cloned().zip(w0.iter().copied()).collect();
 
+    // Informational only (see CvarRebalanceInput::regime_covariance doc):
+    // fits a regime-conditional factor model purely to report
+    // regime_portfolio_vol_annualized_{before,after} as a parametric
+    // cross-check alongside the historical-scenario CVaR/VaR. Never feeds
+    // the LP or the feasibility checks below.
+    let regime_model = if input.regime_covariance {
+        let regime_window = input.frequency.default_window();
+        Some(crate::model::fit_factor_model_with_config(
+            data,
+            &tickers,
+            ModelConfig::new(regime_window, input.frequency).with_regime_covariance(true),
+        )?)
+    } else {
+        None
+    };
+    let regime_state: Option<RegimeState> = regime_model.as_ref().and_then(|m| m.regime_state.clone());
+    let regime_fallback_warnings: Vec<String> =
+        regime_model.as_ref().map(|m| m.regime_fallback_warnings.clone()).unwrap_or_default();
+    let regime_vol = |weights: &BTreeMap<String, f64>| -> Option<f64> {
+        let m = regime_model.as_ref()?;
+        // m.factor_covariance_daily (and hence stock_covariance()) is
+        // already the *current* regime's F, per fit_factor_model_with_config.
+        let sigma = m.stock_covariance();
+        let w = DVector::from_iterator(m.tickers.len(), m.tickers.iter().map(|t| weights[t]));
+        let variance = (w.transpose() * &sigma * &w)[(0, 0)];
+        Some(variance.max(0.0).sqrt())
+    };
+    let regime_portfolio_vol_annualized_before = regime_vol(&weights_before);
+
     let data_window = DataWindow {
         frequency: input.frequency,
         window_periods: window,
@@ -165,6 +213,8 @@ pub fn run_cvar_rebalance(
         factor_names: Vec::new(),
         shrinkage_intensity: 0.0,
         annualization_factor: 1.0,
+        regime_state,
+        regime_fallback_warnings,
     };
 
     let make_trace = |output: &CvarRebalanceOutput, invariants: Vec<InvariantCheck>| -> Result<EvidenceTrace> {
@@ -199,7 +249,7 @@ pub fn run_cvar_rebalance(
              weights cannot sum to 1 under a long-only portfolio.",
             cap * (n as f64)
         );
-        let output = infeasible_output(input, scenario_count, k, weights_before, stats_before, diagnostics.clone());
+        let output = infeasible_output(input, scenario_count, k, weights_before.clone(), stats_before.clone(), regime_portfolio_vol_annualized_before, diagnostics.clone());
         let trace = make_trace(
             &output,
             vec![InvariantCheck {
@@ -224,7 +274,7 @@ pub fn run_cvar_rebalance(
             2.0 * min_required_sells,
             input.turnover_limit
         );
-        let output = infeasible_output(input, scenario_count, k, weights_before, stats_before, diagnostics.clone());
+        let output = infeasible_output(input, scenario_count, k, weights_before.clone(), stats_before.clone(), regime_portfolio_vol_annualized_before, diagnostics.clone());
         let trace = make_trace(
             &output,
             vec![InvariantCheck {
@@ -278,7 +328,7 @@ pub fn run_cvar_rebalance(
         Err(e) => {
             let (status, diagnostics) = classify_resolution_error(&e);
             let output = infeasible_output_with_status(
-                input, scenario_count, k, weights_before, stats_before, status, diagnostics.clone(),
+                input, scenario_count, k, weights_before.clone(), stats_before.clone(), regime_portfolio_vol_annualized_before, status, diagnostics.clone(),
             );
             let trace = make_trace(
                 &output,
@@ -327,6 +377,8 @@ pub fn run_cvar_rebalance(
         ),
     ];
 
+    let regime_portfolio_vol_annualized_after = regime_vol(&weights_after);
+
     let output = CvarRebalanceOutput {
         status: "optimal".to_string(),
         diagnostics: None,
@@ -340,6 +392,8 @@ pub fn run_cvar_rebalance(
         turnover: Some(turnover),
         commission_cost_inr: Some(commission_cost_inr),
         lp_objective_cvar: Some(lp_objective_cvar),
+        regime_portfolio_vol_annualized_before,
+        regime_portfolio_vol_annualized_after,
     };
     let trace = make_trace(&output, invariants)?;
     Ok((output, trace))
@@ -355,12 +409,14 @@ fn classify_resolution_error(e: &ResolutionError) -> (String, String) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn infeasible_output(
     input: &CvarRebalanceInput,
     scenario_count: usize,
     k: usize,
     weights_before: BTreeMap<String, f64>,
     stats_before: CvarPortfolioStats,
+    regime_portfolio_vol_annualized_before: Option<f64>,
     diagnostics: String,
 ) -> CvarRebalanceOutput {
     infeasible_output_with_status(
@@ -369,6 +425,7 @@ fn infeasible_output(
         k,
         weights_before,
         stats_before,
+        regime_portfolio_vol_annualized_before,
         "infeasible".to_string(),
         diagnostics,
     )
@@ -381,6 +438,7 @@ fn infeasible_output_with_status(
     k: usize,
     weights_before: BTreeMap<String, f64>,
     stats_before: CvarPortfolioStats,
+    regime_portfolio_vol_annualized_before: Option<f64>,
     status: String,
     diagnostics: String,
 ) -> CvarRebalanceOutput {
@@ -397,5 +455,7 @@ fn infeasible_output_with_status(
         turnover: None,
         commission_cost_inr: None,
         lp_objective_cvar: None,
+        regime_portfolio_vol_annualized_before,
+        regime_portfolio_vol_annualized_after: None,
     }
 }

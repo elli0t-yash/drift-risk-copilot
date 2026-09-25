@@ -8,6 +8,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::data::{MarketData, FACTOR_NAMES};
 use crate::error::{ComputeError, Result};
+use crate::regime::{self, RegimeState};
+
+/// Minimum observations a regime needs, within the fitted window, for its
+/// own Ledoit-Wolf factor covariance to be used; below this, that
+/// regime's covariance falls back to the full-window `F` and a warning is
+/// recorded (see `fit_factor_model`'s `regime_covariance` handling).
+pub const MIN_REGIME_OBSERVATIONS: usize = 30;
 
 /// Return frequency the factor model is fit at. Non-overlapping: `Weekly`
 /// returns are computed between successive week-end closes, not a rolling
@@ -72,6 +79,32 @@ pub struct StockFit {
     pub n_obs: usize,
 }
 
+/// `fit_factor_model`'s configuration: the trailing window, its frequency,
+/// and whether to condition the factor covariance on the current market
+/// regime (see `regime` module doc; default `false` preserves the
+/// pre-regime behaviour exactly — a single full-window Ledoit-Wolf `F`).
+#[derive(Debug, Clone, Copy)]
+pub struct ModelConfig {
+    pub window: usize,
+    pub frequency: Frequency,
+    pub regime_covariance: bool,
+}
+
+impl ModelConfig {
+    pub fn new(window: usize, frequency: Frequency) -> Self {
+        ModelConfig {
+            window,
+            frequency,
+            regime_covariance: false,
+        }
+    }
+
+    pub fn with_regime_covariance(mut self, regime_covariance: bool) -> Self {
+        self.regime_covariance = regime_covariance;
+        self
+    }
+}
+
 /// The fitted factor model for a set of stocks over a trailing window.
 pub struct FactorModel {
     pub frequency: Frequency,
@@ -80,8 +113,22 @@ pub struct FactorModel {
     pub fits: Vec<StockFit>,
     /// Per-period (daily or weekly, per `frequency`) factor covariance
     /// after Ledoit-Wolf shrinkage, in `FACTOR_NAMES` order (rows/cols).
+    /// When `regime_covariance` was requested, this is `F` for the
+    /// *current* regime (see `regime_factor_covariance_daily`) — every
+    /// existing consumer of `factor_covariance()`/`stock_covariance()`
+    /// therefore automatically becomes regime-conditional with no changes
+    /// of its own.
     pub factor_covariance_daily: DMatrix<f64>,
     pub shrinkage_intensity: f64,
+    /// `Some` only when `ModelConfig::regime_covariance` was `true`.
+    pub regime_state: Option<RegimeState>,
+    /// `Some` only when `ModelConfig::regime_covariance` was `true`: the
+    /// per-period, per-regime factor covariance in Bull/Bear/Crisis order
+    /// (index 0/1/2), each either fit on that regime's own days within the
+    /// window or, if it had fewer than `MIN_REGIME_OBSERVATIONS`, a copy of
+    /// the full-window `F` (see `regime_fallback_warnings`).
+    pub regime_factor_covariance_daily: Option<[DMatrix<f64>; 3]>,
+    pub regime_fallback_warnings: Vec<String>,
 }
 
 impl FactorModel {
@@ -116,6 +163,27 @@ impl FactorModel {
     /// Annualized factor covariance F.
     pub fn factor_covariance(&self) -> DMatrix<f64> {
         annualize_matrix(&self.factor_covariance_daily, self.frequency)
+    }
+
+    /// Annualized factor covariance for a specific regime (0=Bull,
+    /// 1=Bear, 2=Crisis), independent of which regime is "current". `None`
+    /// if `regime_covariance` wasn't requested when the model was fit.
+    pub fn factor_covariance_for_regime(&self, regime: usize) -> Option<DMatrix<f64>> {
+        self.regime_factor_covariance_daily
+            .as_ref()
+            .map(|fs| annualize_matrix(&fs[regime], self.frequency))
+    }
+
+    /// Annualized stock covariance Sigma = B F_regime B^T + D, for a
+    /// specific regime (see `factor_covariance_for_regime`). `D` (specific
+    /// risk) is unchanged — it's always the full-window residual variance,
+    /// per the checkpoint spec.
+    pub fn stock_covariance_for_regime(&self, regime: usize) -> Option<DMatrix<f64>> {
+        let f = self.regime_factor_covariance_daily.as_ref()?;
+        let b = self.beta_matrix();
+        let d = self.residual_matrix_daily();
+        let period_sigma = &b * &f[regime] * b.transpose() + d;
+        Some(annualize_matrix(&period_sigma, self.frequency))
     }
 
     /// Factor correlation matrix, in `FACTOR_NAMES` order. Scale-free: the
@@ -228,15 +296,76 @@ pub fn ledoit_wolf_shrink_identity(data: &DMatrix<f64>) -> (DMatrix<f64>, f64) {
     (shrunk, shrinkage)
 }
 
+/// Splits `factors_window` (window x n_factors) into per-regime
+/// sub-matrices by `viterbi_sequence` (one label per row, 0/1/2) and
+/// Ledoit-Wolf-shrinks each. A regime with fewer than
+/// `MIN_REGIME_OBSERVATIONS` rows falls back to `full_window_f` and gets a
+/// warning string pushed instead. Factored out of
+/// `fit_factor_model_with_config` so the fallback path can be tested with
+/// an injected/synthetic `viterbi_sequence`, independent of whether a real
+/// HMM fit happens to produce a regime that small.
+fn regime_conditional_factor_covariance(
+    factors_window: &DMatrix<f64>,
+    viterbi_sequence: &[u8],
+    full_window_f: &DMatrix<f64>,
+) -> ([DMatrix<f64>; 3], Vec<String>) {
+    let k = factors_window.ncols();
+    let mut per_regime: [DMatrix<f64>; 3] = std::array::from_fn(|_| full_window_f.clone());
+    let mut warnings = Vec::new();
+
+    for (regime_idx, label) in regime::REGIME_LABELS.iter().enumerate() {
+        let row_indices: Vec<usize> = (0..viterbi_sequence.len())
+            .filter(|&t| viterbi_sequence[t] as usize == regime_idx)
+            .collect();
+        if row_indices.len() < MIN_REGIME_OBSERVATIONS {
+            warnings.push(format!(
+                "regime_{regime_idx} ({label}) has only {} observations, fell back to \
+                 full-window covariance",
+                row_indices.len()
+            ));
+            // per_regime[regime_idx] already initialized to the full-window F.
+            continue;
+        }
+        let regime_matrix =
+            DMatrix::from_fn(row_indices.len(), k, |i, j| factors_window[(row_indices[i], j)]);
+        let (f_k, _shrinkage_k) = ledoit_wolf_shrink_identity(&regime_matrix);
+        per_regime[regime_idx] = f_k;
+    }
+
+    (per_regime, warnings)
+}
+
 /// Fits the factor model for `tickers` over the trailing `window` periods
 /// (trading days or weeks, per `frequency`) of `data` (the most recent
 /// `window` return observations, which must already be at `frequency`).
+/// Equivalent to `fit_factor_model_with_config` with `regime_covariance:
+/// false` — kept as a separate, narrower entry point so existing callers
+/// (outside this checkpoint's scope) don't need to change.
 pub fn fit_factor_model(
     data: &MarketData,
     tickers: &[String],
     window: usize,
     frequency: Frequency,
 ) -> Result<FactorModel> {
+    fit_factor_model_with_config(data, tickers, ModelConfig::new(window, frequency))
+}
+
+/// Fits the factor model per `config` (see `ModelConfig`). When
+/// `config.regime_covariance` is true, also fits a 3-state HMM on the
+/// window's `MARKET` (Nifty) returns and splits the factor covariance by
+/// Viterbi-assigned regime — see `regime` module doc and the
+/// `regime_factor_covariance_daily`/`regime_state` fields.
+pub fn fit_factor_model_with_config(
+    data: &MarketData,
+    tickers: &[String],
+    config: ModelConfig,
+) -> Result<FactorModel> {
+    let ModelConfig {
+        window,
+        frequency,
+        regime_covariance,
+    } = config;
+
     let factor_matrices: Vec<&Vec<f64>> = FACTOR_NAMES
         .iter()
         .map(|name| {
@@ -257,8 +386,28 @@ pub fn fit_factor_model(
     let k = FACTOR_NAMES.len();
     let factors_window = DMatrix::from_fn(window, k, |i, j| factor_matrices[j][start + i]);
 
-    let (factor_covariance_daily, shrinkage_intensity) =
+    let (full_window_factor_covariance_daily, shrinkage_intensity) =
         ledoit_wolf_shrink_identity(&factors_window);
+
+    let mut regime_state: Option<RegimeState> = None;
+    let mut regime_factor_covariance_daily: Option<[DMatrix<f64>; 3]> = None;
+    let mut regime_fallback_warnings: Vec<String> = Vec::new();
+    let mut factor_covariance_daily = full_window_factor_covariance_daily.clone();
+
+    if regime_covariance {
+        // FACTOR_NAMES[0] == "MARKET" == Nifty (^NSEI); factor_matrices[0]
+        // is that column, already sliced to the same [start, start+window)
+        // window as everything else here.
+        let nsei_window: Vec<f64> = factor_matrices[0][start..start + window].to_vec();
+        let (_hmm, state) = regime::fit_hmm(&nsei_window)?;
+
+        let (per_regime, warnings) =
+            regime_conditional_factor_covariance(&factors_window, &state.viterbi_sequence, &full_window_factor_covariance_daily);
+        regime_fallback_warnings = warnings;
+        factor_covariance_daily = per_regime[state.current_regime as usize].clone();
+        regime_factor_covariance_daily = Some(per_regime);
+        regime_state = Some(state);
+    }
 
     let mut fits = Vec::with_capacity(tickers.len());
     for ticker in tickers {
@@ -295,5 +444,77 @@ pub fn fit_factor_model(
         fits,
         factor_covariance_daily,
         shrinkage_intensity,
+        regime_state,
+        regime_factor_covariance_daily,
+        regime_fallback_warnings,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic small PRNG, matching the pattern used elsewhere in
+    /// this crate's tests (no `rand` dependency).
+    struct Rng(u64);
+    impl Rng {
+        fn next_signed(&mut self) -> f64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            let unit = (self.0 >> 11) as f64 / (1u64 << 53) as f64;
+            unit * 2.0 - 1.0
+        }
+    }
+
+    fn random_factor_matrix(rows: usize, cols: usize, seed: u64) -> DMatrix<f64> {
+        let mut rng = Rng(seed.max(1));
+        DMatrix::from_fn(rows, cols, |_, _| rng.next_signed() * 0.01)
+    }
+
+    /// A regime with < MIN_REGIME_OBSERVATIONS rows must fall back to the
+    /// full-window F and record a warning naming that regime — tested with
+    /// an injected `viterbi_sequence` rather than relying on a real HMM fit
+    /// happening to produce such a skewed split.
+    #[test]
+    fn fallback_warning_fires_for_a_regime_with_too_few_observations() {
+        let window = 100;
+        let k = FACTOR_NAMES.len();
+        let factors_window = random_factor_matrix(window, k, 7);
+        let (full_window_f, _) = ledoit_wolf_shrink_identity(&factors_window);
+
+        // Bull (0): 60 obs, Bear (1): 25 obs (< 30, should fall back),
+        // Crisis (2): 15 obs (< 30, should fall back).
+        let mut viterbi_sequence = vec![0u8; 60];
+        viterbi_sequence.extend(std::iter::repeat_n(1u8, 25));
+        viterbi_sequence.extend(std::iter::repeat_n(2u8, 15));
+        assert_eq!(viterbi_sequence.len(), window);
+
+        let (per_regime, warnings) =
+            regime_conditional_factor_covariance(&factors_window, &viterbi_sequence, &full_window_f);
+
+        assert_eq!(warnings.len(), 2, "expected exactly 2 fallback warnings, got {warnings:?}");
+        assert!(warnings[0].contains("regime_1") && warnings[0].contains("Bear") && warnings[0].contains("25"));
+        assert!(warnings[1].contains("regime_2") && warnings[1].contains("Crisis") && warnings[1].contains("15"));
+
+        // Regime 0 (Bull, 60 obs >= 30) should NOT equal the full-window F
+        // (it's fit on its own, distinct data); regimes 1 and 2 (fallback)
+        // should equal the full-window F exactly.
+        assert_ne!(per_regime[0], full_window_f);
+        assert_eq!(per_regime[1], full_window_f);
+        assert_eq!(per_regime[2], full_window_f);
+    }
+
+    #[test]
+    fn no_fallback_warnings_when_every_regime_has_enough_observations() {
+        let window = 90;
+        let k = FACTOR_NAMES.len();
+        let factors_window = random_factor_matrix(window, k, 11);
+        let (full_window_f, _) = ledoit_wolf_shrink_identity(&factors_window);
+
+        let viterbi_sequence: Vec<u8> = (0..window).map(|i| (i / 30) as u8).collect();
+        let (_per_regime, warnings) =
+            regime_conditional_factor_covariance(&factors_window, &viterbi_sequence, &full_window_f);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
 }
