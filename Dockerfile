@@ -17,24 +17,28 @@ WORKDIR /app
 
 # Cache the dependency-compilation layer. Copy only the manifests/lockfile
 # and a stub for every workspace crate's declared targets (lib.rs for each
-# crate, plus compute's `experiment` bin — cargo needs the source file for
-# every target declared in a member's Cargo.toml to exist even when
-# building only `-p server`), then do a throwaway build. As long as no
-# Cargo.toml/Cargo.lock changed, Docker reuses this layer — and cargo
-# reuses its compiled *dependency* artifacts in target/ — on later builds
-# where only application source under src/ changed.
+# of compute/agent/server/store, plus compute's `experiment` bin — cargo
+# needs the source file for every target declared in a member's Cargo.toml
+# to exist even when building only `-p server`, and `store` is a workspace
+# member too since it's a path dependency of `compute`), then do a
+# throwaway build. As long as no Cargo.toml/Cargo.lock changed, Docker
+# reuses this layer — and cargo reuses its compiled *dependency* artifacts
+# in target/ — on later builds where only application source under src/
+# changed.
 COPY Cargo.toml Cargo.lock ./
 COPY crates/compute/Cargo.toml crates/compute/Cargo.toml
 COPY crates/agent/Cargo.toml crates/agent/Cargo.toml
 COPY crates/server/Cargo.toml crates/server/Cargo.toml
+COPY crates/store/Cargo.toml crates/store/Cargo.toml
 
-RUN mkdir -p crates/compute/src/bin crates/agent/src crates/server/src \
+RUN mkdir -p crates/compute/src/bin crates/agent/src crates/server/src crates/store/src \
     && echo "pub fn _dummy() {}" > crates/compute/src/lib.rs \
     && echo "fn main() {}" > crates/compute/src/bin/experiment.rs \
     && echo "pub fn _dummy() {}" > crates/agent/src/lib.rs \
     && echo "fn main() {}" > crates/server/src/main.rs \
+    && echo "pub fn _dummy() {}" > crates/store/src/lib.rs \
     && cargo build --release -p server \
-    && rm -rf crates/compute/src crates/agent/src crates/server/src
+    && rm -rf crates/compute/src crates/agent/src crates/server/src crates/store/src
 
 # Now bring in the real source and rebuild. Only the crates whose source
 # actually changed get recompiled; external dependencies (nalgebra,
@@ -49,11 +53,13 @@ RUN mkdir -p crates/compute/src/bin crates/agent/src crates/server/src \
 # image's `/server` exited immediately with no output — the dummy
 # `fn main() {}`, not the real server.
 COPY crates/compute/src crates/compute/src
+COPY crates/compute/build.rs crates/compute/build.rs
 COPY crates/agent/src crates/agent/src
 COPY crates/server/src crates/server/src
 COPY crates/server/static crates/server/static
+COPY crates/store/src crates/store/src
 
-RUN find crates/compute/src crates/agent/src crates/server/src -type f -exec touch {} + \
+RUN find crates/compute/src crates/agent/src crates/server/src crates/store/src -type f -exec touch {} + \
     && cargo build --release -p server
 
 # distroless has no shell, so `RUN mkdir` isn't available in the run stage
