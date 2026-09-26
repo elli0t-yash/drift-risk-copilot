@@ -154,7 +154,18 @@ pub fn engine_version() -> String {
 /// which discards that error rather than failing the build) still
 /// compiles, falling back to `"unknown"` at runtime instead.
 pub fn engine_commit() -> String {
-    option_env!("VERGEN_GIT_SHA").unwrap_or("unknown").to_string()
+    // vergen's actual failure mode (no `.git` directory available at
+    // build time -- e.g. Cloud Build's source upload excludes it, or a
+    // source tarball with none) isn't an *absent* env var, as this
+    // function originally assumed: by default (without vergen's own
+    // `.fail_on_error()`), it still sets `VERGEN_GIT_SHA`, just to its own
+    // literal placeholder string, so `option_env!` sees a *present* var
+    // that happens to be that sentinel -- caught live testing a real
+    // Cloud Run deploy, where `.git` genuinely isn't in the build context.
+    match option_env!("VERGEN_GIT_SHA") {
+        Some(sha) if sha != "VERGEN_IDEMPOTENT_OUTPUT" => sha.to_string(),
+        _ => "unknown".to_string(),
+    }
 }
 
 /// A fresh UUID v4 for a new `EvidenceTrace::id`.

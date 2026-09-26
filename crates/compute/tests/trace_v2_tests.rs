@@ -32,6 +32,16 @@ fn engine_commit_is_never_empty() {
 }
 
 #[test]
+fn engine_commit_never_leaks_vergens_own_placeholder_string() {
+    // Regression test for a bug caught live against a real Cloud Run
+    // deploy (no `.git` directory in the Docker build context): vergen's
+    // own failure-mode placeholder, "VERGEN_IDEMPOTENT_OUTPUT", must never
+    // be exposed as-is -- it should normalize to "unknown" like any other
+    // undetermined-commit case.
+    assert_ne!(engine_commit(), "VERGEN_IDEMPOTENT_OUTPUT");
+}
+
+#[test]
 fn new_trace_id_produces_distinct_ids() {
     let a = new_trace_id();
     let b = new_trace_id();
