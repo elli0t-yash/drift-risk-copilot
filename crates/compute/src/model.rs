@@ -50,6 +50,22 @@ impl Frequency {
             Frequency::Weekly => 156,
         }
     }
+
+    /// Parses the `"daily"`/`"weekly"` (case-insensitive) string form some
+    /// experiment inputs (`RiskDriftInput`, `ReverseStressInput`) use
+    /// instead of the enum directly (so the field can default to `None` ->
+    /// `Daily` without schemars needing a default-valued enum). `None`
+    /// (the field omitted) -> `Daily`.
+    pub fn from_optional_str(s: Option<&str>) -> Result<Frequency> {
+        match s {
+            None => Ok(Frequency::Daily),
+            Some(s) if s.eq_ignore_ascii_case("daily") => Ok(Frequency::Daily),
+            Some(s) if s.eq_ignore_ascii_case("weekly") => Ok(Frequency::Weekly),
+            Some(other) => Err(ComputeError::InvalidInput(format!(
+                "frequency must be \"daily\" or \"weekly\", got {other:?}"
+            ))),
+        }
+    }
 }
 
 pub fn annualize_scalar(period_variance: f64, frequency: Frequency) -> f64 {

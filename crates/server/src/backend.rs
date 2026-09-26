@@ -87,8 +87,11 @@ impl From<compute::ComputeError> for BackendError {
             // problem (the caller needs to run RiskDecomposition first, or
             // gave a bad snapshot id), not an internal failure -- map it
             // the same way `ParseError::Unrecognised` already is (422),
-            // not the generic 500 every other compute error gets.
+            // not the generic 500 every other compute error gets. Same
+            // reasoning for ReverseStress's "threshold unreachable within
+            // bounds" case.
             compute::ComputeError::NoPriorSnapshot(message) => BackendError::Unrecognised(message),
+            compute::ComputeError::ReverseStressInfeasible(message) => BackendError::Unrecognised(message),
             other => BackendError::Compute(other.to_string()),
         }
     }

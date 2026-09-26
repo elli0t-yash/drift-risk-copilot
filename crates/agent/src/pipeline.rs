@@ -139,6 +139,12 @@ fn experiment_summary(trace: &EvidenceTrace) -> String {
             Some(pct) => format!("RiskDrift experiment result: portfolio vol changed by {pct:.2}%."),
             None => "RiskDrift experiment result.".to_string(),
         },
+        "ReverseStress" => match number(&["mahalanobis_severity"]) {
+            Some(severity) => format!(
+                "ReverseStress experiment result: minimum-severity breaching shock has Mahalanobis severity {severity:.2}."
+            ),
+            None => "ReverseStress experiment result.".to_string(),
+        },
         other => format!("{other} experiment result."),
     }
 }

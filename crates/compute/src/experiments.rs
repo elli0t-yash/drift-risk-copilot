@@ -51,6 +51,7 @@ pub enum Experiment {
     CvarRebalance(CvarRebalanceInput),
     PortfolioPerformance(PortfolioPerformanceInput),
     RiskDrift(RiskDriftInput),
+    ReverseStress(ReverseStressInput),
 }
 
 // ---------------------------------------------------------------------
@@ -778,3 +779,9 @@ pub use crate::performance::PortfolioPerformanceInput;
 // ---------------------------------------------------------------------
 
 pub use crate::drift::RiskDriftInput;
+
+// ---------------------------------------------------------------------
+// (f) ReverseStress — see crate::reverse_stress.
+// ---------------------------------------------------------------------
+
+pub use crate::reverse_stress::ReverseStressInput;

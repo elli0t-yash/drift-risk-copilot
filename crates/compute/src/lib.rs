@@ -10,6 +10,7 @@ pub mod model;
 pub mod performance;
 pub mod portfolio;
 pub mod regime;
+pub mod reverse_stress;
 pub mod scenarios;
 pub mod trace;
 

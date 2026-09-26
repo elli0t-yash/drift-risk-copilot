@@ -4,7 +4,7 @@ use agent::conversation::ConversationTurn;
 use agent::parse::{parse_experiment, ParseError};
 use agent::schema::{
     CVAR_REBALANCE_FUNCTION, FACTOR_SHOCK_FUNCTION, PORTFOLIO_PERFORMANCE_FUNCTION,
-    RISK_DECOMPOSITION_FUNCTION, RISK_DRIFT_FUNCTION,
+    REVERSE_STRESS_FUNCTION, RISK_DECOMPOSITION_FUNCTION, RISK_DRIFT_FUNCTION,
 };
 use compute::experiments::{Experiment, Holding, Portfolio};
 use support::{function_call_response, text_response, MockGeminiClient};
@@ -125,6 +125,53 @@ async fn parses_risk_drift_function_call_with_a_specific_baseline_snapshot_id() 
             assert_eq!(input.baseline_snapshot_id.as_deref(), Some("abc-123"));
         }
         other => panic!("expected RiskDrift, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn parses_reverse_stress_function_call_with_null_factor_bounds() {
+    let args = serde_json::json!({ "loss_threshold_inr": 500_000.0, "factor_bounds": null });
+    let client = MockGeminiClient::new(vec![function_call_response(REVERSE_STRESS_FUNCTION, args)]);
+
+    let portfolio = two_stock_portfolio();
+    let experiment = parse_experiment(&client, "what shock would wipe out 5 lakh rupees?", portfolio.clone(), &[])
+        .await
+        .unwrap();
+
+    match experiment {
+        Experiment::ReverseStress(input) => {
+            assert_eq!(input.loss_threshold_inr, 500_000.0);
+            assert!(input.factor_bounds.is_none());
+        }
+        other => panic!("expected ReverseStress, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn parses_reverse_stress_function_call_with_explicit_factor_bounds() {
+    let args = serde_json::json!({
+        "loss_threshold_inr": 500_000.0,
+        "factor_bounds": { "MARKET": [-50.0, 0.0], "BRENT": [-30.0, 80.0] },
+    });
+    let client = MockGeminiClient::new(vec![function_call_response(REVERSE_STRESS_FUNCTION, args)]);
+
+    let portfolio = two_stock_portfolio();
+    let experiment = parse_experiment(
+        &client,
+        "what shock breaks my portfolio if Nifty can only fall 50% and Brent can only move 30%?",
+        portfolio.clone(),
+        &[],
+    )
+    .await
+    .unwrap();
+
+    match experiment {
+        Experiment::ReverseStress(input) => {
+            let bounds = input.factor_bounds.expect("factor_bounds should be present");
+            assert_eq!(bounds.get("MARKET"), Some(&(-50.0, 0.0)));
+            assert_eq!(bounds.get("BRENT"), Some(&(-30.0, 80.0)));
+        }
+        other => panic!("expected ReverseStress, got {other:?}"),
     }
 }
 

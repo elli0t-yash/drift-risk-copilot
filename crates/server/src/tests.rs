@@ -889,3 +889,94 @@ async fn drift_route_returns_summaries_not_full_traces_after_inserting_two_snaps
         assert!(snapshot.get("outputs").is_none());
     }
 }
+
+fn sample_reverse_stress_trace(portfolio_pnl_inr: f64, loss_threshold_inr: f64) -> EvidenceTrace {
+    let mut trace = sample_trace();
+    trace.experiment = "ReverseStress".to_string();
+    trace.outputs = serde_json::json!({
+        "result": {
+            "shock_vector": { "MARKET": -18.0, "USDINR": 12.0, "BRENT": 0.0, "GOLD_USD": 0.0, "RATES_PROXY": 0.0 },
+            "shock_vector_log": { "MARKET": -0.198, "USDINR": 0.113, "BRENT": 0.0, "GOLD_USD": 0.0, "RATES_PROXY": 0.0 },
+            "mahalanobis_severity": 1.8,
+            "severity_label": "1\u{2013}2\u{3c3}",
+            "portfolio_pnl_inr": portfolio_pnl_inr,
+            "loss_threshold_inr": loss_threshold_inr,
+            "holding_pnl": { "RELIANCE.NS": portfolio_pnl_inr * 0.6, "TCS.NS": portfolio_pnl_inr * 0.4 },
+            "factor_attribution": { "MARKET": portfolio_pnl_inr * 0.7, "USDINR": portfolio_pnl_inr * 0.3 },
+            "most_vulnerable_holdings": ["RELIANCE.NS", "TCS.NS"],
+            "solver_status": "converged",
+            "n_iterations": 12,
+            "gradient_norm_final": 1e-7,
+            "linearisation_error_inr": 500.0,
+            "factor_bounds_used": { "MARKET": [-40.0, 0.0], "USDINR": [-5.0, 20.0], "BRENT": [-60.0, 100.0], "GOLD_USD": [-20.0, 40.0], "RATES_PROXY": [-10.0, 10.0] },
+        }
+    });
+    trace
+}
+
+#[tokio::test]
+async fn experiment_reverse_stress_with_valid_input_returns_200_with_negative_pnl() {
+    let app = app_with_backend(MockBackend {
+        experiment_result: Some(sample_reverse_stress_trace(-505_000.0, 500_000.0)),
+        experiment_error: None,
+        ask_result: None,
+        received_conversation_history: Mutex::new(None),
+    });
+
+    let req_body = serde_json::json!({
+        "portfolio": sample_portfolio(),
+        "experiment": { "type": "ReverseStress", "loss_threshold_inr": 500_000.0 },
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/experiment")
+                .header("content-type", "application/json")
+                .body(Body::from(req_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["experiment"], "ReverseStress");
+    let pnl = body["outputs"]["result"]["portfolio_pnl_inr"].as_f64().unwrap();
+    assert!(pnl.is_finite() && pnl < 0.0, "expected a present, negative portfolio_pnl_inr, got {pnl}");
+}
+
+#[tokio::test]
+async fn experiment_reverse_stress_with_infeasible_threshold_returns_422() {
+    let app = app_with_backend(MockBackend {
+        experiment_result: None,
+        experiment_error: Some(crate::backend::BackendError::Unrecognised(
+            "The loss threshold \u{20b9}1,00,00,000 cannot be breached within the specified \
+             factor bounds. Maximum feasible loss is \u{20b9}12,00,000."
+                .to_string(),
+        )),
+        ask_result: None,
+        received_conversation_history: Mutex::new(None),
+    });
+
+    let req_body = serde_json::json!({
+        "portfolio": sample_portfolio(),
+        "experiment": { "type": "ReverseStress", "loss_threshold_inr": 10_000_000.0 },
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/experiment")
+                .header("content-type", "application/json")
+                .body(Body::from(req_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = body_json(response).await;
+    assert!(body["error"].as_str().unwrap().contains("cannot be breached"));
+    assert!(body["error"].as_str().unwrap().contains("Maximum feasible loss"));
+}

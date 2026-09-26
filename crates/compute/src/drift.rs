@@ -40,14 +40,7 @@ pub struct RiskDriftInput {
 
 impl RiskDriftInput {
     fn resolved_frequency(&self) -> Result<Frequency> {
-        match self.frequency.as_deref() {
-            None => Ok(Frequency::Daily),
-            Some(s) if s.eq_ignore_ascii_case("daily") => Ok(Frequency::Daily),
-            Some(s) if s.eq_ignore_ascii_case("weekly") => Ok(Frequency::Weekly),
-            Some(other) => Err(ComputeError::InvalidInput(format!(
-                "frequency must be \"daily\" or \"weekly\", got {other:?}"
-            ))),
-        }
+        Frequency::from_optional_str(self.frequency.as_deref())
     }
 }
 

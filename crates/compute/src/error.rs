@@ -33,6 +33,14 @@ pub enum ComputeError {
     /// own HTTP status instead of a generic 500.
     #[error("{0}")]
     NoPriorSnapshot(String),
+
+    /// `ReverseStress`'s requested `loss_threshold_inr` cannot be breached
+    /// within `factor_bounds` (the max-loss corner of the box doesn't reach
+    /// it, per the linearised pre-solve feasibility check). Distinct from
+    /// `InvalidInput` for the same reason as `NoPriorSnapshot` -- a request
+    /// problem, not an internal failure.
+    #[error("{0}")]
+    ReverseStressInfeasible(String),
 }
 
 pub type Result<T> = std::result::Result<T, ComputeError>;

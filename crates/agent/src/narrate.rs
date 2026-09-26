@@ -16,7 +16,8 @@ pub const NARRATE_SYSTEM_PROMPT: &str = "You are a portfolio risk analyst. Expla
 4. For CvarRebalance: state before and after CVaR, turnover used, and commission cost. Do not describe factor attribution \u{2014} it is not applicable here.
 5. For PortfolioPerformance: state total return and annualized return first, then annualized volatility and max drawdown. Do not describe factor attribution or a hypothetical shock \u{2014} this experiment reports realized historical performance only.
 6. For RiskDrift: state vol_before and vol_after first with the direction of change. Then name the factor with the largest contribution increase. Then state whether the regime changed. If regime_worsened is true, flag this explicitly. Do not narrate every factor \u{2014} focus on the two or three most material changes.
-7. Do not use the phrase 'based on the evidence trace' or any meta-reference to the trace.";
+7. For ReverseStress: state the severity_label and mahalanobis_severity first. Then describe the shock_vector in plain language (e.g. 'a Nifty fall of 18% combined with a 12% INR depreciation'). Name the most_vulnerable_holdings. If linearisation_error_inr exceeds 5% of the loss threshold, add: 'Note: the linear approximation may understate the true shock \u{2014} treat this as indicative.' Do not state the raw gradient_norm or n_iterations.
+8. Do not use the phrase 'based on the evidence trace' or any meta-reference to the trace.";
 
 #[derive(Debug, Error)]
 pub enum NarrateError {

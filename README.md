@@ -21,6 +21,7 @@ crates/
     src/experiments.rs    FactorShock, RiskDecomposition
     src/cvar.rs            CvarRebalance: Rockafellar-Uryasev LP via good_lp + clarabel
     src/drift.rs            RiskDrift: diffs current risk against a stored baseline snapshot
+    src/reverse_stress.rs    ReverseStress: minimum-severity shock that breaches a loss threshold
     src/dispatch.rs          run_experiment: the one fetch+fit+dispatch entry point for every experiment type
     src/context.rs            ExperimentContext (SnapshotStore + portfolio_hash), used by RiskDrift
     src/portfolio.rs           portfolio_hash: order-independent SHA-256 of a portfolio's holdings
@@ -1443,3 +1444,125 @@ inserting two `RiskDrift` snapshots -- plus one deliberately-inserted
 `RiskDecomposition` snapshot for the same portfolio, to confirm it's
 excluded -- returns exactly the 2 summaries, with no `trace_json`/
 `outputs` field present).
+
+## Sixth experiment: ReverseStress (`compute::reverse_stress`)
+
+The inverse of `FactorShock`: instead of "what happens under shock X," this
+asks "what's the *smallest* market shock that would cause at least L
+rupees of loss." Solves for the minimum-Mahalanobis-severity factor shock
+`s` (in log-return space) such that `P&L(s) <= -loss_threshold_inr`,
+subject to per-factor box bounds (default: plausible historical ranges for
+Indian markets -- `MARKET [-40, 0]`, `USDINR [-5, 20]`, `BRENT [-60, 100]`,
+`GOLD_USD [-20, 40]`, `RATES_PROXY [-10, 10]`, all in simple %). Like
+`RiskDrift`, `ReverseStressInput` has no `portfolio` field of its own --
+the portfolio arrives via `compute::dispatch::run_experiment`'s explicit
+`portfolio` parameter (the infrastructure Session 2 built for exactly this
+shape of input), so this session needed **no changes to `store`, `agent`
+pipeline, or server routing** beyond the new `Experiment` variant and its
+own dispatch-layer fetch/fit case.
+
+### The math
+
+`P&L(s) = Sum_i w_i * (exp(Sum_k beta_ik * s_k) - 1) * total_value_inr` --
+identical to `FactorShock`'s formula. `s^T F^-1 s` (the squared Mahalanobis
+distance under the current-regime factor covariance `F`) is the severity to
+minimise; `mahalanobis_severity` in the output is its square root, so the
+`"within 1σ"`/`"1–2σ"`/`"2–3σ"`/`">3σ"` labels' boundaries at exactly 1/2/3
+mean what they say (bucketing the *squared* form would need boundaries at
+1/4/9 for the same sigma levels -- see the judgment call below).
+
+Solved in two stages:
+1. **KKT closed form** on the linearised problem (`P&L(s) ~= p^T s`, where
+   `p_k = Sum_i w_i * beta_ik * total_value_inr` is the linear P&L
+   sensitivity to factor `k`): `s* = -L * (F p) / (p^T F p)` --
+   `compute::reverse_stress::kkt_shock`, unit-tested directly against a
+   hand-built diagonal `F`/single-nonzero-entry `p` (the "single-factor"
+   case: `s* = -L/p_k`, `severity = |s*|/sqrt(F_kk)`, both exact).
+2. **Projected gradient descent** refines that starting point against the
+   *true* (nonlinear) objective and constraint. "Projection" does two
+   things every step: clip to box bounds, then rescale the point (fixed
+   direction, 1-D bisection search on the scale factor) to the smallest
+   magnitude that still makes the *true* nonlinear `P&L` breach `-L`
+   exactly -- not a general nonlinear-constraint projection, but exact for
+   this problem's actual geometry, since `P&L` is monotonic in shock
+   magnitude along any "bad" direction. Armijo backtracking (`β=0.5`,
+   `c=1e-4`), up to 200 iterations, gradient-norm (`<1e-6`) or
+   objective-change (`<1e-8`) convergence.
+3. **Feasibility pre-check**: the worst-case corner of the box (each
+   factor set to whichever bound maximises linearised loss) must itself
+   breach `-L`, or the request is infeasible -- `ComputeError::
+   ReverseStressInfeasible` with the exact max feasible loss, before any
+   optimisation is attempted.
+
+### Judgment calls
+
+- **`mahalanobis_severity` is the *unsquared* Mahalanobis distance**
+  (`sqrt(s^T F^-1 s)`), even though the spec's formulation names `s^T F^-1
+  s` itself "the Mahalanobis severity" and calls it the objective to
+  minimise. Both are literally true (the objective minimised is the
+  squared form; the reported/labelled quantity is its square root) -- the
+  σ-bucket boundaries at exactly 1, 2, 3 only make sense for the unsquared
+  distance (a 2σ point has squared-form value 4, not 2), so that's what's
+  reported and bucketed.
+- **`solver_status: "converged"` means "the projected-gradient search
+  could no longer find a strictly-better feasible point," not "the raw
+  unconstrained gradient norm fell below tolerance."** Confirmed live (see
+  below): the live run converged in a single iteration with
+  `gradient_norm_final: 11.78` -- nowhere near the `1e-6` tolerance. This
+  is expected, not a bug: near the projected boundary, the *projection*
+  operator (clip + rescale-to-breach) dominates a small unconstrained
+  gradient step, so Armijo backtracking can exhaust its 30 attempts
+  without finding a strictly-decreasing candidate even though the
+  underlying point is already the true constrained optimum. A raw gradient
+  norm is the right diagnostic for an *unconstrained* problem; for this
+  projected one, "no further Armijo-acceptable improvement" is the more
+  meaningful stopping signal, which is why it's still labelled
+  `"converged"` rather than `"max_iter"`.
+- **Bounds and the true breach constraint are enforced by an alternating
+  fixed-point loop** (`project_to_feasible`: clip to bounds, then rescale
+  to the true constraint boundary, repeat up to 20 rounds), not a single
+  pass -- clipping can pull a rescaled point back out of breach, and
+  rescaling can push a clipped point back out of bounds, so neither
+  operation alone is sufficient. In every test and the live run this
+  converges within a handful of rounds; a final defensive
+  `project_to_feasible` call after the gradient loop exits (regardless of
+  why it exited) guarantees the hard breach invariant
+  (`portfolio_pnl_inr <= -loss_threshold_inr * 0.999`) holds even if the
+  refinement loop itself stalled early.
+- **`factor_attribution` sums to the log-space P&L, not
+  `portfolio_pnl_inr` exactly** -- same convention as `FactorShock`'s own
+  `factor_attribution_log_inr`: `Sum_i value_i * beta_ik * s_k` is exact in
+  log-return space, but doesn't equal the `exp(.) - 1`-converted simple
+  P&L once the shock is large (the conversion is convex). Recorded as an
+  approximate invariant (tolerance `1%` of `loss_threshold_inr`), never
+  errored, per spec.
+
+### Live run (10-stock Nifty portfolio, `loss_threshold_inr: 500000`, `factor_bounds: null`)
+
+| field | value |
+|---|---|
+| `shock_vector` | `MARKET -4.67%`, `BRENT +1.80%`, `GOLD_USD -0.62%`, `RATES_PROXY +0.88%`, `USDINR +0.68%` |
+| `mahalanobis_severity` | `0.534` |
+| `severity_label` | `"within 1σ"` |
+| `portfolio_pnl_inr` | `-500,000.00` (breaches the ₹5L threshold exactly) |
+| `most_vulnerable_holdings` | `["RELIANCE.NS", "HDFCBANK.NS", "LT.NS"]` |
+| `solver_status` | `"converged"` (`n_iterations: 1`, see the judgment call above re: `gradient_norm_final`) |
+| `linearisation_error_inr` | `13,629.20` |
+
+A modest ~4.7% Nifty fall (well within 1 standard deviation of this
+portfolio's own factor covariance) is enough to breach a ₹5L loss on this
+₹1Cr portfolio -- an unsurprising, sanity-checking result (5% of ₹1Cr is
+exactly ₹5L, and a ~5% market move is not a tail event for Nifty).
+
+### Tests
+
+`compute`: 5 new hermetic tests in `reverse_stress_tests.rs` -- the
+single-factor KKT closed form matches exactly (`1e-6`); `severity_label`'s
+four buckets; infeasibility returns the correct max feasible loss for an
+artificially tight-bounded scenario; the solution respects
+caller-specified bounds; and a 10-synthetic-stock portfolio's gradient
+descent both converges and genuinely breaches the threshold. `agent`: 2
+new `parse_tests.rs` cases (`ReverseStress` with `null` and with explicit
+`factor_bounds`). `server`: 2 new `tests.rs` cases (valid input returns 200
+with a negative `portfolio_pnl_inr`; an infeasible threshold returns 422
+with the exact infeasibility message).

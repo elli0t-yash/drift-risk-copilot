@@ -92,5 +92,16 @@ pub fn run_experiment(
             let (_, trace) = crate::drift::run_risk_drift(cache_dir, portfolio, input, ctx)?;
             Ok(trace)
         }
+        Experiment::ReverseStress(input) => {
+            let tickers = portfolio.tickers();
+            let frequency = crate::reverse_stress::resolved_frequency(input)?;
+            let window = input.window.unwrap_or_else(|| frequency.default_window());
+            let data = crate::data::load_market_data(cache_dir, &tickers, false, frequency)?;
+            let model = crate::model::fit_factor_model(&data, &tickers, crate::model::ModelConfig::new(window, frequency))?;
+            let data_window = build_data_window(&data, window, frequency);
+            let (_, trace) =
+                crate::reverse_stress::run_reverse_stress(&data.quality, data_window, &model, portfolio, input)?;
+            Ok(trace)
+        }
     }
 }
