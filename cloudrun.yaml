@@ -35,6 +35,13 @@ spec:
                 secretKeyRef:
                   name: drift-gemini-key
                   key: latest
+            # /data is the container's own ephemeral local disk: it survives
+            # requests on a single warm instance but is never shared across
+            # instances/revisions and is lost on cold start or scale-to-zero
+            # (minScale: "0" above). Acceptable for a hackathon-scale demo;
+            # see the README's "Persistence" section for the tradeoff.
+            - name: SNAPSHOT_DB_PATH
+              value: /data/snapshots.db
   traffic:
     - latestRevision: true
       percent: 100

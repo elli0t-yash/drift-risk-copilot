@@ -11,7 +11,8 @@ path = "src/main.rs"
 [dependencies]
 compute = { path = "../compute" }
 agent = { path = "../agent" }
-axum.workspace = true
+store = { path = "../store" }
+axum = { workspace = true, features = ["multipart"] }
 tokio = { workspace = true, features = ["net", "signal"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -20,10 +21,13 @@ serde_json.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
 printpdf = "=0.12.8"
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid.workspace = true
 chrono = { workspace = true, features = ["serde"] }
+calamine = "0.26"
+csv.workspace = true
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 chrono.workspace = true
+lopdf = "0.44"

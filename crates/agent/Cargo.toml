@@ -10,6 +10,7 @@ path = "src/lib.rs"
 
 [dependencies]
 compute = { path = "../compute" }
+store = { path = "../store" }
 serde.workspace = true
 serde_json.workspace = true
 schemars.workspace = true
@@ -18,6 +19,7 @@ reqwest.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 regex.workspace = true
+chrono.workspace = true
 
 [dev-dependencies]
 chrono.workspace = true

@@ -1,15 +1,21 @@
-//! `GET /report/{id}`: a single-page A4 PDF summary of a stored `/ask`
-//! result, built directly on `printpdf` 0.12's `Op`-list API (see
-//! `Cargo.toml` -- pinned exactly). That API is a full rewrite from the
-//! `PdfLayerReference`-based API most printpdf examples/tutorials still
-//! show; this module only uses the low-level `Op` primitives (text
-//! positioning, lines), not printpdf's optional HTML/CSS layout engine
-//! (which is what pulls in the crate's much heavier dependency tree --
-//! azul-core, azul-layout, hyphenation, rust-fontconfig -- none of which
-//! this module touches).
+//! `GET /report/{id}`: a single-page A4 PDF summary of a stored
+//! `/experiment` or `/ask` result, built directly on `printpdf` 0.12's
+//! `Op`-list API (see `Cargo.toml` -- pinned exactly). That API is a full
+//! rewrite from the `PdfLayerReference`-based API most printpdf
+//! examples/tutorials still show; this module only uses the low-level `Op`
+//! primitives (text positioning, lines), not printpdf's optional HTML/CSS
+//! layout engine (which is what pulls in the crate's much heavier
+//! dependency tree -- azul-core, azul-layout, hyphenation,
+//! rust-fontconfig -- none of which this module touches).
+//!
+//! Renders from the pieces `store::RiskSnapshot` persists, not the full
+//! `/ask` pipeline result directly: `trace` (the `EvidenceTrace`, always
+//! present), plus `narration`/`grounding_warnings`, which are `Some`/
+//! non-empty only for a `/ask`-originated snapshot (`/experiment` never
+//! calls Gemini, so it has none to store).
 
-use agent::pipeline::PipelineResult;
 use compute::format::format_inr;
+use compute::trace::EvidenceTrace;
 use printpdf::*;
 use serde_json::Value;
 
@@ -20,18 +26,23 @@ const RIGHT_MARGIN_MM: f32 = 20.0;
 const CONTENT_WIDTH_MM: f32 = PAGE_WIDTH_MM - LEFT_MARGIN_MM - RIGHT_MARGIN_MM; // 170mm, per spec
 const RIGHT_EDGE_MM: f32 = PAGE_WIDTH_MM - RIGHT_MARGIN_MM;
 
-/// Renders `result` as a one-page PDF and returns the raw file bytes.
-pub fn render_report(result: &PipelineResult) -> Vec<u8> {
+/// Renders `trace` as a one-page PDF and returns the raw file bytes.
+/// `narration` is the stored snapshot's narration text (`None` for a
+/// `/experiment`-originated snapshot); `grounding_warnings` is its
+/// grounding-warning list (empty for `/experiment`, and often empty for
+/// `/ask` too -- only non-empty when the narration still had unmatched
+/// numbers after retries).
+pub fn render_report(trace: &EvidenceTrace, narration: Option<&str>, grounding_warnings: &[String]) -> Vec<u8> {
     let mut doc = PdfDocument::new("Drift Risk Copilot Report");
     let mut page = Page::new();
 
-    let outputs = &result.trace.outputs;
+    let outputs = &trace.outputs;
     let result_value = outputs.get("result");
 
     // --- Section 1: header ---
     page.text(LEFT_MARGIN_MM, page.y, "Drift Risk Copilot", BuiltinFont::HelveticaBold, 18.0);
     let generated_at = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC");
-    let header_right = format!("{} | generated {}", result.trace.experiment, generated_at);
+    let header_right = format!("{} | generated {}", trace.experiment, generated_at);
     page.text_right(RIGHT_EDGE_MM, page.y, &header_right, BuiltinFont::Helvetica, 10.0);
     page.advance(7.0);
     page.rule();
@@ -40,24 +51,38 @@ pub fn render_report(result: &PipelineResult) -> Vec<u8> {
     // --- Section 2: narration ---
     page.text(LEFT_MARGIN_MM, page.y, "Analysis", BuiltinFont::HelveticaBold, 12.0);
     page.advance(6.0);
-    page.wrapped_text(&result.narration.narration, BuiltinFont::Helvetica, 10.0, 5.0);
-    if !result.narration.grounding_warnings.is_empty() {
-        page.advance(2.0);
-        page.text(
-            LEFT_MARGIN_MM,
-            page.y,
-            "\u{26a0} Some numbers in this explanation could not be verified against the model output.",
-            BuiltinFont::HelveticaOblique,
-            9.0,
-        );
-        page.advance(5.0);
+    match narration {
+        Some(text) => {
+            page.wrapped_text(text, BuiltinFont::Helvetica, 10.0, 5.0);
+            if !grounding_warnings.is_empty() {
+                page.advance(2.0);
+                page.text(
+                    LEFT_MARGIN_MM,
+                    page.y,
+                    "[!] Some numbers in this explanation could not be verified.",
+                    BuiltinFont::HelveticaOblique,
+                    9.0,
+                );
+                page.advance(5.0);
+            }
+        }
+        None => {
+            page.text(
+                LEFT_MARGIN_MM,
+                page.y,
+                "No narrative \u{2014} direct experiment result.",
+                BuiltinFont::HelveticaOblique,
+                10.0,
+            );
+            page.advance(5.0);
+        }
     }
     page.advance(4.0);
 
     // --- Section 3: key numbers ---
     page.text(LEFT_MARGIN_MM, page.y, "Key Numbers", BuiltinFont::HelveticaBold, 12.0);
     page.advance(6.0);
-    let rows = key_numbers(&result.trace.experiment, result_value, &result.trace.model_params);
+    let rows = key_numbers(&trace.experiment, result_value, &trace.model_params);
     page.table(&["Metric", "Value", "Unit"], &rows);
     page.advance(4.0);
 
@@ -70,11 +95,10 @@ pub fn render_report(result: &PipelineResult) -> Vec<u8> {
         page.y,
         &format!(
             "Model: window={} periods, frequency={:?}, shrinkage_intensity={:.4}{}",
-            result.trace.model_params.window_periods,
-            result.trace.model_params.frequency,
-            result.trace.model_params.shrinkage_intensity,
-            result
-                .trace
+            trace.model_params.window_periods,
+            trace.model_params.frequency,
+            trace.model_params.shrinkage_intensity,
+            trace
                 .model_params
                 .regime_state
                 .as_ref()
@@ -86,22 +110,17 @@ pub fn render_report(result: &PipelineResult) -> Vec<u8> {
     );
     page.advance(5.0);
 
-    let total_forward_filled: usize = result
-        .trace
-        .data_quality
-        .per_series
-        .iter()
-        .map(|s| s.forward_filled_days)
-        .sum();
-    let total_dropped: usize = result.trace.data_quality.per_series.iter().map(|s| s.dropped_days).sum();
+    let total_forward_filled: usize =
+        trace.data_quality.per_series.iter().map(|s| s.forward_filled_days).sum();
+    let total_dropped: usize = trace.data_quality.per_series.iter().map(|s| s.dropped_days).sum();
     page.text(
         LEFT_MARGIN_MM,
         page.y,
         &format!(
             "Data quality: {} to {} ({} trading days), {} forward-filled, {} dropped",
-            result.trace.data_quality.date_range_start,
-            result.trace.data_quality.date_range_end,
-            result.trace.data_quality.trading_days,
+            trace.data_quality.date_range_start,
+            trace.data_quality.date_range_end,
+            trace.data_quality.trading_days,
             total_forward_filled,
             total_dropped,
         ),
@@ -110,8 +129,7 @@ pub fn render_report(result: &PipelineResult) -> Vec<u8> {
     );
     page.advance(6.0);
 
-    let invariant_rows: Vec<[String; 3]> = result
-        .trace
+    let invariant_rows: Vec<[String; 3]> = trace
         .invariants
         .iter()
         .map(|inv| {
@@ -489,3 +507,4 @@ fn wrap_text(text: &str, font: BuiltinFont, size_pt: f32, max_width_mm: f32) -> 
     }
     lines
 }
+

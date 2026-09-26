@@ -1,6 +1,6 @@
 mod common;
 
-use compute::model::{fit_factor_model, fit_factor_model_with_config, ledoit_wolf_shrink_identity, Frequency, ModelConfig};
+use compute::model::{fit_factor_model, ledoit_wolf_shrink_identity, Frequency, ModelConfig};
 use nalgebra::DMatrix;
 
 #[test]
@@ -17,7 +17,8 @@ fn ols_recovers_known_betas() {
     );
 
     let tickers = vec!["TEST".to_string()];
-    let model = fit_factor_model(&data, &tickers, 252, compute::model::Frequency::Daily).expect("fit should succeed");
+    let model = fit_factor_model(&data, &tickers, ModelConfig::new(252, Frequency::Daily))
+        .expect("fit should succeed");
 
     let fit = &model.fits[0];
     assert_eq!(fit.betas.len(), 5);
@@ -40,7 +41,7 @@ fn ledoit_wolf_shrinkage_in_unit_interval_and_psd() {
     let true_betas = [0.8, 0.1, -0.2, 0.3, -0.1];
     let data = common::synthetic_single_stock("TEST", 0.0, &true_betas, 300, 0.001, 7);
     let tickers = vec!["TEST".to_string()];
-    let model = fit_factor_model(&data, &tickers, 252, compute::model::Frequency::Daily).unwrap();
+    let model = fit_factor_model(&data, &tickers, ModelConfig::new(252, Frequency::Daily)).unwrap();
 
     assert!(
         (0.0..=1.0).contains(&model.shrinkage_intensity),
@@ -82,17 +83,13 @@ fn regime_conditional_f_is_psd_for_all_three_regimes_on_real_nsei_data() {
     let tickers = vec!["RELIANCE.NS".to_string(), "TCS.NS".to_string()];
     let data = compute::data::load_market_data(cache_dir, &tickers, false, Frequency::Daily)
         .expect("live Yahoo fetch failed");
-    let model = fit_factor_model_with_config(
-        &data,
-        &tickers,
-        ModelConfig::new(252, Frequency::Daily).with_regime_covariance(true),
-    )
-    .expect("regime-conditional fit failed on real data");
+    let model = fit_factor_model(&data, &tickers, ModelConfig::new(252, Frequency::Daily))
+        .expect("regime-conditional fit failed on real data");
 
     let regime_fs = model
         .regime_factor_covariance_daily
         .as_ref()
-        .expect("regime_covariance was requested, regime_factor_covariance_daily must be Some");
+        .expect("regime-conditioning is unconditional, regime_factor_covariance_daily must be Some");
 
     for (regime_idx, f) in regime_fs.iter().enumerate() {
         assert!(is_symmetric(f, 1e-9), "F for regime {regime_idx} is not symmetric");

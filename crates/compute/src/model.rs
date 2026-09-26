@@ -50,6 +50,22 @@ impl Frequency {
             Frequency::Weekly => 156,
         }
     }
+
+    /// Parses the `"daily"`/`"weekly"` (case-insensitive) string form some
+    /// experiment inputs (`RiskDriftInput`, `ReverseStressInput`) use
+    /// instead of the enum directly (so the field can default to `None` ->
+    /// `Daily` without schemars needing a default-valued enum). `None`
+    /// (the field omitted) -> `Daily`.
+    pub fn from_optional_str(s: Option<&str>) -> Result<Frequency> {
+        match s {
+            None => Ok(Frequency::Daily),
+            Some(s) if s.eq_ignore_ascii_case("daily") => Ok(Frequency::Daily),
+            Some(s) if s.eq_ignore_ascii_case("weekly") => Ok(Frequency::Weekly),
+            Some(other) => Err(ComputeError::InvalidInput(format!(
+                "frequency must be \"daily\" or \"weekly\", got {other:?}"
+            ))),
+        }
+    }
 }
 
 pub fn annualize_scalar(period_variance: f64, frequency: Frequency) -> f64 {
@@ -79,29 +95,19 @@ pub struct StockFit {
     pub n_obs: usize,
 }
 
-/// `fit_factor_model`'s configuration: the trailing window, its frequency,
-/// and whether to condition the factor covariance on the current market
-/// regime (see `regime` module doc; default `false` preserves the
-/// pre-regime behaviour exactly — a single full-window Ledoit-Wolf `F`).
+/// `fit_factor_model`'s configuration: the trailing window and its
+/// frequency. The factor covariance is always conditioned on the current
+/// market regime (see `regime` module doc) — there is no longer a flag to
+/// opt out of it.
 #[derive(Debug, Clone, Copy)]
 pub struct ModelConfig {
     pub window: usize,
     pub frequency: Frequency,
-    pub regime_covariance: bool,
 }
 
 impl ModelConfig {
     pub fn new(window: usize, frequency: Frequency) -> Self {
-        ModelConfig {
-            window,
-            frequency,
-            regime_covariance: false,
-        }
-    }
-
-    pub fn with_regime_covariance(mut self, regime_covariance: bool) -> Self {
-        self.regime_covariance = regime_covariance;
-        self
+        ModelConfig { window, frequency }
     }
 }
 
@@ -113,20 +119,20 @@ pub struct FactorModel {
     pub fits: Vec<StockFit>,
     /// Per-period (daily or weekly, per `frequency`) factor covariance
     /// after Ledoit-Wolf shrinkage, in `FACTOR_NAMES` order (rows/cols).
-    /// When `regime_covariance` was requested, this is `F` for the
-    /// *current* regime (see `regime_factor_covariance_daily`) — every
-    /// existing consumer of `factor_covariance()`/`stock_covariance()`
-    /// therefore automatically becomes regime-conditional with no changes
-    /// of its own.
+    /// This is `F` for the *current* regime (see
+    /// `regime_factor_covariance_daily`) — every consumer of
+    /// `factor_covariance()`/`stock_covariance()` is therefore always
+    /// regime-conditional.
     pub factor_covariance_daily: DMatrix<f64>,
     pub shrinkage_intensity: f64,
-    /// `Some` only when `ModelConfig::regime_covariance` was `true`.
+    /// Always `Some` after `fit_factor_model` — regime-conditioning is
+    /// unconditional.
     pub regime_state: Option<RegimeState>,
-    /// `Some` only when `ModelConfig::regime_covariance` was `true`: the
-    /// per-period, per-regime factor covariance in Bull/Bear/Crisis order
-    /// (index 0/1/2), each either fit on that regime's own days within the
-    /// window or, if it had fewer than `MIN_REGIME_OBSERVATIONS`, a copy of
-    /// the full-window `F` (see `regime_fallback_warnings`).
+    /// Always `Some` after `fit_factor_model`: the per-period, per-regime
+    /// factor covariance in Bull/Bear/Crisis order (index 0/1/2), each
+    /// either fit on that regime's own days within the window or, if it had
+    /// fewer than `MIN_REGIME_OBSERVATIONS`, a copy of the full-window `F`
+    /// (see `regime_fallback_warnings`).
     pub regime_factor_covariance_daily: Option<[DMatrix<f64>; 3]>,
     pub regime_fallback_warnings: Vec<String>,
 }
@@ -166,8 +172,8 @@ impl FactorModel {
     }
 
     /// Annualized factor covariance for a specific regime (0=Bull,
-    /// 1=Bear, 2=Crisis), independent of which regime is "current". `None`
-    /// if `regime_covariance` wasn't requested when the model was fit.
+    /// 1=Bear, 2=Crisis), independent of which regime is "current". Always
+    /// `Some` after `fit_factor_model`.
     pub fn factor_covariance_for_regime(&self, regime: usize) -> Option<DMatrix<f64>> {
         self.regime_factor_covariance_daily
             .as_ref()
@@ -337,34 +343,17 @@ fn regime_conditional_factor_covariance(
 
 /// Fits the factor model for `tickers` over the trailing `window` periods
 /// (trading days or weeks, per `frequency`) of `data` (the most recent
-/// `window` return observations, which must already be at `frequency`).
-/// Equivalent to `fit_factor_model_with_config` with `regime_covariance:
-/// false` — kept as a separate, narrower entry point so existing callers
-/// (outside this checkpoint's scope) don't need to change.
-pub fn fit_factor_model(
-    data: &MarketData,
-    tickers: &[String],
-    window: usize,
-    frequency: Frequency,
-) -> Result<FactorModel> {
-    fit_factor_model_with_config(data, tickers, ModelConfig::new(window, frequency))
-}
-
-/// Fits the factor model per `config` (see `ModelConfig`). When
-/// `config.regime_covariance` is true, also fits a 3-state HMM on the
+/// `window` return observations, which must already be at `frequency`),
+/// per `config` (see `ModelConfig`). Always fits a 3-state HMM on the
 /// window's `MARKET` (Nifty) returns and splits the factor covariance by
 /// Viterbi-assigned regime — see `regime` module doc and the
 /// `regime_factor_covariance_daily`/`regime_state` fields.
-pub fn fit_factor_model_with_config(
+pub fn fit_factor_model(
     data: &MarketData,
     tickers: &[String],
     config: ModelConfig,
 ) -> Result<FactorModel> {
-    let ModelConfig {
-        window,
-        frequency,
-        regime_covariance,
-    } = config;
+    let ModelConfig { window, frequency } = config;
 
     let factor_matrices: Vec<&Vec<f64>> = FACTOR_NAMES
         .iter()
@@ -389,25 +378,20 @@ pub fn fit_factor_model_with_config(
     let (full_window_factor_covariance_daily, shrinkage_intensity) =
         ledoit_wolf_shrink_identity(&factors_window);
 
-    let mut regime_state: Option<RegimeState> = None;
-    let mut regime_factor_covariance_daily: Option<[DMatrix<f64>; 3]> = None;
-    let mut regime_fallback_warnings: Vec<String> = Vec::new();
-    let mut factor_covariance_daily = full_window_factor_covariance_daily.clone();
+    // FACTOR_NAMES[0] == "MARKET" == Nifty (^NSEI); factor_matrices[0] is
+    // that column, already sliced to the same [start, start+window) window
+    // as everything else here.
+    let nsei_window: Vec<f64> = factor_matrices[0][start..start + window].to_vec();
+    let (_hmm, state) = regime::fit_hmm(&nsei_window)?;
 
-    if regime_covariance {
-        // FACTOR_NAMES[0] == "MARKET" == Nifty (^NSEI); factor_matrices[0]
-        // is that column, already sliced to the same [start, start+window)
-        // window as everything else here.
-        let nsei_window: Vec<f64> = factor_matrices[0][start..start + window].to_vec();
-        let (_hmm, state) = regime::fit_hmm(&nsei_window)?;
-
-        let (per_regime, warnings) =
-            regime_conditional_factor_covariance(&factors_window, &state.viterbi_sequence, &full_window_factor_covariance_daily);
-        regime_fallback_warnings = warnings;
-        factor_covariance_daily = per_regime[state.current_regime as usize].clone();
-        regime_factor_covariance_daily = Some(per_regime);
-        regime_state = Some(state);
-    }
+    let (per_regime, regime_fallback_warnings) = regime_conditional_factor_covariance(
+        &factors_window,
+        &state.viterbi_sequence,
+        &full_window_factor_covariance_daily,
+    );
+    let factor_covariance_daily = per_regime[state.current_regime as usize].clone();
+    let regime_factor_covariance_daily = Some(per_regime);
+    let regime_state = Some(state);
 
     let mut fits = Vec::with_capacity(tickers.len());
     for ticker in tickers {

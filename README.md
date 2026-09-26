@@ -20,6 +20,12 @@ crates/
     src/regime.rs          3-state Gaussian HMM (Baum-Welch, Viterbi) for market-regime detection
     src/experiments.rs    FactorShock, RiskDecomposition
     src/cvar.rs            CvarRebalance: Rockafellar-Uryasev LP via good_lp + clarabel
+    src/drift.rs            RiskDrift: diffs current risk against a stored baseline snapshot
+    src/reverse_stress.rs    ReverseStress: minimum-severity shock that breaches a loss threshold
+    src/policy.rs            RiskPolicy/PolicyResult; PolicyCheck experiment; evaluate_policy
+    src/dispatch.rs          run_experiment: the one fetch+fit+dispatch entry point for every experiment type
+    src/context.rs            ExperimentContext (SnapshotStore + portfolio_hash), used by RiskDrift
+    src/portfolio.rs           portfolio_hash: order-independent SHA-256 of a portfolio's holdings
     src/trace.rs          EvidenceTrace and its sub-structs
     src/scenarios.rs       Fixed historical-scenario presets (COVID crash, IL&FS, taper tantrum)
     src/bin/experiment.rs CLI: runs one experiment from a JSON file
@@ -37,15 +43,20 @@ crates/
     examples/demo_pipeline.rs  One-off demo: mocked Gemini + a real compute call (see below)
     tests/                    Mocked-Gemini unit/integration tests (no network to Gemini)
   server/    # axum HTTP API + embedded UI
-    src/main.rs           Router, tracing setup, GEMINI_API_KEY startup check
-    src/routes.rs          /health, /scenarios, /experiment, /ask, static-file fallback handlers
+    src/main.rs           Router, tracing setup, GEMINI_API_KEY + SnapshotStore startup checks
+    src/routes.rs          /health, /scenarios, /experiment, /ask, /report/{id}, static-file fallback handlers
+    src/upload.rs            POST /portfolio/upload: CSV/XLSX -> Portfolio
     src/backend.rs          Backend trait (RealBackend wraps compute+agent) + error mapping
-    src/validate.rs          Portfolio validation shared by /experiment and /ask
+    src/validate.rs          Portfolio validation shared by /experiment, /ask, and /portfolio/upload
     src/error.rs             ApiError ({error, code} JSON responses) + AppJson extractor
     src/logging.rs            Request logging middleware (method, path, status, latency)
+    src/pdf.rs                GET /report/{id}: renders a PDF from a stored EvidenceTrace
     src/tests.rs               Route tests against a MockBackend (no network)
     static/index.html         Embedded single-page UI (include_str!, no build step)
+  store/     # persistent SQLite-backed risk-snapshot store
+    src/lib.rs             SnapshotStore + RiskSnapshot; rusqlite (bundled feature, no external sqlite3 needed)
 data/cache/  # cached raw price CSVs (gitignored; fetched on first run)
+data/snapshots.db (or $SNAPSHOT_DB_PATH)  # SQLite risk-snapshot store
 Dockerfile     # multi-stage build -> gcr.io/distroless/cc-debian12
 cloudrun.yaml  # Cloud Run service config
 ```
@@ -485,11 +496,42 @@ immediately if grounding_warnings fires" below.
 ## Server (`server::main`)
 
 ```
-GET  /health        -> { status: "ok", version } (200)
-POST /experiment     -> { portfolio, experiment } in, EvidenceTrace out
-POST /ask              -> { portfolio, message } in, AskResponse out
-GET  /*                  -> embedded single-page UI (static/index.html)
+GET  /health              -> { status: "ok", version } (200)
+POST /experiment           -> { portfolio, experiment } in, EvidenceTrace out
+POST /ask                    -> { portfolio, message } in, AskResponse out
+GET  /report/{result_id}      -> PDF, rendered from a stored EvidenceTrace
+POST /portfolio/upload         -> multipart CSV/XLSX in, { portfolio, ... } out
+GET  /*                          -> embedded single-page UI (static/index.html)
 ```
+
+Both `POST /experiment` and `POST /ask` now also insert a `RiskSnapshot`
+into the persistent `store::SnapshotStore` on every successful call (see
+"PDF reports, snapshot store, and CVaR cap defaulting" below) — `/ask`
+returns the row's id as `result_id`; `/experiment`'s response shape is
+unchanged (still the bare `EvidenceTrace`), so its snapshot is a side
+effect, not something the caller gets an id for directly.
+
+### `POST /portfolio/upload` (`server::upload`)
+
+Accepts `multipart/form-data` with one field, `file` (`.csv` or `.xlsx`,
+first sheet only for XLSX). Two accepted column layouts, detected from the
+header row (case-insensitive): `ticker,weight` (weight-based) or
+`ticker,shares,avg_price_inr` (value-based — `value_inr = shares *
+avg_price_inr` per holding, `weight = value_inr / total_value_inr` rounded
+to 6 decimals, `total_value_inr` recomputed as the sum). A bare NSE-looking
+ticker with no exchange suffix (all uppercase letters/digits, no `.`) gets
+`.NS` appended, reported back in `tickers_normalised`. Runs the same
+`validate_portfolio` check as `/experiment`/`/ask` before responding, so a
+malformed upload (weights not summing to 1.0, fewer than 2 holdings, an
+unsupported extension, missing columns, or an empty file) gets the same
+400 `{error, code}` shape those routes use.
+
+**Judgment call:** weight-based CSVs carry no portfolio value at all (only
+ticker + weight), so there's nothing to derive `total_value_inr` from.
+Defaults to 1,000,000 INR — this codebase's existing demo convention
+elsewhere (`sample_portfolio` helpers throughout the test suite) — which
+the caller should overwrite before using the returned `Portfolio` for
+anything that cares about real INR amounts (P&L, commission cost, etc.).
 
 `ExperimentRequest.experiment` is the tagged `Experiment` variant's JSON
 *minus* `portfolio` (e.g. `{"type": "FactorShock", "shocks_pct": {...}}`) —
@@ -706,8 +748,16 @@ original 60s was sized for).
 A 3-state Gaussian HMM (`compute::regime`, Baum-Welch fit from scratch, no
 external HMM crate) on Nifty (`^NSEI`) daily log returns, used to split the
 factor covariance `F` by market regime instead of always pooling the full
-window. Default is unchanged behaviour (`regime_covariance: false`
-everywhere) — this is purely opt-in.
+window.
+
+**Always-on as of the session that added persistent snapshots and portfolio
+upload**: regime-conditioning used to be an opt-in `regime_covariance: bool`
+field on `FactorShockInput`/`RiskDecompositionInput`/`CvarRebalanceInput`,
+defaulting to `false` everywhere. That field is gone -- every request now
+gets a regime-conditional fit unconditionally, and every `EvidenceTrace`'s
+`model_params.regime_state` is always populated (never `None`). The
+mechanics below (states, fallback, per-experiment wiring) are unchanged;
+only the "was this requested" branch was removed.
 
 ### The model
 
@@ -733,22 +783,22 @@ everywhere) — this is purely opt-in.
 
 ### Wiring into the factor model
 
-`model::ModelConfig { window, frequency, regime_covariance }` replaces the
-old bare `(window, frequency)` pair for the regime-aware path
-(`fit_factor_model_with_config`); the original `fit_factor_model(data,
-tickers, window, frequency)` is kept as a thin non-regime wrapper so
-**nothing outside `compute`'s own CLI/experiments/cvar needed to change**
-— `agent`/`server` still call the old signature and compile unmodified.
+`model::ModelConfig { window, frequency }` is the only fit configuration
+now -- `fit_factor_model_with_config` was renamed to `fit_factor_model` and
+the old non-regime `fit_factor_model(data, tickers, window, frequency)`
+thin wrapper was removed, since there is no longer a non-regime path to
+wrap. Every caller (`agent::pipeline`, `compute`'s own CLI, `cvar`) was
+updated to the new signature.
 
-When `regime_covariance: true`: the HMM fits on the *same* window's `MARKET`
-factor series (already Nifty's own log returns, no separate fetch), factor
-returns are split by the Viterbi sequence, and each regime gets its own
-Ledoit-Wolf `F_k`. `FactorModel.factor_covariance_daily` — the field every
-existing `factor_covariance()`/`stock_covariance()` call already reads —
-becomes `F_{current_regime}`, so **RiskDecomposition needed zero changes to
-its own math**: it was already just calling those methods. All three
-regimes' `F_k` remain available via `factor_covariance_for_regime(k)` /
-`stock_covariance_for_regime(k)`, which is what `FactorShock`'s
+The HMM fits on the *same* window's `MARKET` factor series (already
+Nifty's own log returns, no separate fetch), factor returns are split by
+the Viterbi sequence, and each regime gets its own Ledoit-Wolf `F_k`.
+`FactorModel.factor_covariance_daily` — the field every existing
+`factor_covariance()`/`stock_covariance()` call already reads — is always
+`F_{current_regime}`, so **RiskDecomposition needs zero special-casing of
+its own math**: it just calls those methods, unconditionally regime-aware.
+All three regimes' `F_k` remain available via `factor_covariance_for_regime(k)`
+/ `stock_covariance_for_regime(k)`, which is what `FactorShock`'s
 `crisis_comparison` uses.
 
 **Fallback**: a regime with fewer than `MIN_REGIME_OBSERVATIONS` (30) days
@@ -759,24 +809,31 @@ case, not just a hypothetical — see the live run below.
 
 ### Per-experiment behaviour
 
-- **RiskDecomposition**: `regime_covariance: bool` field; when true, vol
-  and Euler contributions use `F_{current_regime}` automatically (see
-  above). `model_params.regime_state` records which regime.
-- **FactorShock**: `regime_covariance: bool` field; when true *and* the
-  current regime isn't already Crisis, `outputs.result.crisis_comparison`
-  reruns the same shock (including conditional propagation) using
-  `F_crisis` instead of `F_current`, so a reader can see "how much worse
-  would this look under crisis-regime correlations" without a second
-  request. Absent (not zeroed) when the current regime already is Crisis,
-  since that comparison would be a no-op.
-- **CvarRebalance**: `regime_covariance: bool` field; per the design note,
-  the LP and feasibility checks always use historical scenarios directly,
-  *never* a factor-model covariance — so this can't gate optimality. It
-  instead fits a regime-conditional factor model purely to report
+- **RiskDecomposition**: vol and Euler contributions always use
+  `F_{current_regime}` (see above). `model_params.regime_state` records
+  which regime.
+- **FactorShock**: whenever the current regime isn't already Crisis,
+  `outputs.result.crisis_comparison` reruns the same shock (including
+  conditional propagation) using `F_crisis` instead of `F_current`, so a
+  reader can see "how much worse would this look under crisis-regime
+  correlations" without a second request. Absent (not zeroed) when the
+  current regime already is Crisis, since that comparison would be a no-op.
+- **CvarRebalance**: per the design note, the LP and feasibility checks
+  always use historical scenarios directly, *never* a factor-model
+  covariance — so regime can't gate optimality. It instead always fits a
+  regime-conditional factor model purely to report
   `regime_portfolio_vol_annualized_{before,after}` (`sqrt(w' Sigma_regime
   w)` for `weights_before`/`weights_after`) as a parametric cross-check
   alongside the historical CVaR/VaR, with `model_params.regime_state`
-  recording which regime.
+  recording which regime. This fit uses the CVaR experiment's own resolved
+  scenario `window` (not a separate fixed default), and degrades to `None`
+  regime fields (rather than failing the whole request) if that window is
+  narrower than the HMM's 90-observation minimum.
+- **PortfolioPerformance**: never fits a factor model (unchanged), but now
+  reports `outputs.result.regime_label` (informational only) from a
+  standalone HMM fit on the window's own MARKET series, and populates
+  `model_params.regime_state` the same way. `None` only if that standalone
+  fit itself fails.
 
 ### Live run (10-stock Nifty portfolio)
 
@@ -791,18 +848,22 @@ the 252-day window).
 covariance"` — Bear was too thin a slice of this particular 252-day window
 to shrink its own `F`.
 
-**RiskDecomposition, `portfolio_vol_annualized`**:
+**RiskDecomposition, `portfolio_vol_annualized`**, captured from the
+session that first added regime-conditioning (back when it was still
+opt-in via `regime_covariance: bool`; the flag itself is gone now, see
+above, but the comparison is still the right mental model for what
+regime-conditioning does):
 
 | | value |
 |---|---|
-| `regime_covariance: false` | 0.1549 |
-| `regime_covariance: true` (Bull) | 0.1174 |
+| full-window `F` (no regime split) | 0.1549 |
+| regime-conditional `F` (Bull) | 0.1174 |
 
 Meaningfully lower under the Bull-regime `F` than the full-window `F`, as
 expected — the window's Bear/Crisis days pull the full-window covariance up.
 
-**FactorShock (Nifty −12%, Brent +20%, `regime_covariance: true`)**,
-current regime Bull, so `crisis_comparison` is present:
+**FactorShock (Nifty −12%, Brent +20%)**, current regime Bull, so
+`crisis_comparison` is present:
 
 | | current regime (Bull) | `crisis_comparison` |
 |---|---|---|
@@ -824,11 +885,13 @@ order the segments appear in the data (a deliberately *not* variance-sorted
 order — high, low, medium). `model`'s own tests inject a synthetic Viterbi
 sequence directly (rather than coaxing a real HMM fit into an unlucky
 split) to test the <30-obs fallback deterministically. `experiment_tests.rs`
-covers RiskDecomposition's vol actually differing with/without
-`regime_covariance`, and FactorShock's `crisis_comparison` presence/absence
-by regime. One test — `F` is PSD for all three regimes on real NSEI data —
-needs network and is `#[ignore]`d by default; run with `cargo test -p
-compute --test model_tests -- --ignored`. Confirmed passing.
+covers RiskDecomposition always using a regime-conditional `F` that differs
+across regimes, and FactorShock's `crisis_comparison` presence/absence by
+regime. Two tests need network and are `#[ignore]`d by default: `F` is PSD
+for all three regimes on real NSEI data (`cargo test -p compute --test
+model_tests -- --ignored`), and every experiment type's trace has a
+non-null `regime_state` on real data (`cargo test -p compute --test
+always_on_regime_tests -- --ignored`). Both confirmed passing.
 
 ### Judgment calls
 
@@ -859,16 +922,25 @@ compute --test model_tests -- --ignored`. Confirmed passing.
   at all currently (they're pure cap/turnover arithmetic), so doing that
   would be a bigger, unrequested change to what "feasible" means for this
   experiment.
-- **Regime HMM window for CvarRebalance** defaults to
-  `frequency.default_window()` (252 daily), independent of CvarRebalance's
-  own `window` (which defaults to *full available history* for scenarios) —
-  these are two different jobs (regime detection wants a recent window;
-  historical CVaR wants as much data as possible), so tying them together
-  would have been actively wrong.
-- **`fit_factor_model` (old signature) kept as a thin wrapper** rather than
-  changing its signature and updating every call site across `agent`/
-  `server`, per this checkpoint's explicit scope ("no other crate changes
-  in this session").
+- **Regime HMM window for CvarRebalance now reuses the CVaR experiment's own
+  resolved scenario `window`**, not a separate fixed `frequency.default_window()`
+  (252 daily) as in the original opt-in design. That fixed default broke
+  the moment regime-conditioning became unconditional, since it required
+  every ticker to have >= 252 observations even when the caller's own
+  `window`/available data was shorter (hit immediately by this crate's
+  existing short-synthetic-data CVaR tests, all of which use ~100
+  observations). Reusing the resolved window also has the advantage of
+  keeping the reported regime consistent with the same span the CVaR
+  analysis itself runs over, rather than an unrelated hardcoded lookback.
+- **CvarRebalance's regime fit degrades to `None` on failure** (including
+  "window narrower than 90 observations", `regime::fit_hmm`'s minimum)
+  instead of failing the whole request, since it's explicitly informational
+  and not load-bearing for the LP/feasibility checks. The equivalent
+  standalone fit in `PortfolioPerformance` (for `regime_label`) does the
+  same. `FactorShock`/`RiskDecomposition` do *not* have this fallback —
+  regime-conditioning is load-bearing there (`crisis_comparison`, and the
+  vol/Euler-contribution math itself), so a fit failure there is a genuine
+  error, propagated with `?` from `fit_factor_model`.
 
 ## Historical scenario presets and multi-turn `/ask`
 
@@ -982,35 +1054,73 @@ the test can inspect what it captured after the request completes.
   per spec "sequential is fine") is therefore also unmeasured against real
   API latency in this session.
 
-## PDF reports, result store, and CVaR cap defaulting
+## PDF reports, snapshot store, and CVaR cap defaulting
 
-### In-memory result store (`server::store`)
+### Persistent risk snapshot store (`store::SnapshotStore`)
 
-`ResultStore`: a fixed-capacity (`20`) ring buffer (`VecDeque<(Uuid, PipelineResult)>`
-behind a `Mutex`), keyed by a server-generated UUID v4. Every successful
-`POST /ask` inserts its `PipelineResult` and returns the id as
-`result_id` in `AskResponse`; the oldest entry is evicted once the buffer
-is full. `POST /experiment` does **not** store anything -- it has no
-narration/suggestion to report on, only a bare `EvidenceTrace`.
-`agent::pipeline::PipelineResult` and `agent::grounding::GroundedNarration`
-both gained `#[derive(Clone)]` (a small, unavoidable agent-crate touch):
-`ResultStore::get(&self, id) -> Option<PipelineResult>` hands the caller
-its own owned copy without moving the entry out of the shared queue, which
-needs `Clone`, not a reference.
+`ResultStore` (an in-memory, fixed-capacity-20 `VecDeque`) has been
+replaced by `store::SnapshotStore`, a SQLite-backed store in its own crate
+(`crates/store`, using `rusqlite`'s `bundled` feature so no external
+`sqlite3` needs to be installed on the distroless runtime image -- SQLite
+is compiled from source as part of the crate build). Both `POST /experiment`
+and `POST /ask` now insert a `RiskSnapshot` row on every successful call
+(`POST /experiment` didn't store anything at all before this); `POST /ask`
+still returns the row's id as `result_id` in `AskResponse`.
+
+A `RiskSnapshot` holds the full `EvidenceTrace` as `trace_json`, plus a
+handful of fields pulled out of it for fast querying without re-parsing
+JSON: `portfolio_hash` (see below), `experiment_type`, `engine_version`,
+`regime_label`/`smoothed_probs` (from `model_params.regime_state`, which
+every experiment type now always populates -- see "Regime-conditional
+factor covariance" below), `portfolio_vol_annualized` (`RiskDecomposition`
+only), and `cvar_historical` (`CvarRebalance` only). It deliberately does
+**not** persist narration or the follow-up suggestion -- those are
+`/ask`-pipeline-only text, not part of the evidence trace, and adding them
+would mean widening the fixed schema.
+
+**Judgment call:** since the persisted schema has no room for narration,
+`GET /report/{id}`'s PDF (`server::pdf`, below) now renders purely from the
+trace -- the old "Analysis" section (the narration paragraph + grounding
+warning) is gone. A report requested for a `POST /experiment` result was
+always narration-less (there's no Gemini call on that path); the same is
+now also true for a `POST /ask` result once it's fetched back out of the
+store. The live narration text is still returned synchronously in `/ask`'s
+own JSON response -- only the *stored, re-fetchable-later* copy lost it.
+
+**Persistence caveat (Cloud Run):** the store's file path comes from
+`SNAPSHOT_DB_PATH` (`main.rs`), defaulting to `/data/snapshots.db`. On
+Cloud Run, `/data` is the container instance's own ephemeral local disk: it
+survives across requests on a single warm instance, but is never shared
+between instances or revisions, and is wiped on a cold start or
+scale-to-zero (this service's `cloudrun.yaml` sets `minScale: "0"`, so
+scale-to-zero is the normal idle state, not an edge case). Snapshots are
+therefore best-effort recent history, not a durable audit log -- acceptable
+for a hackathon-scale demo, but a real deployment should point
+`SNAPSHOT_DB_PATH` at a mounted persistent volume (e.g. a GCS FUSE mount)
+or replace `SnapshotStore`'s backing store with a managed database
+(Cloud SQL) instead.
+
+### Portfolio identity (`compute::portfolio::portfolio_hash`)
+
+`SnapshotStore::latest_for_portfolio` looks up prior snapshots for "the
+same portfolio" by `portfolio_hash`: SHA-256 of `"TICKER:weight,..."` pairs
+sorted by ticker ascending, hex-encoded. Order-independent by construction
+(sorted before hashing), so the same holdings always hash identically
+regardless of what order the caller listed them in.
 
 ### `GET /report/{result_id}` (`server::pdf`)
 
 A single-page A4 PDF built on `printpdf = "=0.12.8"` (pinned exactly, see
 "Judgment calls" below for why the version matters here more than usual).
-404 (`result_not_found`) if the id was never stored or has since been
-evicted. Layout: header (title + experiment type/timestamp, rule),
-Analysis (word-wrapped narration + a grounding-warning line if any),
-key Numbers (a 3-column table, one row set per experiment type -- P&L/
-given+implied shocks/regime/crisis P&L for FactorShock; vol/top-2 factors/
-specific risk/regime for RiskDecomposition; CVaR before/after/reduction/
-turnover/commission for CvarRebalance), Evidence Trace (model params,
-data quality, invariants with pass/fail), footer (fixed regime-smoothing
-disclaimer). Single-pass, no pagination, per spec.
+404 (`result_not_found`) if the id was never stored. Renders from the
+`EvidenceTrace` alone (see the judgment call above for why narration is no
+longer part of this). Layout: header (title + experiment type/timestamp,
+rule), Key Numbers (a 3-column table, one row set per experiment type --
+P&L/given+implied shocks/regime/crisis P&L for FactorShock; vol/top-2
+factors/specific risk/regime for RiskDecomposition; CVaR before/after/
+reduction/turnover/commission for CvarRebalance), Evidence Trace (model
+params, data quality, invariants with pass/fail), footer (fixed
+regime-smoothing disclaimer). Single-pass, no pagination, per spec.
 
 ### Shared INR formatting (`compute::format::format_inr`)
 
@@ -1207,3 +1317,402 @@ portfolio) and 1 new `agent` parse test (mocked Gemini calling
 folder, including the exact regression case (this question used to 422,
 now returns 200) -- full collection re-run clean, 30/30 requests, 92/92
 assertions.
+
+## Fifth experiment: RiskDrift (`compute::drift`)
+
+Explains what changed in a portfolio's risk between two points in time,
+by diffing the current factor-model fit against a prior stored
+`RiskDecomposition` snapshot: volatility, factor contributions (Euler),
+portfolio-level factor betas, factor correlations, market regime, and
+specific-risk share. `RiskDriftInput` carries no `portfolio` field of its
+own (unlike every other experiment) -- it's diffing "the current
+portfolio" against a *stored* baseline, not two portfolios given inline --
+so the portfolio now flows into the compute layer as an explicit parameter
+everywhere, not just embedded in each variant's own input.
+
+### `ExperimentContext` and the new dispatch layer (`compute::dispatch`, `compute::context`)
+
+`RiskDrift` needs read access to `store::SnapshotStore` to resolve its
+baseline, so `store` is now a dependency of `compute` (previously only
+`server` depended on it). The per-variant fetch/fit/dispatch logic that
+used to live in `agent::pipeline::compute_trace` moved into
+`compute::dispatch::run_experiment(experiment, portfolio, ctx)` --
+`agent::pipeline::compute_trace` is now a thin wrapper around it.
+`ExperimentContext { store, portfolio_hash }` is threaded through for
+every experiment type but only `RiskDrift` actually reads it; the other
+four ignore it (reserved for a later session's policy checks, per the
+original spec). This cascaded through:
+- `agent::pipeline::run` gained a `store: Arc<SnapshotStore>` parameter.
+- `server::backend::Backend::run_experiment` gained a `portfolio: Portfolio`
+  parameter (needed since `RiskDriftInput` has none of its own to read).
+- `server::backend::RealBackend` gained a `store` field, built once in
+  `main.rs` and shared with `AppState`.
+
+### Baseline compatibility: `portfolio_betas` and `factor_correlation`
+
+Diffing betas/correlations requires the *baseline's own* per-stock betas
+and factor correlation matrix -- neither was ever persisted anywhere in
+`EvidenceTrace` before this session (only `by_factor`'s Euler
+contributions and `portfolio_vol_annualized` were). `RiskDecompositionOutput`
+gained two new fields, `portfolio_betas: BTreeMap<String, f64>` (portfolio-level
+factor exposure, `Sum_i w_i * beta_ik`) and `factor_correlation: CorrelationMatrix`,
+populated by `run_risk_decomposition`. **This means a `RiskDecomposition`
+snapshot stored *before* this change cannot serve as a `RiskDrift`
+baseline** -- `run_risk_drift` detects the absence of these fields (an
+empty map/matrix when read back from JSON) and returns a clear
+`ComputeError::InvalidInput` naming the stored snapshot's `engine_version`
+and asking the caller to rerun `RiskDecomposition`, rather than silently
+producing zeroed deltas.
+
+### Judgment calls
+
+- **Baseline resolution when `baseline_snapshot_id` is omitted uses the
+  single most recent stored snapshot**, not "the second entry" of a
+  2-item `latest_for_portfolio` query as an earlier draft of this spec
+  described. At the point baseline resolution runs, `RiskDrift`'s own
+  result has not yet been stored (that happens afterward, via the same
+  generic `SnapshotStore::insert` path `/experiment`/`/ask` already use
+  for every experiment type -- `RiskDrift` needed no special insertion
+  code of its own), so there is no "current" entry in the store to skip
+  past yet. Taking the second entry literally would require *two* prior
+  snapshots to exist before `RiskDrift` could run even once, which
+  contradicts the required live-run flow (a single prior
+  `RiskDecomposition` snapshot must be usable immediately as a baseline
+  for the very next `RiskDrift` call) -- confirmed by the live run below,
+  which does exactly that.
+- **`run_risk_drift` is split into a thin data-fetching wrapper and a
+  hermetic `compute_risk_drift`** (pure diff logic: baseline snapshot +
+  an already-computed "current" `RiskDecompositionOutput`/`EvidenceTrace`
+  in, `RiskDriftOutputs`/`EvidenceTrace` out), matching every other
+  experiment function's convention of taking pre-fetched data/model
+  rather than reaching out to the network itself. This is what makes the
+  five required `compute` tests possible without live Yahoo data.
+- **`GET /drift` filters client-side over a capped recent window**
+  (`DRIFT_SCAN_WINDOW = 1000`) rather than the store having a "list
+  recent of this experiment type" query -- out of this session's declared
+  scope ("no changes to the store crate"). A portfolio with more than
+  1000 *non*-`RiskDrift` snapshots since its oldest relevant `RiskDrift`
+  one could miss older entries; fine for a hackathon-scale demo, but a
+  real "risk drift history" UI would want the store itself to support
+  filtering by `experiment_type`.
+- **`ComputeError::NoPriorSnapshot` maps to 422**, not the generic 500
+  every other compute error gets (`server::backend`'s
+  `From<compute::ComputeError>` now matches on this variant specifically)
+  -- matching how `ParseError::Unrecognised` (a request problem, not an
+  internal failure) is already mapped.
+- **`days_elapsed` compares data-window end dates, not wall-clock
+  `created_at` timestamps** -- it answers "how much did the underlying
+  market data advance between the two fits," which is what a risk-drift
+  narrative actually cares about, not how long ago someone happened to
+  click a button.
+
+### Live run (10-stock... actually 2-stock demo portfolio, RELIANCE.NS/TCS.NS)
+
+1. `POST /experiment` `RiskDecomposition` (window 252) to create a
+   baseline: `200`, regime `Bull`, `portfolio_vol_annualized: 0.18447555218792452`.
+2. `POST /experiment` `RiskDrift` with `baseline_snapshot_id: null`,
+   run seconds later against the same live data: `200`,
+   `vol_before: 0.18447555218792452`, `vol_after: 0.18447555218792452`,
+   `vol_change_pct: 0.0`, `regime_before: "Bull"`, `regime_after: "Bull"`,
+   `top_growing_risk_factor: "USDINR"`. Vol and regime are identical
+   because the underlying market data hadn't changed in the few seconds
+   between the two calls -- exactly the expected, correct result, not a
+   bug (a real drift narrative would show non-trivial deltas across a
+   longer gap between snapshots).
+3. `GET /drift?portfolio=<hash>` (hash computed the same way
+   `compute::portfolio::portfolio_hash` does): `200`, `snapshots` contains
+   exactly the one `RiskDrift` result from step 2, with the same
+   `vol_before`/`vol_after`/`regime_before`/`regime_after` fields.
+
+### Tests
+
+`compute`: 5 new hermetic tests in `drift_tests.rs` against
+`compute_risk_drift` directly (no network) -- `vol_change_abs`/
+`vol_change_pct` computed correctly; the Euler-additivity residual is
+recorded (not errored) when factor deltas don't sum exactly to
+`vol_change_abs`; `regime_changed`/`regime_worsened` true/false in both
+directions; `risk_became_more_concentrated`'s 5-percentage-point
+threshold (50%->60% true, 50%->52% false); and
+`run_risk_drift` (the thin wrapper, exercising real baseline resolution
+against an empty in-memory store) returns `ComputeError::NoPriorSnapshot`
+with the exact required message when nothing exists yet. `agent`: 2 new
+`parse_tests.rs` cases (`RiskDrift` with a `null` and with a specific
+`baseline_snapshot_id`). `server`: 4 new `tests.rs` cases (`RiskDrift`
+with a pre-inserted baseline returns 200 with a non-null `vol_change_abs`;
+no prior snapshot returns 422 with the exact message; `GET /drift` with
+no snapshots returns `{"snapshots": []}`, 200; `GET /drift` after
+inserting two `RiskDrift` snapshots -- plus one deliberately-inserted
+`RiskDecomposition` snapshot for the same portfolio, to confirm it's
+excluded -- returns exactly the 2 summaries, with no `trace_json`/
+`outputs` field present).
+
+## Sixth experiment: ReverseStress (`compute::reverse_stress`)
+
+The inverse of `FactorShock`: instead of "what happens under shock X," this
+asks "what's the *smallest* market shock that would cause at least L
+rupees of loss." Solves for the minimum-Mahalanobis-severity factor shock
+`s` (in log-return space) such that `P&L(s) <= -loss_threshold_inr`,
+subject to per-factor box bounds (default: plausible historical ranges for
+Indian markets -- `MARKET [-40, 0]`, `USDINR [-5, 20]`, `BRENT [-60, 100]`,
+`GOLD_USD [-20, 40]`, `RATES_PROXY [-10, 10]`, all in simple %). Like
+`RiskDrift`, `ReverseStressInput` has no `portfolio` field of its own --
+the portfolio arrives via `compute::dispatch::run_experiment`'s explicit
+`portfolio` parameter (the infrastructure Session 2 built for exactly this
+shape of input), so this session needed **no changes to `store`, `agent`
+pipeline, or server routing** beyond the new `Experiment` variant and its
+own dispatch-layer fetch/fit case.
+
+### The math
+
+`P&L(s) = Sum_i w_i * (exp(Sum_k beta_ik * s_k) - 1) * total_value_inr` --
+identical to `FactorShock`'s formula. `s^T F^-1 s` (the squared Mahalanobis
+distance under the current-regime factor covariance `F`) is the severity to
+minimise; `mahalanobis_severity` in the output is its square root, so the
+`"within 1σ"`/`"1–2σ"`/`"2–3σ"`/`">3σ"` labels' boundaries at exactly 1/2/3
+mean what they say (bucketing the *squared* form would need boundaries at
+1/4/9 for the same sigma levels -- see the judgment call below).
+
+Solved in two stages:
+1. **KKT closed form** on the linearised problem (`P&L(s) ~= p^T s`, where
+   `p_k = Sum_i w_i * beta_ik * total_value_inr` is the linear P&L
+   sensitivity to factor `k`): `s* = -L * (F p) / (p^T F p)` --
+   `compute::reverse_stress::kkt_shock`, unit-tested directly against a
+   hand-built diagonal `F`/single-nonzero-entry `p` (the "single-factor"
+   case: `s* = -L/p_k`, `severity = |s*|/sqrt(F_kk)`, both exact).
+2. **Projected gradient descent** refines that starting point against the
+   *true* (nonlinear) objective and constraint. "Projection" does two
+   things every step: clip to box bounds, then rescale the point (fixed
+   direction, 1-D bisection search on the scale factor) to the smallest
+   magnitude that still makes the *true* nonlinear `P&L` breach `-L`
+   exactly -- not a general nonlinear-constraint projection, but exact for
+   this problem's actual geometry, since `P&L` is monotonic in shock
+   magnitude along any "bad" direction. Armijo backtracking (`β=0.5`,
+   `c=1e-4`), up to 200 iterations, gradient-norm (`<1e-6`) or
+   objective-change (`<1e-8`) convergence.
+3. **Feasibility pre-check**: the worst-case corner of the box (each
+   factor set to whichever bound maximises linearised loss) must itself
+   breach `-L`, or the request is infeasible -- `ComputeError::
+   ReverseStressInfeasible` with the exact max feasible loss, before any
+   optimisation is attempted.
+
+### Judgment calls
+
+- **`mahalanobis_severity` is the *unsquared* Mahalanobis distance**
+  (`sqrt(s^T F^-1 s)`), even though the spec's formulation names `s^T F^-1
+  s` itself "the Mahalanobis severity" and calls it the objective to
+  minimise. Both are literally true (the objective minimised is the
+  squared form; the reported/labelled quantity is its square root) -- the
+  σ-bucket boundaries at exactly 1, 2, 3 only make sense for the unsquared
+  distance (a 2σ point has squared-form value 4, not 2), so that's what's
+  reported and bucketed.
+- **`solver_status: "converged"` means "the projected-gradient search
+  could no longer find a strictly-better feasible point," not "the raw
+  unconstrained gradient norm fell below tolerance."** Confirmed live (see
+  below): the live run converged in a single iteration with
+  `gradient_norm_final: 11.78` -- nowhere near the `1e-6` tolerance. This
+  is expected, not a bug: near the projected boundary, the *projection*
+  operator (clip + rescale-to-breach) dominates a small unconstrained
+  gradient step, so Armijo backtracking can exhaust its 30 attempts
+  without finding a strictly-decreasing candidate even though the
+  underlying point is already the true constrained optimum. A raw gradient
+  norm is the right diagnostic for an *unconstrained* problem; for this
+  projected one, "no further Armijo-acceptable improvement" is the more
+  meaningful stopping signal, which is why it's still labelled
+  `"converged"` rather than `"max_iter"`.
+- **Bounds and the true breach constraint are enforced by an alternating
+  fixed-point loop** (`project_to_feasible`: clip to bounds, then rescale
+  to the true constraint boundary, repeat up to 20 rounds), not a single
+  pass -- clipping can pull a rescaled point back out of breach, and
+  rescaling can push a clipped point back out of bounds, so neither
+  operation alone is sufficient. In every test and the live run this
+  converges within a handful of rounds; a final defensive
+  `project_to_feasible` call after the gradient loop exits (regardless of
+  why it exited) guarantees the hard breach invariant
+  (`portfolio_pnl_inr <= -loss_threshold_inr * 0.999`) holds even if the
+  refinement loop itself stalled early.
+- **`factor_attribution` sums to the log-space P&L, not
+  `portfolio_pnl_inr` exactly** -- same convention as `FactorShock`'s own
+  `factor_attribution_log_inr`: `Sum_i value_i * beta_ik * s_k` is exact in
+  log-return space, but doesn't equal the `exp(.) - 1`-converted simple
+  P&L once the shock is large (the conversion is convex). Recorded as an
+  approximate invariant (tolerance `1%` of `loss_threshold_inr`), never
+  errored, per spec.
+
+### Live run (10-stock Nifty portfolio, `loss_threshold_inr: 500000`, `factor_bounds: null`)
+
+| field | value |
+|---|---|
+| `shock_vector` | `MARKET -4.67%`, `BRENT +1.80%`, `GOLD_USD -0.62%`, `RATES_PROXY +0.88%`, `USDINR +0.68%` |
+| `mahalanobis_severity` | `0.534` |
+| `severity_label` | `"within 1σ"` |
+| `portfolio_pnl_inr` | `-500,000.00` (breaches the ₹5L threshold exactly) |
+| `most_vulnerable_holdings` | `["RELIANCE.NS", "HDFCBANK.NS", "LT.NS"]` |
+| `solver_status` | `"converged"` (`n_iterations: 1`, see the judgment call above re: `gradient_norm_final`) |
+| `linearisation_error_inr` | `13,629.20` |
+
+A modest ~4.7% Nifty fall (well within 1 standard deviation of this
+portfolio's own factor covariance) is enough to breach a ₹5L loss on this
+₹1Cr portfolio -- an unsurprising, sanity-checking result (5% of ₹1Cr is
+exactly ₹5L, and a ~5% market move is not a tail event for Nifty).
+
+### Tests
+
+`compute`: 5 new hermetic tests in `reverse_stress_tests.rs` -- the
+single-factor KKT closed form matches exactly (`1e-6`); `severity_label`'s
+four buckets; infeasibility returns the correct max feasible loss for an
+artificially tight-bounded scenario; the solution respects
+caller-specified bounds; and a 10-synthetic-stock portfolio's gradient
+descent both converges and genuinely breaches the threshold. `agent`: 2
+new `parse_tests.rs` cases (`ReverseStress` with `null` and with explicit
+`factor_bounds`). `server`: 2 new `tests.rs` cases (valid input returns 200
+with a negative `portfolio_pnl_inr`; an infeasible threshold returns 422
+with the exact infeasibility message).
+
+## Policy Engine (`compute::policy`) and constraint-aware remediation
+
+A deterministic risk-limit checker (`RiskPolicy` -> `PolicyResult`), plus
+two ways to use it: a standalone seventh experiment type (`PolicyCheck`),
+and an extension to `CvarRebalance` that tries to *fix* policy breaches by
+re-solving at a tighter CVaR confidence level. No optimisation and no LLM
+call happens inside the policy engine itself -- every rule is a plain
+comparison against a quantity already computable from a fitted
+`FactorModel` and the historical return series.
+
+### Rules and what each one actually computes
+
+- `max_vol_annualized`: the same `sqrt(w' Sigma w)` formula
+  `RiskDecomposition` uses, against the already-fitted (always
+  regime-conditional) model -- no refit.
+- `max_cvar_95`: historical CVaR at a **fixed** 95% confidence, computed
+  directly from the portfolio's own full-history simple returns -- never
+  via `CvarRebalance`'s LP, and never by reading a stored snapshot (see
+  the judgment call below on why `evaluate_policy` doesn't take a `store`
+  parameter at all, despite an earlier draft of this spec suggesting one).
+- `max_factor_contribution_share`: the largest *signed* (not absolute
+  value) single-factor Euler contribution share -- a large negative
+  (diversifying) contributor is never flagged as "dominant," matching what
+  a risk manager actually means by the limit.
+- `max_position_weight`: `max(w_i)` across holdings.
+- `max_loss_under_scenarios`: for each named scenario, a real
+  `FactorShock` run (`propagate: false`, per spec) against
+  `compute::scenarios::all_scenarios()`'s fixed shock set, loss reported
+  as `abs(portfolio_pnl_inr) / total_value_inr`.
+
+### `PolicyCheck`, the seventh experiment type
+
+Like `RiskDrift`/`ReverseStress`, `PolicyCheckInput` has no `portfolio`
+field of its own -- it reuses the same dispatch-level `portfolio`
+parameter those two already established. `PolicyCheckOutputs` always
+reports the four "actual" values (`portfolio_vol`, `portfolio_cvar_95`,
+`max_position_weight`, `max_factor_share`) regardless of whether the
+matching `RiskPolicy` field was set, so a caller can see where they stand
+even for limits they didn't ask about.
+
+### Constraint-aware remediation (`CvarRebalance`'s new `policy` field)
+
+`CvarRebalanceInput.policy: Option<RiskPolicy>` triggers, after the LP
+solves: evaluate the policy against the proposed weights; if breaches
+remain, tighten `confidence_level` by `0.01` and re-solve, up to 5 times,
+keeping whichever attempt's weights are reported (`weights_after`,
+`stats_after`, `turnover`, etc. all reflect the *final* remediation
+attempt, not the original solve -- `confidence_level` in the output is
+likewise the final, tightened value, not the one the caller originally
+sent). Implemented as a recursive call to `run_cvar_rebalance` itself
+(each retry's own `input.policy` is `None`, so it can't recurse further) --
+reusing the entire existing LP-building/solving path rather than
+extracting a separate "core solver" out of it.
+
+### Judgment calls
+
+- **`evaluate_policy` takes no `store` parameter**, despite an earlier
+  draft of this spec's own function signature listing one ("needed for
+  CVaR: run CvarRebalance or read from latest snapshot"). The spec's own
+  evaluation logic for `max_cvar_95` says the opposite explicitly ("compute
+  CVaR directly from historical scenarios... do not run the LP"), which
+  needs a `MarketData` reference, not a store handle -- so `store` was
+  dropped and `data: &MarketData` added instead. `evaluate_policy` is
+  synchronous, hermetic, and needs nothing beyond what a fitted model
+  already carries.
+- **Passive policy attachment is skipped for `RiskDrift`.** `dispatch::
+  run_experiment` attaches a passive `policy_result` to every experiment
+  except `PolicyCheck`/`CvarRebalance` (which handle policy themselves),
+  but `RiskDrift` fits its "current" factor model *internally*
+  (`drift::run_risk_drift`) and never exposes it back to the dispatcher --
+  re-fitting it a second time purely for a passive check felt like the
+  wrong trade-off for this session. A caller wanting a policy check
+  alongside `RiskDrift` should make a separate `PolicyCheck` request.
+  `PortfolioPerformance` similarly never otherwise fits a factor model, so
+  one is fit there *only* when a policy is actually attached (skipped
+  entirely, no extra cost, when it isn't).
+- **Live-caught bug, fixed before the live runs below**: `run_cvar_rebalance`'s
+  internal `build_portfolio` closure (builds a `Portfolio` from a
+  `weights_before`/`weights_after` map to hand to `evaluate_policy`)
+  originally iterated the map directly -- but `weights_before`/`_after` are
+  `BTreeMap<String, f64>`, hence *alphabetically* ordered, while
+  `evaluate_policy` needs `portfolio.tickers() == model.tickers`
+  *positionally*, not just as a set (the fitted model's `beta_matrix()`
+  rows are in the original portfolio's ticker order). Every existing test
+  happened to use already-alphabetical tickers (`AAA`/`BBB`), so this
+  passed the full test suite before failing immediately on the first real
+  10-ticker Nifty portfolio (`RELIANCE.NS` first, not alphabetically
+  first) with `"portfolio holdings and fitted model tickers must match
+  1:1, in order"`. Fixed by iterating the *original* `tickers` list
+  instead of the map; a new regression test
+  (`cvar_rebalance_with_policy_does_not_care_about_ticker_alphabetical_order`)
+  uses deliberately reverse-alphabetical tickers so this can't silently
+  regress again.
+- **Tightening `confidence_level` is not guaranteed to resolve every
+  breach, and the live run below confirms it doesn't always** -- CVaR
+  minimization at a higher confidence level only changes the
+  historical-scenario tail the LP optimizes over; it has no direct
+  mechanical relationship to a factor-shock scenario limit
+  (`max_loss_under_scenarios`) or a factor-concentration limit
+  (`max_factor_contribution_share`). The live run's `max_position_weight`
+  breach happened to resolve (a side effect of `per_name_cap` binding in
+  the same LP, not of confidence-level tightening itself), while the
+  `covid_crash` scenario-loss breach did not, even after all 5 iterations
+  reached the confidence-level ceiling (`0.999`). This is exactly why the
+  output separately reports `policy_breaches_resolved`/`_remaining` rather
+  than a single pass/fail bit -- remediation is a best-effort heuristic,
+  not a guaranteed fix.
+
+### Live run A: `PolicyCheck` on the 10-stock Nifty portfolio
+
+Policy: `max_vol_annualized: 0.14`, `max_cvar_95: 0.03`,
+`max_factor_contribution_share: 0.80`, `max_position_weight: 0.12`,
+`max_loss_under_scenarios: [{covid_crash, max_loss_pct: 0.30}]`.
+
+`all_passed: false`, `breach_count: 2`:
+
+| rule | actual | limit | passed |
+|---|---|---|---|
+| `max_vol_annualized` | 11.7% | 14.0% | ✓ |
+| `max_cvar_95` | 2.0% | 3.0% | ✓ |
+| `max_factor_contribution_share` (MARKET) | 64.4% | 80.0% | ✓ |
+| `max_position_weight` (RELIANCE.NS) | 15.0% | 12.0% | ✗ (breach 3.0pp) |
+| `max_loss_under_scenarios[covid_crash]` | 37.6% | 30.0% | ✗ (breach 7.6pp) |
+
+`most_severe_breach`: `max_loss_under_scenarios[covid_crash]` (larger
+breach magnitude). Note the portfolio's live vol (11.7%) is well under the
+14% limit and under the 15.5% figure an earlier session's live run
+captured -- real market data moves between sessions; this isn't a
+discrepancy, it's what "live" means.
+
+### Live run B: `CvarRebalance` with the same policy attached
+
+`turnover_limit: 0.4`, `per_name_cap: 0.12`, same policy as above.
+
+`status: "optimal"`, `remediation_iterations: 5`, final
+`confidence_level: 0.999` (tightened from 0.95, hit the ceiling without
+resolving everything):
+
+- `policy_breaches_resolved`: `[]`
+- `policy_breaches_remaining`: `["max_loss_under_scenarios[covid_crash]"]`
+
+The `max_position_weight` breach present in `policy_result_before`
+disappeared from `policy_result_after` -- but, per the judgment call
+above, that's `per_name_cap: 0.12` doing its job in the LP itself (every
+`weights_after` entry sits at essentially exactly 0.12), not the
+confidence-level tightening. The `covid_crash` scenario-loss breach
+remained unresolved through all 5 iterations, demonstrating the
+remediation loop's real limitation rather than a contrived one.

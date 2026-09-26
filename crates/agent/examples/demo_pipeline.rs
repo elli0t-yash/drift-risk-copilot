@@ -7,10 +7,7 @@
 
 use std::sync::Mutex;
 
-use agent::gemini::{
-    Candidate, Content, FunctionCall, GeminiClient, GeminiError, GeminiRequest, GeminiResponse,
-    Part,
-};
+use agent::gemini::{Candidate, Content, GeminiClient, GeminiError, GeminiRequest, GeminiResponse, Part};
 use compute::experiments::{Holding, Portfolio};
 
 struct ScriptedClient {
@@ -19,31 +16,17 @@ struct ScriptedClient {
 
 #[async_trait::async_trait]
 impl GeminiClient for ScriptedClient {
-    async fn generate(&self, _request: &GeminiRequest) -> Result<GeminiResponse, GeminiError> {
+    async fn generate(
+        &self,
+        _model: &str,
+        _request: &GeminiRequest,
+    ) -> Result<GeminiResponse, GeminiError> {
         Ok(self
             .responses
             .lock()
             .unwrap()
             .pop()
             .expect("ScriptedClient: ran out of scripted responses"))
-    }
-}
-
-fn function_call(name: &str, args: serde_json::Value) -> GeminiResponse {
-    GeminiResponse {
-        candidates: vec![Candidate {
-            content: Content {
-                role: Some("model".to_string()),
-                parts: vec![Part {
-                    text: None,
-                    function_call: Some(FunctionCall {
-                        name: name.to_string(),
-                        args,
-                    }),
-                }],
-            },
-            finish_reason: Some("STOP".to_string()),
-        }],
     }
 }
 
@@ -86,28 +69,38 @@ These implied moves are not user inputs; they follow from the historical correla
 MARKET, BRENT and the other factors. The loss is dominated by the MARKET shock, given the \
 portfolio's substantial equity beta exposure.";
 
+    let plan_json = serde_json::json!([{
+        "tool": "factor_shock",
+        "params": { "shocks_pct": { "MARKET": -12.0, "BRENT": 20.0 }, "propagate": true },
+        "reason": "user asked for a hypothetical market + oil shock",
+    }])
+    .to_string();
+
     let client = ScriptedClient {
         responses: Mutex::new(vec![
             // Popped last-in-first-out, so this list is in reverse call
-            // order: parse (function call), then narrate (text), then
-            // suggest (text).
+            // order: plan (JSON text), then narrate (text), then suggest
+            // (text).
             text("What if I cut my turnover budget to 20% instead?"),
             text(narration_text),
-            function_call(
-                agent::schema::FACTOR_SHOCK_FUNCTION,
-                serde_json::json!({
-                    "shocks_pct": { "MARKET": -12.0, "BRENT": 20.0 },
-                    "propagate": true,
-                }),
-            ),
+            text(&plan_json),
         ]),
     };
 
+    let store = std::sync::Arc::new(store::SnapshotStore::open(":memory:").expect("in-memory store always opens"));
+    let holdings: Vec<(String, f64)> =
+        portfolio.holdings.iter().map(|h| (h.ticker.clone(), h.weight)).collect();
+    let ctx = compute::context::ExperimentContext {
+        store,
+        portfolio_hash: compute::portfolio::portfolio_hash(&holdings),
+        policy: None,
+    };
     let result = agent::pipeline::run(
         &client,
         "what if the market drops 12% and brent jumps 20%?",
         portfolio,
         &[],
+        &ctx,
     )
     .await
     .expect("pipeline run failed");

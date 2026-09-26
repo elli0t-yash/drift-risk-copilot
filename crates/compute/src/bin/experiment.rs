@@ -4,7 +4,7 @@ use clap::Parser;
 use compute::cvar::run_cvar_rebalance;
 use compute::data::load_market_data;
 use compute::experiments::{run_factor_shock, run_risk_decomposition, Experiment};
-use compute::model::{fit_factor_model_with_config, ModelConfig};
+use compute::model::{fit_factor_model, ModelConfig};
 use compute::performance::run_portfolio_performance;
 use compute::trace::DataWindow;
 
@@ -31,6 +31,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raw = std::fs::read_to_string(&args.input)?;
     let experiment: Experiment = serde_json::from_str(&raw)?;
 
+    if matches!(experiment, Experiment::RiskDrift(_)) {
+        return Err("RiskDrift needs a running SnapshotStore with prior experiment history to \
+                     diff against, which this one-shot CLI doesn't provide -- run it via the \
+                     server's POST /experiment instead."
+            .into());
+    }
+    if matches!(experiment, Experiment::ReverseStress(_) | Experiment::PolicyCheck(_)) {
+        return Err("ReverseStress/PolicyCheck have no \"portfolio\" field of their own (the \
+                     portfolio is a separate parameter at the server/dispatch layer, not part \
+                     of the JSON tagged-union input this CLI deserializes) -- run them via the \
+                     server's POST /experiment instead."
+            .into());
+    }
+
     if let Experiment::CvarRebalance(input) = &experiment {
         let tickers = input.portfolio.tickers();
         let data = load_market_data(&args.cache_dir, &tickers, args.refresh, input.frequency)?;
@@ -54,23 +68,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let (portfolio, window, frequency, regime_covariance) = match &experiment {
-        Experiment::FactorShock(i) => (&i.portfolio, i.resolved_window(), i.frequency, i.regime_covariance),
-        Experiment::RiskDecomposition(i) => {
-            (&i.portfolio, i.resolved_window(), i.frequency, i.regime_covariance)
-        }
-        Experiment::CvarRebalance(_) | Experiment::PortfolioPerformance(_) => {
+    let (portfolio, window, frequency) = match &experiment {
+        Experiment::FactorShock(i) => (&i.portfolio, i.resolved_window(), i.frequency),
+        Experiment::RiskDecomposition(i) => (&i.portfolio, i.resolved_window(), i.frequency),
+        Experiment::CvarRebalance(_) | Experiment::PortfolioPerformance(_) | Experiment::RiskDrift(_) | Experiment::ReverseStress(_) | Experiment::PolicyCheck(_) => {
             unreachable!("handled above")
         }
     };
 
     let tickers = portfolio.tickers();
     let data = load_market_data(&args.cache_dir, &tickers, args.refresh, frequency)?;
-    let model = fit_factor_model_with_config(
-        &data,
-        &tickers,
-        ModelConfig::new(window, frequency).with_regime_covariance(regime_covariance),
-    )?;
+    let model = fit_factor_model(&data, &tickers, ModelConfig::new(window, frequency))?;
 
     let data_window = DataWindow {
         frequency,
@@ -88,7 +96,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (_, trace) = run_risk_decomposition(&data.quality, data_window, &model, input)?;
             trace
         }
-        Experiment::CvarRebalance(_) | Experiment::PortfolioPerformance(_) => {
+        Experiment::CvarRebalance(_) | Experiment::PortfolioPerformance(_) | Experiment::RiskDrift(_) | Experiment::ReverseStress(_) | Experiment::PolicyCheck(_) => {
             unreachable!("handled above")
         }
     };

@@ -899,13 +899,13 @@
       "name": "9. Regime",
       "item": [
         {
-          "name": "a. RiskDecomposition with regime_covariance: true",
+          "name": "a. RiskDecomposition (regime is always-on)",
           "request": {
             "method": "POST",
             "header": [{"key": "Content-Type", "value": "application/json"}],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"experiment\": {\n    \"type\": \"RiskDecomposition\",\n    \"regime_covariance\": true\n  }\n}",
+              "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"experiment\": {\n    \"type\": \"RiskDecomposition\"\n  }\n}",
               "options": {"raw": {"language": "json"}}
             },
             "url": {"raw": "{{base_url}}/experiment", "host": ["{{base_url}}"], "path": ["experiment"]}
@@ -936,13 +936,13 @@
           ]
         },
         {
-          "name": "b. FactorShock with regime_covariance: true, Nifty -12% Brent +20%",
+          "name": "b. FactorShock (regime is always-on), Nifty -12% Brent +20%",
           "request": {
             "method": "POST",
             "header": [{"key": "Content-Type", "value": "application/json"}],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"experiment\": {\n    \"type\": \"FactorShock\",\n    \"shocks_pct\": {\"MARKET\": -12.0, \"BRENT\": 20.0},\n    \"propagate\": true,\n    \"regime_covariance\": true\n  }\n}",
+              "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"experiment\": {\n    \"type\": \"FactorShock\",\n    \"shocks_pct\": {\"MARKET\": -12.0, \"BRENT\": 20.0},\n    \"propagate\": true\n  }\n}",
               "options": {"raw": {"language": "json"}}
             },
             "url": {"raw": "{{base_url}}/experiment", "host": ["{{base_url}}"], "path": ["experiment"]}

@@ -14,6 +14,7 @@ use crate::data::DataQuality;
 use crate::error::{ComputeError, Result};
 use crate::experiments::{log_to_simple, Portfolio};
 use crate::model::Frequency;
+use crate::regime;
 use crate::trace::{DataWindow, EvidenceTrace, InvariantCheck, ModelParams};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -50,6 +51,13 @@ pub struct PortfolioPerformanceOutput {
     pub max_drawdown: f64,
     pub best_period_return: f64,
     pub worst_period_return: f64,
+    /// The market regime ("Bull"/"Bear"/"Crisis") at the end of the window,
+    /// informational only -- this experiment never fits a factor model, so
+    /// the regime is read from a standalone HMM fit on the window's MARKET
+    /// series (see `run_portfolio_performance`), not from any covariance
+    /// used above. `None` only if that fit itself failed (e.g. the window
+    /// is narrower than `regime::fit_hmm`'s minimum observation count).
+    pub regime_label: Option<String>,
 }
 
 pub fn run_portfolio_performance(
@@ -123,6 +131,21 @@ pub fn run_portfolio_performance(
         / (window.max(2) - 1) as f64;
     let annualized_vol_realized = (variance * ann_factor).sqrt();
 
+    // Informational only (see PortfolioPerformanceOutput::regime_label
+    // doc): this experiment never fits a factor model, so the regime read
+    // here is a standalone HMM fit on the window's own MARKET series, not
+    // derived from anything above. Degrades to `None` rather than failing
+    // the whole experiment if the window is too narrow for `fit_hmm`'s
+    // minimum observation count.
+    // "MARKET" is the factor *label* (FACTOR_NAMES[0]), not the raw ticker
+    // `data::MARKET` ("^NSEI") -- `factor_returns` is keyed by the former.
+    let nsei_window: Option<&Vec<f64>> = data.factor_returns.get("MARKET");
+    let regime_state = nsei_window.and_then(|series| {
+        let series_start = series.len().checked_sub(window)?;
+        regime::fit_hmm(&series[series_start..]).ok().map(|(_, state)| state)
+    });
+    let regime_label = regime_state.as_ref().map(|s| s.current_label.to_string());
+
     let output = PortfolioPerformanceOutput {
         start_value_inr,
         end_value_inr,
@@ -132,6 +155,7 @@ pub fn run_portfolio_performance(
         max_drawdown,
         best_period_return: best,
         worst_period_return: worst,
+        regime_label,
     };
 
     let invariant = InvariantCheck::approx_eq(
@@ -150,14 +174,16 @@ pub fn run_portfolio_performance(
         factor_names: Vec::new(),
         shrinkage_intensity: 0.0,
         annualization_factor: ann_factor,
-        regime_state: None,
+        regime_state,
         regime_fallback_warnings: Vec::new(),
         cap_source: None,
     };
 
     let trace = EvidenceTrace {
+        id: crate::trace::new_trace_id(),
         experiment: "PortfolioPerformance".to_string(),
         inputs: serde_json::to_value(input)?,
+        data_as_of: crate::trace::data_as_of(&data_window),
         data_window,
         data_quality: data_quality.clone(),
         model_params,
@@ -170,6 +196,11 @@ pub fn run_portfolio_performance(
         }),
         invariants: vec![invariant],
         engine_version: crate::trace::engine_version(),
+        engine_commit: crate::trace::engine_commit(),
+        scenario_provenance: None,
+        parent_trace_ids: Vec::new(),
+        baseline_model_params: None,
+        policy_result: None,
     };
 
     Ok((output, trace))

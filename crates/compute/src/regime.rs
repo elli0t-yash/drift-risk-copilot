@@ -17,7 +17,7 @@
 //! `fit_hmm` is what guarantees that determinism (see its doc comment).
 
 use schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{ComputeError, Result};
 
@@ -48,6 +48,9 @@ pub struct HmmModel {
     pub n_iter: u32,
 }
 
+/// Constant `RegimeState::smoothing_note` value (see its field doc).
+const SMOOTHING_NOTE: &str = "full-history smoothed, not suitable for live trading signals";
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct RegimeState {
     /// 0 = Bull, 1 = Bear, 2 = Crisis.
@@ -63,6 +66,49 @@ pub struct RegimeState {
     pub log_likelihood: f64,
     pub n_iter: u32,
     pub smoothing_note: &'static str,
+}
+
+/// Hand-written (not derived): `current_label`/`smoothing_note` are
+/// `&'static str`, which `#[derive(Deserialize)]` cannot produce (it would
+/// need to borrow from the deserializer's input, not `'static`). Round-trips
+/// through an owned-`String` shadow struct instead, mapping `current_label`
+/// back onto one of `REGIME_LABELS`'s `'static` entries (round-tripping
+/// `EvidenceTrace` through JSON is exactly what `store::SnapshotStore`'s
+/// persistence, and `GET /report/{id}`'s reconstruction of it, both need).
+impl<'de> Deserialize<'de> for RegimeState {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RegimeStateOwned {
+            current_regime: u8,
+            current_label: String,
+            smoothed_probs: [f64; N_STATES],
+            viterbi_sequence: Vec<u8>,
+            obs_count_per_regime: [usize; N_STATES],
+            log_likelihood: f64,
+            n_iter: u32,
+            #[allow(dead_code)]
+            smoothing_note: String,
+        }
+        let owned = RegimeStateOwned::deserialize(deserializer)?;
+        let current_label = REGIME_LABELS
+            .iter()
+            .find(|&&label| label == owned.current_label)
+            .copied()
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown regime label {:?}", owned.current_label)))?;
+        Ok(RegimeState {
+            current_regime: owned.current_regime,
+            current_label,
+            smoothed_probs: owned.smoothed_probs,
+            viterbi_sequence: owned.viterbi_sequence,
+            obs_count_per_regime: owned.obs_count_per_regime,
+            log_likelihood: owned.log_likelihood,
+            n_iter: owned.n_iter,
+            smoothing_note: SMOOTHING_NOTE,
+        })
+    }
 }
 
 fn gaussian_pdf(x: f64, mean: f64, variance: f64) -> f64 {
@@ -484,7 +530,7 @@ pub fn fit_hmm(nsei_returns: &[f64]) -> Result<(HmmModel, RegimeState)> {
         obs_count_per_regime,
         log_likelihood: final_ll,
         n_iter,
-        smoothing_note: "full-history smoothed, not suitable for live trading signals",
+        smoothing_note: SMOOTHING_NOTE,
     };
 
     Ok((model, state))

@@ -3,8 +3,9 @@ mod support;
 use agent::conversation::ConversationTurn;
 use agent::parse::{parse_experiment, ParseError};
 use agent::schema::{
-    CVAR_REBALANCE_FUNCTION, FACTOR_SHOCK_FUNCTION, PORTFOLIO_PERFORMANCE_FUNCTION,
-    RISK_DECOMPOSITION_FUNCTION,
+    CVAR_REBALANCE_FUNCTION, FACTOR_SHOCK_FUNCTION, POLICY_CHECK_FUNCTION,
+    PORTFOLIO_PERFORMANCE_FUNCTION, REVERSE_STRESS_FUNCTION, RISK_DECOMPOSITION_FUNCTION,
+    RISK_DRIFT_FUNCTION,
 };
 use compute::experiments::{Experiment, Holding, Portfolio};
 use support::{function_call_response, text_response, MockGeminiClient};
@@ -93,6 +94,89 @@ async fn parses_portfolio_performance_function_call() {
 }
 
 #[tokio::test]
+async fn parses_risk_drift_function_call_with_null_baseline_snapshot_id() {
+    let args = serde_json::json!({ "baseline_snapshot_id": null });
+    let client = MockGeminiClient::new(vec![function_call_response(RISK_DRIFT_FUNCTION, args)]);
+
+    let portfolio = two_stock_portfolio();
+    let experiment = parse_experiment(&client, "what changed in my risk?", portfolio.clone(), &[])
+        .await
+        .unwrap();
+
+    match experiment {
+        Experiment::RiskDrift(input) => {
+            assert_eq!(input.baseline_snapshot_id, None);
+        }
+        other => panic!("expected RiskDrift, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn parses_risk_drift_function_call_with_a_specific_baseline_snapshot_id() {
+    let args = serde_json::json!({ "baseline_snapshot_id": "abc-123" });
+    let client = MockGeminiClient::new(vec![function_call_response(RISK_DRIFT_FUNCTION, args)]);
+
+    let portfolio = two_stock_portfolio();
+    let experiment = parse_experiment(&client, "compare my risk to snapshot abc-123", portfolio.clone(), &[])
+        .await
+        .unwrap();
+
+    match experiment {
+        Experiment::RiskDrift(input) => {
+            assert_eq!(input.baseline_snapshot_id.as_deref(), Some("abc-123"));
+        }
+        other => panic!("expected RiskDrift, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn parses_reverse_stress_function_call_with_null_factor_bounds() {
+    let args = serde_json::json!({ "loss_threshold_inr": 500_000.0, "factor_bounds": null });
+    let client = MockGeminiClient::new(vec![function_call_response(REVERSE_STRESS_FUNCTION, args)]);
+
+    let portfolio = two_stock_portfolio();
+    let experiment = parse_experiment(&client, "what shock would wipe out 5 lakh rupees?", portfolio.clone(), &[])
+        .await
+        .unwrap();
+
+    match experiment {
+        Experiment::ReverseStress(input) => {
+            assert_eq!(input.loss_threshold_inr, 500_000.0);
+            assert!(input.factor_bounds.is_none());
+        }
+        other => panic!("expected ReverseStress, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn parses_reverse_stress_function_call_with_explicit_factor_bounds() {
+    let args = serde_json::json!({
+        "loss_threshold_inr": 500_000.0,
+        "factor_bounds": { "MARKET": [-50.0, 0.0], "BRENT": [-30.0, 80.0] },
+    });
+    let client = MockGeminiClient::new(vec![function_call_response(REVERSE_STRESS_FUNCTION, args)]);
+
+    let portfolio = two_stock_portfolio();
+    let experiment = parse_experiment(
+        &client,
+        "what shock breaks my portfolio if Nifty can only fall 50% and Brent can only move 30%?",
+        portfolio.clone(),
+        &[],
+    )
+    .await
+    .unwrap();
+
+    match experiment {
+        Experiment::ReverseStress(input) => {
+            let bounds = input.factor_bounds.expect("factor_bounds should be present");
+            assert_eq!(bounds.get("MARKET"), Some(&(-50.0, 0.0)));
+            assert_eq!(bounds.get("BRENT"), Some(&(-30.0, 80.0)));
+        }
+        other => panic!("expected ReverseStress, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn parses_cvar_rebalance_function_call() {
     let args = serde_json::json!({
         "per_name_cap": 0.2,
@@ -111,6 +195,60 @@ async fn parses_cvar_rebalance_function_call() {
             assert_eq!(input.per_name_cap, Some(0.2));
             assert_eq!(input.turnover_limit, 0.3);
             assert_eq!(input.portfolio.tickers(), portfolio.tickers());
+        }
+        other => panic!("expected CvarRebalance, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn parses_policy_check_function_call_with_a_partial_policy() {
+    let args = serde_json::json!({
+        "policy": { "max_vol_annualized": 0.18 },
+    });
+    let client = MockGeminiClient::new(vec![function_call_response(POLICY_CHECK_FUNCTION, args)]);
+
+    let portfolio = two_stock_portfolio();
+    let experiment =
+        parse_experiment(&client, "is my portfolio within risk limits?", portfolio.clone(), &[])
+            .await
+            .unwrap();
+
+    match experiment {
+        Experiment::PolicyCheck(input) => {
+            assert_eq!(input.policy.max_vol_annualized, Some(0.18));
+            assert_eq!(input.policy.max_cvar_95, None);
+            assert_eq!(input.policy.max_factor_contribution_share, None);
+            assert_eq!(input.policy.max_position_weight, None);
+            assert_eq!(input.policy.max_turnover, None);
+            assert!(input.policy.max_loss_under_scenarios.is_none());
+        }
+        other => panic!("expected PolicyCheck, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn parses_cvar_rebalance_function_call_with_a_policy_field_attached() {
+    let args = serde_json::json!({
+        "turnover_limit": 0.3,
+        "policy": { "max_vol_annualized": 0.15, "max_position_weight": 0.20 },
+    });
+    let client = MockGeminiClient::new(vec![function_call_response(CVAR_REBALANCE_FUNCTION, args)]);
+
+    let portfolio = two_stock_portfolio();
+    let experiment = parse_experiment(
+        &client,
+        "rebalance to cut tail risk but keep vol under 15% and no name over 20%",
+        portfolio.clone(),
+        &[],
+    )
+    .await
+    .unwrap();
+
+    match experiment {
+        Experiment::CvarRebalance(input) => {
+            let policy = input.policy.expect("policy should be present");
+            assert_eq!(policy.max_vol_annualized, Some(0.15));
+            assert_eq!(policy.max_position_weight, Some(0.20));
         }
         other => panic!("expected CvarRebalance, got {other:?}"),
     }

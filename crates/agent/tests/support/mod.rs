@@ -13,6 +13,8 @@ pub struct MockGeminiClient {
     /// Every request `generate` was called with, oldest first, so tests can
     /// inspect exactly what was sent (e.g. conversation-history ordering).
     requests: Mutex<Vec<GeminiRequest>>,
+    /// Every model string `generate` was called with, oldest first.
+    models: Mutex<Vec<String>>,
 }
 
 impl MockGeminiClient {
@@ -24,6 +26,7 @@ impl MockGeminiClient {
             responses: Mutex::new(responses.into_iter().map(Ok).rev().collect()),
             calls: Mutex::new(0),
             requests: Mutex::new(Vec::new()),
+            models: Mutex::new(Vec::new()),
         }
     }
 
@@ -40,13 +43,28 @@ impl MockGeminiClient {
             .cloned()
             .expect("MockGeminiClient: generate was never called")
     }
+
+    /// The most recent model string `generate` was called with.
+    pub fn last_model(&self) -> String {
+        self.models
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("MockGeminiClient: generate was never called")
+    }
 }
 
 #[async_trait::async_trait]
 impl GeminiClient for MockGeminiClient {
-    async fn generate(&self, request: &GeminiRequest) -> Result<GeminiResponse, GeminiError> {
+    async fn generate(
+        &self,
+        model: &str,
+        request: &GeminiRequest,
+    ) -> Result<GeminiResponse, GeminiError> {
         *self.calls.lock().unwrap() += 1;
         self.requests.lock().unwrap().push(request.clone());
+        self.models.lock().unwrap().push(model.to_string());
         let mut queue = self.responses.lock().unwrap();
         match queue.pop() {
             Some(Ok(resp)) => Ok(resp),

@@ -50,6 +50,9 @@ pub enum Experiment {
     RiskDecomposition(RiskDecompositionInput),
     CvarRebalance(CvarRebalanceInput),
     PortfolioPerformance(PortfolioPerformanceInput),
+    RiskDrift(RiskDriftInput),
+    ReverseStress(ReverseStressInput),
+    PolicyCheck(PolicyCheckInput),
 }
 
 // ---------------------------------------------------------------------
@@ -82,13 +85,6 @@ pub struct FactorShockInput {
     /// `frequency.default_window()` (252 daily, 156 weekly) when omitted.
     #[serde(default)]
     pub window: Option<usize>,
-    /// When true, the model this experiment runs against is fit with
-    /// regime-conditional covariance (see `model::ModelConfig`), and
-    /// (unless the current regime already *is* Crisis) the trace also
-    /// includes `crisis_comparison`: the same shock rerun using the
-    /// crisis-regime factor covariance instead of the current regime's.
-    #[serde(default)]
-    pub regime_covariance: bool,
 }
 
 fn default_true() -> bool {
@@ -199,12 +195,12 @@ pub struct FactorShockOutput {
     /// fitted factor) does not include the rupee move a domestic gold
     /// holder actually realizes.
     pub gold_inr_implied_move: ShockValue,
-    /// Present when `regime_covariance: true` and the current regime is
-    /// not already Crisis: the same shock rerun using the crisis-regime
-    /// factor covariance (`F_crisis`) instead of whichever regime is
-    /// current, to show tail-scenario sensitivity. Absent (not just
-    /// zeroed) when the current regime already is Crisis, since a "crisis
-    /// vs. crisis" comparison would be a no-op.
+    /// Present unless the current regime already *is* Crisis: the same
+    /// shock rerun using the crisis-regime factor covariance (`F_crisis`)
+    /// instead of whichever regime is current, to show tail-scenario
+    /// sensitivity. Absent (not just zeroed) when the current regime
+    /// already is Crisis, since a "crisis vs. crisis" comparison would be a
+    /// no-op.
     pub crisis_comparison: Option<CrisisComparisonOutput>,
     pub crisis_comparison_note: Option<&'static str>,
 }
@@ -276,8 +272,9 @@ fn conditional_expectation(
 
 /// Everything from a single shock-propagation-and-pricing pass that
 /// depends on which factor covariance was used. Computed once against the
-/// model's own (current-regime, if `regime_covariance`) `F`, and again
-/// against `F_crisis` when a crisis comparison is requested.
+/// model's own (always current-regime) `F`, and again against `F_crisis`
+/// when a crisis comparison is needed (current regime isn't already
+/// Crisis).
 struct ShockComputation {
     full_shock: Vec<f64>,
     implied_computation: BTreeMap<String, f64>,
@@ -499,41 +496,37 @@ pub fn run_factor_shock(
     let invariants = primary.invariants;
 
     const CRISIS_REGIME: usize = 2;
-    let (crisis_comparison, crisis_comparison_note) = if input.regime_covariance {
-        match &model.regime_state {
-            Some(state) if state.current_regime as usize != CRISIS_REGIME => {
-                let f_crisis = model
-                    .factor_covariance_for_regime(CRISIS_REGIME)
-                    .expect("regime_covariance requested and regime_state present implies regime_factor_covariance_daily present");
-                let crisis = propagate_and_price(
-                    &f_crisis,
-                    model,
-                    input,
-                    &factor_names,
-                    &known_idx,
-                    &known_vals,
-                    &unknown_idx,
-                )?;
-                let crisis_implied_shocks: BTreeMap<String, ShockValue> = crisis
-                    .implied_computation
-                    .iter()
-                    .map(|(k, v)| (k.clone(), to_shock_value(*v)))
-                    .collect();
-                (
-                    Some(CrisisComparisonOutput {
-                        implied_shocks: crisis_implied_shocks,
-                        per_holding: crisis.per_holding,
-                        portfolio_pnl_inr: crisis.portfolio_pnl_inr,
-                        portfolio_log_pnl_inr: crisis.portfolio_log_pnl_inr,
-                        factor_attribution_log_inr: crisis.factor_attribution_log_inr,
-                    }),
-                    Some("Rerun using crisis-regime covariance to show tail-scenario sensitivity"),
-                )
-            }
-            _ => (None, None),
+    let (crisis_comparison, crisis_comparison_note) = match &model.regime_state {
+        Some(state) if state.current_regime as usize != CRISIS_REGIME => {
+            let f_crisis = model
+                .factor_covariance_for_regime(CRISIS_REGIME)
+                .expect("regime-conditioning is unconditional, so regime_factor_covariance_daily is always present");
+            let crisis = propagate_and_price(
+                &f_crisis,
+                model,
+                input,
+                &factor_names,
+                &known_idx,
+                &known_vals,
+                &unknown_idx,
+            )?;
+            let crisis_implied_shocks: BTreeMap<String, ShockValue> = crisis
+                .implied_computation
+                .iter()
+                .map(|(k, v)| (k.clone(), to_shock_value(*v)))
+                .collect();
+            (
+                Some(CrisisComparisonOutput {
+                    implied_shocks: crisis_implied_shocks,
+                    per_holding: crisis.per_holding,
+                    portfolio_pnl_inr: crisis.portfolio_pnl_inr,
+                    portfolio_log_pnl_inr: crisis.portfolio_log_pnl_inr,
+                    factor_attribution_log_inr: crisis.factor_attribution_log_inr,
+                }),
+                Some("Rerun using crisis-regime covariance to show tail-scenario sensitivity"),
+            )
         }
-    } else {
-        (None, None)
+        _ => (None, None),
     };
 
     let output = FactorShockOutput {
@@ -565,8 +558,10 @@ pub fn run_factor_shock(
     };
 
     let trace = EvidenceTrace {
+        id: crate::trace::new_trace_id(),
         experiment: "FactorShock".to_string(),
         inputs: serde_json::to_value(input)?,
+        data_as_of: crate::trace::data_as_of(&data_window),
         data_window,
         data_quality: data_quality.clone(),
         model_params: ModelParams {
@@ -585,6 +580,11 @@ pub fn run_factor_shock(
         }),
         invariants,
         engine_version: crate::trace::engine_version(),
+        engine_commit: crate::trace::engine_commit(),
+        scenario_provenance: None,
+        parent_trace_ids: Vec::new(),
+        baseline_model_params: None,
+        policy_result: None,
     };
 
     Ok((output, trace))
@@ -603,13 +603,6 @@ pub struct RiskDecompositionInput {
     /// `frequency.default_window()` (252 daily, 156 weekly) when omitted.
     #[serde(default)]
     pub window: Option<usize>,
-    /// When true, the model this experiment runs against is fit with
-    /// regime-conditional covariance (see `model::ModelConfig`): vol and
-    /// Euler contributions then use the *current* regime's factor
-    /// covariance rather than the full window's. Which regime that was is
-    /// recorded in the trace's `model_params.regime_state`.
-    #[serde(default)]
-    pub regime_covariance: bool,
 }
 
 impl RiskDecompositionInput {
@@ -639,6 +632,15 @@ pub struct RiskDecompositionOutput {
     pub by_factor: Vec<FactorContribution>,
     pub specific_risk_contribution: f64,
     pub specific_risk_fraction_of_vol: f64,
+    /// Portfolio-level factor exposure, `Sum_i w_i * beta_ik`, per factor.
+    /// Added so `RiskDrift` can compare beta exposure across two
+    /// snapshots without re-fitting the baseline's own factor model (which
+    /// the trace alone doesn't retain enough to do -- see the `drift`
+    /// module doc).
+    pub portfolio_betas: BTreeMap<String, f64>,
+    /// Factor correlation matrix at fit time. Added for the same reason as
+    /// `portfolio_betas` -- `RiskDrift`'s correlation-drift comparison.
+    pub factor_correlation: CorrelationMatrix,
 }
 
 pub fn run_risk_decomposition(
@@ -705,6 +707,16 @@ pub fn run_risk_decomposition(
         0.0
     };
 
+    let portfolio_betas: BTreeMap<String, f64> =
+        factor_names.iter().enumerate().map(|(k, name)| (name.clone(), x[k])).collect();
+    let corr = model.factor_correlation();
+    let factor_correlation = CorrelationMatrix {
+        factor_names: factor_names.clone(),
+        rows: (0..factor_names.len())
+            .map(|i| (0..factor_names.len()).map(|j| corr[(i, j)]).collect())
+            .collect(),
+    };
+
     let stock_sum: f64 = by_stock.iter().map(|s| s.contribution).sum();
     let factor_plus_specific: f64 =
         by_factor.iter().map(|f| f.contribution).sum::<f64>() + specific_risk_contribution;
@@ -729,11 +741,15 @@ pub fn run_risk_decomposition(
         } else {
             0.0
         },
+        portfolio_betas,
+        factor_correlation,
     };
 
     let trace = EvidenceTrace {
+        id: crate::trace::new_trace_id(),
         experiment: "RiskDecomposition".to_string(),
         inputs: serde_json::to_value(input)?,
+        data_as_of: crate::trace::data_as_of(&data_window),
         data_window,
         data_quality: data_quality.clone(),
         model_params: ModelParams {
@@ -749,6 +765,11 @@ pub fn run_risk_decomposition(
         outputs: serde_json::json!({ "result": output }),
         invariants,
         engine_version: crate::trace::engine_version(),
+        engine_commit: crate::trace::engine_commit(),
+        scenario_provenance: None,
+        parent_trace_ids: Vec::new(),
+        baseline_model_params: None,
+        policy_result: None,
     };
 
     Ok((output, trace))
@@ -765,3 +786,21 @@ pub use crate::cvar::CvarRebalanceInput;
 // ---------------------------------------------------------------------
 
 pub use crate::performance::PortfolioPerformanceInput;
+
+// ---------------------------------------------------------------------
+// (e) RiskDrift — see crate::drift.
+// ---------------------------------------------------------------------
+
+pub use crate::drift::RiskDriftInput;
+
+// ---------------------------------------------------------------------
+// (f) ReverseStress — see crate::reverse_stress.
+// ---------------------------------------------------------------------
+
+pub use crate::reverse_stress::ReverseStressInput;
+
+// ---------------------------------------------------------------------
+// (g) PolicyCheck — see crate::policy.
+// ---------------------------------------------------------------------
+
+pub use crate::policy::PolicyCheckInput;
