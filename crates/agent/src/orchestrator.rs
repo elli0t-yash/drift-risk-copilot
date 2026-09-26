@@ -85,6 +85,21 @@ parameters. Available tools and their params:
 - cvar_rebalance: propose a rebalance that reduces tail risk (CVaR) within a turnover budget. params: {turnover_limit, confidence_level?, per_name_cap?, commission_bps?}
 - policy_check: check the portfolio against risk limits. params: {policy: {max_vol_annualized?, max_cvar_95?, max_factor_contribution_share?, max_position_weight?}}
 - portfolio_performance: realized historical performance over a trailing window. params: {frequency?, window?}
+- decline: the message has nothing to do with this portfolio's risk, performance, or a market \
+scenario (e.g. small talk, general knowledge, something unrelated like the weather). params: {}. \
+reason must be exactly the one-sentence, polite decline to show the user directly (not a note to \
+yourself) -- e.g. \"I can only help with questions about your portfolio's risk and performance.\" \
+This must be the only entry in the array when used.
+
+- If the user asks about a specific stock, best/worst performer, or individual holding returns, use \
+portfolio_performance -- it includes per-holding data.
+- If the user asks a follow-up that references a prior result ('now reduce it', 'what about a bigger \
+crash', 'which stock is dragging me down'), infer the experiment from context -- do not ask for \
+clarification.
+- If the user asks what to do, what action to take, or how to fix their portfolio, select \
+cvar_rebalance.
+- If the user expresses concern about a market event ('what if RBI raises rates', 'what about the US \
+election', 'crude is spiking'), select factor_shock with the relevant factor shocked.
 
 Respond with ONLY a JSON array, no prose, no markdown code fences: \
 [{\"tool\": <tool name>, \"params\": <object>, \"reason\": <one short sentence>}, ...]. \
@@ -101,12 +116,23 @@ pub enum OrchestratorError {
     Gemini(#[from] crate::gemini::GeminiError),
     #[error("failed to (de)serialize tool params: {0}")]
     Serialize(#[from] serde_json::Error),
+    /// The planning call decided the message doesn't relate to the
+    /// portfolio at all (see `PLANNING_SYSTEM_PROMPT`'s `decline` tool) --
+    /// the model's own one-sentence decline, to return to the caller
+    /// as-is. Mirrors `parse::ParseError::Unrecognised`'s contract from
+    /// the pre-orchestrator single-tool pipeline (a 422, not a 500 --
+    /// see `server::backend`'s `From` impl).
+    #[error("{0}")]
+    Unrecognised(String),
 }
 
 /// Runs the planning call and parses its response into `Vec<ToolPlan>`,
 /// falling back to a single `current_risk` plan (recording the raw
 /// response either way) if the response isn't valid JSON, isn't an array,
-/// or is empty. Returns `(plans, raw_response_text)`.
+/// or is empty. Returns `(plans, raw_response_text)` -- except when the
+/// plan is a single `decline` entry (see `PLANNING_SYSTEM_PROMPT`), which
+/// returns `Err(OrchestratorError::Unrecognised)` instead: an off-topic
+/// message runs no tool at all, rather than falling back to one.
 pub async fn plan_tools<C: GeminiClient>(
     client: &C,
     user_message: &str,
@@ -134,6 +160,9 @@ pub async fn plan_tools<C: GeminiClient>(
 
     let plans = parse_plan_response(&raw);
     match plans {
+        Some(plans) if plans.len() == 1 && plans[0].tool == "decline" => {
+            Err(OrchestratorError::Unrecognised(plans[0].reason.clone()))
+        }
         Some(plans) if !plans.is_empty() => Ok((plans, raw)),
         _ => Ok((
             vec![ToolPlan {

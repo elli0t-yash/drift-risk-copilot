@@ -202,9 +202,17 @@ fn approx_eq(a: f64, b: f64, relative_tolerance: f64) -> bool {
 pub fn check_grounding(narration: &str, trace_numbers: &[f64]) -> GroundingCheck {
     let mut check = GroundingCheck::default();
     for extracted in extract_numbers(narration) {
+        // Matches the extracted value against a trace number either
+        // signed or negated: the conversational narration style (see
+        // `NARRATE_SYSTEM_PROMPT`) routinely conveys a loss/decline's sign
+        // through the surrounding words instead of a literal minus sign
+        // ("lost 17.8%", "a drawdown of 20.4%"), which is exactly the
+        // magnitude a negative trace value like `total_return_pct: -17.8`
+        // grounds, just without the model repeating the sign character.
+        // Caught live verifying this session's narration style change.
         let is_match = trace_numbers
             .iter()
-            .any(|&t| approx_eq(extracted.value, t, RELATIVE_TOLERANCE));
+            .any(|&t| approx_eq(extracted.value, t, RELATIVE_TOLERANCE) || approx_eq(-extracted.value, t, RELATIVE_TOLERANCE));
         if is_match {
             check.matched.push(extracted.value);
         } else {
