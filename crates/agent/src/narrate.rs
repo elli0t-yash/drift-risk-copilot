@@ -32,7 +32,7 @@ Experiment-specific guidance (use as a checklist, not a template \u{2014} the re
 
 Portfolio performance:
 - Lead with whether the portfolio made or lost money and by how much (total_return_pct).
-- Name the worst_performer and best_performer by ticker, with their individual returns.
+- Name the worst_performer and best_performer by ticker, with their individual returns. When citing a holding's return, use that holding's own total_return_pct from holding_returns, not the portfolio-level total_return_pct. These are different numbers \u{2014} conflating them is misleading.
 - State max drawdown in plain English.
 - Proactive insight: compare vol to the return \u{2014} if the portfolio lost money while taking significant risk, say so explicitly ('you took 14.7% annualised vol for a \u{2212}17.8% return \u{2014} the risk wasn't rewarded').
 
