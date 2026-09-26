@@ -52,6 +52,15 @@ impl From<agent::parse::ParseError> for BackendError {
     }
 }
 
+impl From<agent::orchestrator::OrchestratorError> for BackendError {
+    fn from(err: agent::orchestrator::OrchestratorError) -> Self {
+        match err {
+            agent::orchestrator::OrchestratorError::Gemini(g) => BackendError::from(g),
+            other => BackendError::Internal(other.to_string()),
+        }
+    }
+}
+
 impl From<agent::narrate::NarrateError> for BackendError {
     fn from(err: agent::narrate::NarrateError) -> Self {
         match err {
@@ -73,10 +82,13 @@ impl From<agent::suggest::SuggestError> for BackendError {
 impl From<agent::pipeline::PipelineError> for BackendError {
     fn from(err: agent::pipeline::PipelineError) -> Self {
         match err {
-            agent::pipeline::PipelineError::Parse(p) => BackendError::from(p),
+            agent::pipeline::PipelineError::Orchestrator(o) => BackendError::from(o),
             agent::pipeline::PipelineError::Compute(c) => BackendError::Compute(c.to_string()),
             agent::pipeline::PipelineError::Narrate(n) => BackendError::from(n),
             agent::pipeline::PipelineError::Suggest(s) => BackendError::from(s),
+            agent::pipeline::PipelineError::AllToolsFailed(errors) => {
+                BackendError::Compute(format!("every planned tool failed: {errors:?}"))
+            }
         }
     }
 }
@@ -168,15 +180,15 @@ impl Backend for RealBackend {
         conversation_history: Vec<ConversationTurn>,
         policy: Option<RiskPolicy>,
     ) -> Result<PipelineResult, BackendError> {
-        let result = agent::pipeline::run(
-            &self.gemini,
-            &message,
-            portfolio,
-            &conversation_history,
-            self.store.clone(),
+        let holdings: Vec<(String, f64)> =
+            portfolio.holdings.iter().map(|h| (h.ticker.clone(), h.weight)).collect();
+        let ctx = compute::context::ExperimentContext {
+            store: self.store.clone(),
+            portfolio_hash: compute::portfolio::portfolio_hash(&holdings),
             policy,
-        )
-        .await?;
+        };
+        let result =
+            agent::pipeline::run(&self.gemini, &message, portfolio, &conversation_history, &ctx).await?;
         Ok(result)
     }
 }

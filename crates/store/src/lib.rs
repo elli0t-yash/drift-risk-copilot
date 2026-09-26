@@ -72,6 +72,11 @@ CREATE TABLE IF NOT EXISTS risk_snapshots (
 );
 CREATE INDEX IF NOT EXISTS risk_snapshots_portfolio_hash_created_at
     ON risk_snapshots (portfolio_hash, created_at);
+CREATE TABLE IF NOT EXISTS agent_execution_traces (
+    id          TEXT PRIMARY KEY,
+    created_at  TEXT NOT NULL,
+    execution_trace_json TEXT NOT NULL
+);
 ";
 
 /// Columns added after the table's initial release. SQLite has no `ALTER
@@ -195,6 +200,38 @@ impl SnapshotStore {
             .query_map(params![limit as i64], row_to_snapshot)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Persists `execution_trace_json` (an `agent::AgentExecutionTrace`,
+    /// serialized -- this crate has no dependency on `agent`, so it's
+    /// stored opaquely as JSON, same as `RiskSnapshot::trace_json`), under
+    /// its own already-generated `id` (unlike `insert`, which always
+    /// assigns a fresh one -- `AgentExecutionTrace::id` is generated once,
+    /// by `agent::pipeline::run`, and `GET /execution-trace/{id}` needs to
+    /// be able to look it up by that same id the caller already has from
+    /// `AskResponse`).
+    pub fn insert_execution_trace(&self, id: &str, execution_trace_json: &str) -> Result<()> {
+        let created_at = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agent_execution_traces (id, created_at, execution_trace_json)
+             VALUES (?1, ?2, ?3)",
+            params![id, created_at, execution_trace_json],
+        )?;
+        Ok(())
+    }
+
+    /// The raw `execution_trace_json` stored for `id`, or `None` if unknown.
+    pub fn get_execution_trace(&self, id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT execution_trace_json FROM agent_execution_traces WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(row)
     }
 }
 
@@ -361,6 +398,21 @@ mod tests {
         assert_eq!(fetched.narration, new_snapshot.narration);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn execution_trace_round_trips_through_the_store() {
+        let store = SnapshotStore::open(":memory:").unwrap();
+        store.insert_execution_trace("exec-1", r#"{"id":"exec-1","narration":"hi"}"#).unwrap();
+
+        let fetched = store.get_execution_trace("exec-1").unwrap();
+        assert_eq!(fetched.as_deref(), Some(r#"{"id":"exec-1","narration":"hi"}"#));
+    }
+
+    #[test]
+    fn get_execution_trace_returns_none_for_an_unknown_id() {
+        let store = SnapshotStore::open(":memory:").unwrap();
+        assert!(store.get_execution_trace("nonexistent").unwrap().is_none());
     }
 
     #[test]

@@ -71,6 +71,7 @@ fn build_router(state: AppState) -> Router {
         .route("/experiment", post(routes::post_experiment))
         .route("/ask", post(routes::post_ask))
         .route("/report/:result_id", get(routes::get_report))
+        .route("/execution-trace/:id", get(routes::get_execution_trace))
         .route("/drift", get(routes::get_drift))
         .route("/portfolio/upload", post(upload::post_portfolio_upload))
         .fallback(routes::static_handler)

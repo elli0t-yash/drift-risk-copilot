@@ -19,11 +19,37 @@ fn percent_and_negative_sign_are_normalised_to_a_decimal_fraction() {
     assert!((numbers[0].value - (-0.12)).abs() < 1e-9);
 }
 
+/// Regression test for a second bug caught in this session's live
+/// verification: `NARRATE_SYSTEM_PROMPT` mandates the abbreviated `₹X.XL`
+/// / `₹X.XCr` forms (not the spelled-out word "lakh"/"crore") for amounts
+/// above ₹1L, but the regex used to only recognize "lakh"/"crore" --
+/// every compliant narration was spuriously flagged as ungrounded.
+#[test]
+fn abbreviated_l_and_cr_suffixes_are_recognised() {
+    let numbers = extract_numbers("Your portfolio would lose approximately \u{20b9}12.0L, or \u{20b9}1.2Cr in a worse case.");
+    assert_eq!(numbers.len(), 2);
+    assert!((numbers[0].value - 1_200_000.0).abs() < 1e-6, "got {}", numbers[0].value);
+    assert!((numbers[1].value - 12_000_000.0).abs() < 1e-6, "got {}", numbers[1].value);
+}
+
 #[test]
 fn plain_number_with_thousands_separators_is_normalised() {
     let numbers = extract_numbers("Portfolio P&L: -1,175,389 INR.");
     assert_eq!(numbers.len(), 1);
     assert!((numbers[0].value - (-1_175_389.0)).abs() < 1e-6);
+}
+
+/// Regression test for a bug caught in this session's live verification:
+/// Gemini writes a negative rupee amount as "−₹11,95,069" (minus, then
+/// the rupee sign, then Indian-grouped digits) -- the sign must still be
+/// picked up even though it precedes ₹ rather than the digits themselves,
+/// or a real loss gets misread as a positive number and wrongly flagged
+/// as ungrounded.
+#[test]
+fn a_minus_sign_before_the_rupee_symbol_is_still_applied() {
+    let numbers = extract_numbers("Your portfolio would lose approximately \u{2212}\u{20b9}11,95,069.");
+    assert_eq!(numbers.len(), 1);
+    assert!((numbers[0].value - (-1_195_069.0)).abs() < 1e-6, "got {}", numbers[0].value);
 }
 
 #[test]
@@ -102,8 +128,10 @@ fn sample_trace() -> compute::trace::EvidenceTrace {
     use compute::trace::{DataWindow, EvidenceTrace, ModelParams};
 
     EvidenceTrace {
+        id: compute::trace::new_trace_id(),
         experiment: "RiskDecomposition".to_string(),
         inputs: serde_json::json!({}),
+        data_as_of: "2026-09-24T00:00:00Z".to_string(),
         data_window: DataWindow {
             frequency: Frequency::Daily,
             window_periods: 252,
@@ -129,6 +157,9 @@ fn sample_trace() -> compute::trace::EvidenceTrace {
         outputs: serde_json::json!({ "result": { "portfolio_vol_annualized": 0.1552 } }),
         invariants: vec![],
         engine_version: "0.1.0".to_string(),
+        engine_commit: compute::trace::engine_commit(),
+        scenario_provenance: None,
+        parent_trace_ids: Vec::new(),
         baseline_model_params: None,
         policy_result: None,
     }

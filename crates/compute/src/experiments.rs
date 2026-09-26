@@ -558,8 +558,10 @@ pub fn run_factor_shock(
     };
 
     let trace = EvidenceTrace {
+        id: crate::trace::new_trace_id(),
         experiment: "FactorShock".to_string(),
         inputs: serde_json::to_value(input)?,
+        data_as_of: crate::trace::data_as_of(&data_window),
         data_window,
         data_quality: data_quality.clone(),
         model_params: ModelParams {
@@ -578,6 +580,9 @@ pub fn run_factor_shock(
         }),
         invariants,
         engine_version: crate::trace::engine_version(),
+        engine_commit: crate::trace::engine_commit(),
+        scenario_provenance: None,
+        parent_trace_ids: Vec::new(),
         baseline_model_params: None,
         policy_result: None,
     };
@@ -741,8 +746,10 @@ pub fn run_risk_decomposition(
     };
 
     let trace = EvidenceTrace {
+        id: crate::trace::new_trace_id(),
         experiment: "RiskDecomposition".to_string(),
         inputs: serde_json::to_value(input)?,
+        data_as_of: crate::trace::data_as_of(&data_window),
         data_window,
         data_quality: data_quality.clone(),
         model_params: ModelParams {
@@ -758,6 +765,9 @@ pub fn run_risk_decomposition(
         outputs: serde_json::json!({ "result": output }),
         invariants,
         engine_version: crate::trace::engine_version(),
+        engine_commit: crate::trace::engine_commit(),
+        scenario_provenance: None,
+        parent_trace_ids: Vec::new(),
         baseline_model_params: None,
         policy_result: None,
     };

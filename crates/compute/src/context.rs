@@ -10,6 +10,7 @@ use store::SnapshotStore;
 
 use crate::policy::RiskPolicy;
 
+#[derive(Clone)]
 pub struct ExperimentContext {
     pub store: Arc<SnapshotStore>,
     /// The current request's portfolio, hashed the same way

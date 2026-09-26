@@ -159,6 +159,12 @@ pub struct AskResponse {
     /// Stored under this id in the persistent `SnapshotStore`;
     /// `GET /report/{result_id}` renders it as a PDF.
     pub result_id: String,
+    /// A record of the orchestration itself (the planning call, each
+    /// tool's execution, the combined narration/grounding outcome) --
+    /// distinct from `trace`, which records the *experiment's* evidence.
+    /// Also independently retrievable via
+    /// `GET /execution-trace/{agent_execution_trace.id}`.
+    pub agent_execution_trace: agent::AgentExecutionTrace,
 }
 
 pub async fn post_ask(
@@ -187,6 +193,16 @@ pub async fn post_ask(
         ApiError::bad_request("internal_error", format!("failed to persist risk snapshot: {e}"))
     })?;
 
+    let execution_trace_json = serde_json::to_string(&result.execution_trace).map_err(|e| {
+        ApiError::bad_request("internal_error", format!("failed to serialize execution trace: {e}"))
+    })?;
+    state
+        .store
+        .insert_execution_trace(&result.execution_trace.id, &execution_trace_json)
+        .map_err(|e| {
+            ApiError::bad_request("internal_error", format!("failed to persist execution trace: {e}"))
+        })?;
+
     Ok(Json(AskResponse {
         experiment: result.experiment,
         trace: result.trace,
@@ -195,7 +211,25 @@ pub async fn post_ask(
         assistant_turn: result.assistant_turn,
         suggestion: result.suggestion,
         result_id,
+        agent_execution_trace: result.execution_trace,
     }))
+}
+
+/// `GET /execution-trace/{id}`: the full `AgentExecutionTrace` for a prior
+/// `/ask` call. 404 if `id` is unknown.
+pub async fn get_execution_trace(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<agent::AgentExecutionTrace>, ApiError> {
+    let json = state
+        .store
+        .get_execution_trace(&id)
+        .map_err(|e| ApiError::bad_request("internal_error", format!("failed to read snapshot store: {e}")))?
+        .ok_or_else(|| ApiError::not_found("execution_trace_not_found", format!("no stored execution trace for id {id}")))?;
+    let trace: agent::AgentExecutionTrace = serde_json::from_str(&json).map_err(|e| {
+        ApiError::bad_request("internal_error", format!("stored execution_trace_json is invalid: {e}"))
+    })?;
+    Ok(Json(trace))
 }
 
 /// Serves the embedded single-page UI for every unmatched path, so the

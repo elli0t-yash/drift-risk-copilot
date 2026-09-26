@@ -74,8 +74,10 @@ fn risk_decomposition_result(
     let mut data_window = sample_data_window();
     data_window.end = end_date;
     let trace = EvidenceTrace {
+        id: compute::trace::new_trace_id(),
         experiment: "RiskDecomposition".to_string(),
         inputs: serde_json::json!({}),
+        data_as_of: compute::trace::data_as_of(&data_window),
         data_window,
         data_quality: sample_data_quality(),
         model_params: ModelParams {
@@ -91,6 +93,9 @@ fn risk_decomposition_result(
         outputs: serde_json::json!({ "result": output }),
         invariants: vec![],
         engine_version: "0.1.0".to_string(),
+        engine_commit: compute::trace::engine_commit(),
+        scenario_provenance: None,
+        parent_trace_ids: Vec::new(),
         baseline_model_params: None,
         policy_result: None,
     };

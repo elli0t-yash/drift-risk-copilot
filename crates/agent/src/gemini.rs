@@ -150,7 +150,14 @@ pub trait GeminiClient: Send + Sync {
 }
 
 /// The real client: POSTs to Gemini's `generateContent` endpoint, retrying
-/// up to `MAX_ATTEMPTS` times with exponential backoff on 429/503.
+/// up to `MAX_ATTEMPTS` times with exponential backoff on 429/503, on a
+/// transport-level send failure (DNS hiccup, connection reset, TLS
+/// handshake failure), and on a response body read/decode failure --
+/// caught live in this session's verification, all three occurring on an
+/// otherwise-successful run against a real network. Previously only the
+/// 429/503 case retried; a `send()`/body-read failure propagated
+/// immediately via `?`, with no retry at all, even though it's no less
+/// transient than a 503.
 pub struct HttpGeminiClient {
     http: reqwest::Client,
     api_key: String,
@@ -178,16 +185,47 @@ impl GeminiClient for HttpGeminiClient {
         let mut attempt = 0u32;
         loop {
             attempt += 1;
-            let resp = self
+            let retry_or_return = |err: GeminiError, attempt: u32| async move {
+                if attempt < MAX_ATTEMPTS {
+                    let backoff = Duration::from_millis(250 * 2u64.pow(attempt - 1));
+                    tokio::time::sleep(backoff).await;
+                    None
+                } else {
+                    Some(err)
+                }
+            };
+
+            // The API key is sent as a header, not a `?key=...` query
+            // parameter: `reqwest::Error`'s `Display` (surfaced via
+            // `GeminiError::Http`) includes the request URL on a
+            // transport-level failure (DNS, TLS, connect timeout, etc.),
+            // which would otherwise leak the key into logs/error
+            // responses. Gemini's `generateContent` accepts either form;
+            // this sidesteps the leak vector entirely rather than relying
+            // on scrubbing every place an error might surface.
+            let sent = self
                 .http
                 .post(&url)
-                .query(&[("key", self.api_key.as_str())])
+                .header("x-goog-api-key", &self.api_key)
                 .json(request)
                 .send()
-                .await?;
+                .await;
+            let resp = match sent {
+                Ok(resp) => resp,
+                Err(e) => match retry_or_return(GeminiError::Http(e), attempt).await {
+                    None => continue,
+                    Some(e) => return Err(e),
+                },
+            };
             let status = resp.status();
             if status.is_success() {
-                let text = resp.text().await?;
+                let text = match resp.text().await {
+                    Ok(text) => text,
+                    Err(e) => match retry_or_return(GeminiError::Http(e), attempt).await {
+                        None => continue,
+                        Some(e) => return Err(e),
+                    },
+                };
                 let body: GeminiResponse = serde_json::from_str(&text)?;
                 return Ok(body);
             }

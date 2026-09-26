@@ -51,8 +51,10 @@ fn sample_regime_state() -> RegimeState {
 
 fn sample_trace() -> EvidenceTrace {
     EvidenceTrace {
+        id: compute::trace::new_trace_id(),
         experiment: "RiskDecomposition".to_string(),
         inputs: serde_json::json!({}),
+        data_as_of: "2026-09-24T00:00:00Z".to_string(),
         data_window: DataWindow {
             frequency: Frequency::Daily,
             window_periods: 252,
@@ -78,8 +80,37 @@ fn sample_trace() -> EvidenceTrace {
         outputs: serde_json::json!({ "result": { "portfolio_vol_annualized": 0.1552 } }),
         invariants: vec![],
         engine_version: "0.1.0".to_string(),
+        engine_commit: compute::trace::engine_commit(),
+        scenario_provenance: None,
+        parent_trace_ids: Vec::new(),
         baseline_model_params: None,
         policy_result: None,
+    }
+}
+
+fn sample_execution_trace() -> agent::AgentExecutionTrace {
+    agent::AgentExecutionTrace {
+        id: "exec-trace-id".to_string(),
+        created_at: "2026-01-01T00:00:00Z".to_string(),
+        user_message: "what's my portfolio risk?".to_string(),
+        planning_response_raw: r#"[{"tool":"current_risk","params":{},"reason":"test"}]"#.to_string(),
+        tool_plans: vec![agent::ToolPlan {
+            tool: "current_risk".to_string(),
+            params: serde_json::json!({}),
+            reason: "test".to_string(),
+        }],
+        tool_results: vec![agent::ToolResult {
+            tool: "current_risk".to_string(),
+            trace_id: "trace-id".to_string(),
+            latency_ms: 5,
+            success: true,
+            error: None,
+        }],
+        narration: "Vol is 15.5% annualised.".to_string(),
+        grounding_status: agent::GroundingStatus { passed: true, warnings: vec![], retry_count: 0 },
+        suggestion: "What if I reduce my turnover to 20%?".to_string(),
+        total_latency_ms: 10,
+        gemini_calls: 3,
     }
 }
 
@@ -128,12 +159,15 @@ impl Backend for MockBackend {
             .map(|r| agent::pipeline::PipelineResult {
                 experiment: r.experiment.clone(),
                 trace: r.trace.clone(),
+                traces: r.traces.clone(),
+                tool_plans: r.tool_plans.clone(),
                 narration: agent::grounding::GroundedNarration {
                     narration: r.narration.narration.clone(),
                     grounding_warnings: r.narration.grounding_warnings.clone(),
                 },
                 assistant_turn: r.assistant_turn.clone(),
                 suggestion: r.suggestion.clone(),
+                execution_trace: r.execution_trace.clone(),
             })
             .ok_or_else(|| BackendError::Internal("no mock ask result configured".to_string()))
     }
@@ -274,6 +308,8 @@ async fn ask_with_mocked_pipeline_returns_grounding_warnings() {
             window: None,
         }),
         trace: sample_trace(),
+        traces: vec![sample_trace()],
+        tool_plans: vec![],
         narration: agent::grounding::GroundedNarration {
             narration: "Vol is 99% (unverified).".to_string(),
             grounding_warnings: vec![
@@ -282,6 +318,7 @@ async fn ask_with_mocked_pipeline_returns_grounding_warnings() {
         },
         assistant_turn: agent::ConversationTurn::assistant("Vol is 99% (unverified)."),
         suggestion: "What if I reduce my turnover to 20%?".to_string(),
+        execution_trace: sample_execution_trace(),
     };
     let app = app_with_backend(MockBackend {
         experiment_result: None,
@@ -327,12 +364,15 @@ async fn ask_with_non_empty_conversation_history_forwards_it_to_the_backend() {
             window: None,
         }),
         trace: sample_trace(),
+        traces: vec![sample_trace()],
+        tool_plans: vec![],
         narration: agent::grounding::GroundedNarration {
             narration: "Vol is 15.5% annualised.".to_string(),
             grounding_warnings: vec![],
         },
         assistant_turn: agent::ConversationTurn::assistant("Vol is 15.5% annualised."),
         suggestion: "Now reduce my tail risk with 20% turnover?".to_string(),
+        execution_trace: sample_execution_trace(),
     };
     let backend = Arc::new(MockBackend {
         experiment_result: None,
@@ -384,12 +424,15 @@ async fn report_route_returns_pdf_for_a_result_stored_by_a_prior_ask() {
             window: None,
         }),
         trace: sample_trace(),
+        traces: vec![sample_trace()],
+        tool_plans: vec![],
         narration: agent::grounding::GroundedNarration {
             narration: "Vol is 15.5% annualised.".to_string(),
             grounding_warnings: vec![],
         },
         assistant_turn: agent::ConversationTurn::assistant("Vol is 15.5% annualised."),
         suggestion: "Now reduce my tail risk?".to_string(),
+        execution_trace: sample_execution_trace(),
     };
     let app = app_with_backend(MockBackend {
         experiment_result: None,
@@ -467,6 +510,94 @@ async fn report_route_returns_404_for_an_unknown_id() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn execution_trace_route_returns_404_for_an_unknown_id() {
+    let app = app_with_backend(MockBackend {
+        experiment_result: None,
+        experiment_error: None,
+        ask_result: None,
+        received_conversation_history: Mutex::new(None),
+        received_policy: Mutex::new(None),
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/execution-trace/nonexistent-id")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn execution_trace_route_returns_the_trace_stored_by_a_prior_ask() {
+    let pipeline_result = agent::pipeline::PipelineResult {
+        experiment: Experiment::RiskDecomposition(RiskDecompositionInput {
+            portfolio: sample_portfolio(),
+            frequency: Frequency::Daily,
+            window: None,
+        }),
+        trace: sample_trace(),
+        traces: vec![sample_trace()],
+        tool_plans: vec![],
+        narration: agent::grounding::GroundedNarration {
+            narration: "Vol is 15.5% annualised.".to_string(),
+            grounding_warnings: vec![],
+        },
+        assistant_turn: agent::ConversationTurn::assistant("Vol is 15.5% annualised."),
+        suggestion: "What if I reduce my turnover to 20%?".to_string(),
+        execution_trace: sample_execution_trace(),
+    };
+    let app = app_with_backend(MockBackend {
+        experiment_result: None,
+        experiment_error: None,
+        ask_result: Some(pipeline_result),
+        received_conversation_history: Mutex::new(None),
+        received_policy: Mutex::new(None),
+    });
+
+    let req_body = serde_json::json!({
+        "portfolio": sample_portfolio(),
+        "message": "what's my portfolio risk?",
+    });
+    let ask_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ask")
+                .header("content-type", "application/json")
+                .body(Body::from(req_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ask_response.status(), StatusCode::OK);
+    let ask_body = body_json(ask_response).await;
+    let execution_trace_id = ask_body["agent_execution_trace"]["id"].as_str().unwrap().to_string();
+    assert_eq!(ask_body["agent_execution_trace"]["gemini_calls"], 3);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/execution-trace/{execution_trace_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["id"], execution_trace_id);
+    assert_eq!(body["narration"], "Vol is 15.5% annualised.");
+    assert_eq!(body["gemini_calls"], 3);
 }
 
 #[tokio::test]

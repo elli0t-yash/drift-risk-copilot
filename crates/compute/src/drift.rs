@@ -282,14 +282,23 @@ pub fn compute_risk_drift(
     });
 
     let trace = EvidenceTrace {
+        id: crate::trace::new_trace_id(),
         experiment: "RiskDrift".to_string(),
         inputs: serde_json::to_value(input)?,
+        data_as_of: current_trace.data_as_of.clone(),
         data_window: current_trace.data_window,
         data_quality: current_trace.data_quality,
         model_params: current_trace.model_params,
         outputs: serde_json::json!({ "result": output }),
         invariants,
         engine_version: crate::trace::engine_version(),
+        engine_commit: crate::trace::engine_commit(),
+        scenario_provenance: None,
+        // RiskDrift always directly depends on its baseline snapshot's own
+        // trace -- record that dependency, matching the field's own doc
+        // ("IDs of traces that preceded this one in the same
+        // investigation").
+        parent_trace_ids: vec![baseline_snapshot.id.clone()],
         baseline_model_params,
         policy_result: None,
     };

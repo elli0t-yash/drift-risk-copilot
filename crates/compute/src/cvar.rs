@@ -275,8 +275,10 @@ pub fn run_cvar_rebalance(
 
     let make_trace = |output: &CvarRebalanceOutput, invariants: Vec<InvariantCheck>| -> Result<EvidenceTrace> {
         Ok(EvidenceTrace {
+            id: crate::trace::new_trace_id(),
             experiment: "CvarRebalance".to_string(),
             inputs: serde_json::to_value(input)?,
+            data_as_of: crate::trace::data_as_of(&data_window),
             data_window: data_window.clone(),
             data_quality: data_quality.clone(),
             model_params: model_params.clone(),
@@ -288,8 +290,11 @@ pub fn run_cvar_rebalance(
             }),
             invariants,
             engine_version: crate::trace::engine_version(),
+            engine_commit: crate::trace::engine_commit(),
+            scenario_provenance: None,
+            parent_trace_ids: Vec::new(),
             baseline_model_params: None,
-        policy_result: None,
+            policy_result: None,
         })
     };
 
