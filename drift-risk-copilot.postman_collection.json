@@ -28,6 +28,18 @@
       "value": "",
       "type": "string",
       "description": "Set by \"Multi-turn\" request 1's post-response script (JSON.stringify of assistant_turn); consumed by request 2's pre-request script to build conversation_history."
+    },
+    {
+      "key": "computed_portfolio_hash",
+      "value": "",
+      "type": "string",
+      "description": "Set by \"12. Risk Drift\"'s GET /drift pre-request script -- reproduces compute::portfolio::portfolio_hash in JS from {{portfolio}}, since no endpoint returns this hash directly."
+    },
+    {
+      "key": "last_execution_trace_id",
+      "value": "",
+      "type": "string",
+      "description": "Set by \"17. Multi-tool Ask\"'s post-response script from POST /ask's agent_execution_trace.id; consumed by \"18. Execution Trace\"'s GET /execution-trace/{{last_execution_trace_id}}."
     }
   ],
   "item": [
@@ -41,8 +53,12 @@
             "header": [],
             "url": {
               "raw": "{{base_url}}/health",
-              "host": ["{{base_url}}"],
-              "path": ["health"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "health"
+              ]
             }
           },
           "event": [
@@ -74,13 +90,30 @@
           "name": "a. FactorShock - Nifty -12% Brent +20%",
           "request": {
             "method": "POST",
-            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"experiment\": {\n    \"type\": \"FactorShock\",\n    \"shocks_pct\": {\"MARKET\": -12.0, \"BRENT\": 20.0},\n    \"propagate\": true\n  }\n}",
-              "options": {"raw": {"language": "json"}}
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
-            "url": {"raw": "{{base_url}}/experiment", "host": ["{{base_url}}"], "path": ["experiment"]}
+            "url": {
+              "raw": "{{base_url}}/experiment",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "experiment"
+              ]
+            }
           },
           "event": [
             {
@@ -119,13 +152,30 @@
           "name": "b. RiskDecomposition",
           "request": {
             "method": "POST",
-            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"experiment\": {\n    \"type\": \"RiskDecomposition\"\n  }\n}",
-              "options": {"raw": {"language": "json"}}
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
-            "url": {"raw": "{{base_url}}/experiment", "host": ["{{base_url}}"], "path": ["experiment"]}
+            "url": {
+              "raw": "{{base_url}}/experiment",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "experiment"
+              ]
+            }
           },
           "event": [
             {
@@ -167,13 +217,30 @@
           "name": "c. CvarRebalance",
           "request": {
             "method": "POST",
-            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"experiment\": {\n    \"type\": \"CvarRebalance\",\n    \"confidence_level\": 0.95,\n    \"per_name_cap\": 0.20,\n    \"turnover_limit\": 0.30,\n    \"commission_bps\": 10\n  }\n}",
-              "options": {"raw": {"language": "json"}}
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
-            "url": {"raw": "{{base_url}}/experiment", "host": ["{{base_url}}"], "path": ["experiment"]}
+            "url": {
+              "raw": "{{base_url}}/experiment",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "experiment"
+              ]
+            }
           },
           "event": [
             {
@@ -212,13 +279,30 @@
           "name": "d. FactorShock - all 5 factors given, propagate true",
           "request": {
             "method": "POST",
-            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"experiment\": {\n    \"type\": \"FactorShock\",\n    \"shocks_pct\": {\n      \"MARKET\": -5.0,\n      \"USDINR\": 2.0,\n      \"BRENT\": 10.0,\n      \"GOLD_USD\": -3.0,\n      \"RATES_PROXY\": 1.0\n    },\n    \"propagate\": true\n  }\n}",
-              "options": {"raw": {"language": "json"}}
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
-            "url": {"raw": "{{base_url}}/experiment", "host": ["{{base_url}}"], "path": ["experiment"]}
+            "url": {
+              "raw": "{{base_url}}/experiment",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "experiment"
+              ]
+            }
           },
           "event": [
             {
@@ -242,13 +326,30 @@
           "name": "e. CvarRebalance - tau = 0",
           "request": {
             "method": "POST",
-            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"experiment\": {\n    \"type\": \"CvarRebalance\",\n    \"confidence_level\": 0.95,\n    \"per_name_cap\": 0.20,\n    \"turnover_limit\": 0.0,\n    \"commission_bps\": 10\n  }\n}",
-              "options": {"raw": {"language": "json"}}
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
-            "url": {"raw": "{{base_url}}/experiment", "host": ["{{base_url}}"], "path": ["experiment"]}
+            "url": {
+              "raw": "{{base_url}}/experiment",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "experiment"
+              ]
+            }
           },
           "event": [
             {
@@ -281,13 +382,30 @@
           "name": "a. What happens to my portfolio if Nifty crashes 15%?",
           "request": {
             "method": "POST",
-            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"message\": \"What happens to my portfolio if Nifty crashes 15%?\"\n}",
-              "options": {"raw": {"language": "json"}}
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
-            "url": {"raw": "{{base_url}}/ask", "host": ["{{base_url}}"], "path": ["ask"]}
+            "url": {
+              "raw": "{{base_url}}/ask",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "ask"
+              ]
+            }
           },
           "event": [
             {
@@ -334,13 +452,30 @@
           "name": "b. Where is my risk concentrated?",
           "request": {
             "method": "POST",
-            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"message\": \"Where is my risk concentrated?\"\n}",
-              "options": {"raw": {"language": "json"}}
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
-            "url": {"raw": "{{base_url}}/ask", "host": ["{{base_url}}"], "path": ["ask"]}
+            "url": {
+              "raw": "{{base_url}}/ask",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "ask"
+              ]
+            }
           },
           "event": [
             {
@@ -384,13 +519,30 @@
           "name": "c. Reduce my tail risk, I can tolerate 25% turnover.",
           "request": {
             "method": "POST",
-            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"message\": \"Reduce my tail risk, I can tolerate 25% turnover.\"\n}",
-              "options": {"raw": {"language": "json"}}
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
-            "url": {"raw": "{{base_url}}/ask", "host": ["{{base_url}}"], "path": ["ask"]}
+            "url": {
+              "raw": "{{base_url}}/ask",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "ask"
+              ]
+            }
           },
           "event": [
             {
@@ -434,13 +586,30 @@
           "name": "d. What is the weather like in Mumbai today?",
           "request": {
             "method": "POST",
-            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"message\": \"What is the weather like in Mumbai today?\"\n}",
-              "options": {"raw": {"language": "json"}}
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
-            "url": {"raw": "{{base_url}}/ask", "host": ["{{base_url}}"], "path": ["ask"]}
+            "url": {
+              "raw": "{{base_url}}/ask",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "ask"
+              ]
+            }
           },
           "event": [
             {
@@ -471,13 +640,30 @@
           "name": "a. Weights sum to 1.2",
           "request": {
             "method": "POST",
-            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"portfolio\": {\n    \"holdings\": [\n      {\"ticker\": \"RELIANCE.NS\", \"weight\": 0.18},\n      {\"ticker\": \"HDFCBANK.NS\", \"weight\": 0.156},\n      {\"ticker\": \"ICICIBANK.NS\", \"weight\": 0.144},\n      {\"ticker\": \"INFY.NS\", \"weight\": 0.12},\n      {\"ticker\": \"TCS.NS\", \"weight\": 0.12},\n      {\"ticker\": \"LT.NS\", \"weight\": 0.108},\n      {\"ticker\": \"ITC.NS\", \"weight\": 0.108},\n      {\"ticker\": \"KOTAKBANK.NS\", \"weight\": 0.096},\n      {\"ticker\": \"BHARTIARTL.NS\", \"weight\": 0.096},\n      {\"ticker\": \"TMPV.NS\", \"weight\": 0.072}\n    ],\n    \"total_value_inr\": 10000000.0\n  },\n  \"experiment\": {\n    \"type\": \"RiskDecomposition\"\n  }\n}",
-              "options": {"raw": {"language": "json"}}
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
-            "url": {"raw": "{{base_url}}/experiment", "host": ["{{base_url}}"], "path": ["experiment"]}
+            "url": {
+              "raw": "{{base_url}}/experiment",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "experiment"
+              ]
+            }
           },
           "event": [
             {
@@ -498,13 +684,30 @@
           "name": "b. Single holding only",
           "request": {
             "method": "POST",
-            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"portfolio\": {\n    \"holdings\": [\n      {\"ticker\": \"RELIANCE.NS\", \"weight\": 1.0}\n    ],\n    \"total_value_inr\": 1000000.0\n  },\n  \"experiment\": {\n    \"type\": \"RiskDecomposition\"\n  }\n}",
-              "options": {"raw": {"language": "json"}}
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
-            "url": {"raw": "{{base_url}}/experiment", "host": ["{{base_url}}"], "path": ["experiment"]}
+            "url": {
+              "raw": "{{base_url}}/experiment",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "experiment"
+              ]
+            }
           },
           "event": [
             {
@@ -525,13 +728,30 @@
           "name": "c. Negative total_value_inr",
           "request": {
             "method": "POST",
-            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"portfolio\": {\n    \"holdings\": [\n      {\"ticker\": \"RELIANCE.NS\", \"weight\": 0.6},\n      {\"ticker\": \"TCS.NS\", \"weight\": 0.4}\n    ],\n    \"total_value_inr\": -50000\n  },\n  \"experiment\": {\n    \"type\": \"RiskDecomposition\"\n  }\n}",
-              "options": {"raw": {"language": "json"}}
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
-            "url": {"raw": "{{base_url}}/experiment", "host": ["{{base_url}}"], "path": ["experiment"]}
+            "url": {
+              "raw": "{{base_url}}/experiment",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "experiment"
+              ]
+            }
           },
           "event": [
             {
@@ -552,13 +772,30 @@
           "name": "d. Missing experiment field entirely",
           "request": {
             "method": "POST",
-            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"portfolio\": {{portfolio}}\n}",
-              "options": {"raw": {"language": "json"}}
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
-            "url": {"raw": "{{base_url}}/experiment", "host": ["{{base_url}}"], "path": ["experiment"]}
+            "url": {
+              "raw": "{{base_url}}/experiment",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "experiment"
+              ]
+            }
           },
           "event": [
             {
@@ -583,13 +820,30 @@
           "name": "e. CvarRebalance via /ask with no per_name_cap mentioned",
           "request": {
             "method": "POST",
-            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"message\": \"Reduce my tail risk, I can tolerate 20% turnover.\"\n}",
-              "options": {"raw": {"language": "json"}}
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
-            "url": {"raw": "{{base_url}}/ask", "host": ["{{base_url}}"], "path": ["ask"]}
+            "url": {
+              "raw": "{{base_url}}/ask",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "ask"
+              ]
+            }
           },
           "event": [
             {
@@ -624,13 +878,30 @@
           "name": "a. FactorShock with propagate: false",
           "request": {
             "method": "POST",
-            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"experiment\": {\n    \"type\": \"FactorShock\",\n    \"shocks_pct\": {\"MARKET\": -12.0},\n    \"propagate\": false\n  }\n}",
-              "options": {"raw": {"language": "json"}}
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
-            "url": {"raw": "{{base_url}}/experiment", "host": ["{{base_url}}"], "path": ["experiment"]}
+            "url": {
+              "raw": "{{base_url}}/experiment",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "experiment"
+              ]
+            }
           },
           "event": [
             {
@@ -652,13 +923,30 @@
           "name": "b. CvarRebalance with confidence 0.99",
           "request": {
             "method": "POST",
-            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"experiment\": {\n    \"type\": \"CvarRebalance\",\n    \"confidence_level\": 0.99,\n    \"per_name_cap\": 0.20,\n    \"turnover_limit\": 0.30,\n    \"commission_bps\": 10\n  }\n}",
-              "options": {"raw": {"language": "json"}}
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
-            "url": {"raw": "{{base_url}}/experiment", "host": ["{{base_url}}"], "path": ["experiment"]}
+            "url": {
+              "raw": "{{base_url}}/experiment",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "experiment"
+              ]
+            }
           },
           "event": [
             {
@@ -688,7 +976,15 @@
           "request": {
             "method": "GET",
             "header": [],
-            "url": {"raw": "{{base_url}}/scenarios", "host": ["{{base_url}}"], "path": ["scenarios"]}
+            "url": {
+              "raw": "{{base_url}}/scenarios",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "scenarios"
+              ]
+            }
           },
           "event": [
             {
@@ -729,13 +1025,30 @@
           "name": "a. POST /ask (stores last_result_id)",
           "request": {
             "method": "POST",
-            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"message\": \"Where is my risk concentrated?\"\n}",
-              "options": {"raw": {"language": "json"}}
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
-            "url": {"raw": "{{base_url}}/ask", "host": ["{{base_url}}"], "path": ["ask"]}
+            "url": {
+              "raw": "{{base_url}}/ask",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "ask"
+              ]
+            }
           },
           "event": [
             {
@@ -762,8 +1075,13 @@
             "header": [],
             "url": {
               "raw": "{{base_url}}/report/{{last_result_id}}",
-              "host": ["{{base_url}}"],
-              "path": ["report", "{{last_result_id}}"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "report",
+                "{{last_result_id}}"
+              ]
             }
           },
           "event": [
@@ -791,8 +1109,13 @@
             "header": [],
             "url": {
               "raw": "{{base_url}}/report/00000000-0000-0000-0000-000000000000",
-              "host": ["{{base_url}}"],
-              "path": ["report", "00000000-0000-0000-0000-000000000000"]
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "report",
+                "00000000-0000-0000-0000-000000000000"
+              ]
             }
           },
           "event": [
@@ -816,13 +1139,30 @@
           "name": "a. Turn 1 - Where is my risk concentrated?",
           "request": {
             "method": "POST",
-            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"message\": \"Where is my risk concentrated?\",\n  \"conversation_history\": []\n}",
-              "options": {"raw": {"language": "json"}}
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
-            "url": {"raw": "{{base_url}}/ask", "host": ["{{base_url}}"], "path": ["ask"]}
+            "url": {
+              "raw": "{{base_url}}/ask",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "ask"
+              ]
+            }
           },
           "event": [
             {
@@ -845,13 +1185,30 @@
           "name": "b. Turn 2 - Now reduce my tail risk, allow up to 20% turnover.",
           "request": {
             "method": "POST",
-            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "body": {
               "mode": "raw",
               "raw": "{}",
-              "options": {"raw": {"language": "json"}}
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
-            "url": {"raw": "{{base_url}}/ask", "host": ["{{base_url}}"], "path": ["ask"]}
+            "url": {
+              "raw": "{{base_url}}/ask",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "ask"
+              ]
+            }
           },
           "event": [
             {
@@ -902,13 +1259,30 @@
           "name": "a. RiskDecomposition (regime is always-on)",
           "request": {
             "method": "POST",
-            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"experiment\": {\n    \"type\": \"RiskDecomposition\"\n  }\n}",
-              "options": {"raw": {"language": "json"}}
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
-            "url": {"raw": "{{base_url}}/experiment", "host": ["{{base_url}}"], "path": ["experiment"]}
+            "url": {
+              "raw": "{{base_url}}/experiment",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "experiment"
+              ]
+            }
           },
           "event": [
             {
@@ -939,13 +1313,30 @@
           "name": "b. FactorShock (regime is always-on), Nifty -12% Brent +20%",
           "request": {
             "method": "POST",
-            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"experiment\": {\n    \"type\": \"FactorShock\",\n    \"shocks_pct\": {\"MARKET\": -12.0, \"BRENT\": 20.0},\n    \"propagate\": true\n  }\n}",
-              "options": {"raw": {"language": "json"}}
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
-            "url": {"raw": "{{base_url}}/experiment", "host": ["{{base_url}}"], "path": ["experiment"]}
+            "url": {
+              "raw": "{{base_url}}/experiment",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "experiment"
+              ]
+            }
           },
           "event": [
             {
@@ -981,13 +1372,30 @@
           "name": "a. covid_crash",
           "request": {
             "method": "POST",
-            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"experiment\": {\n    \"type\": \"FactorShock\",\n    \"shocks_pct\": {\n      \"MARKET\": -38.0,\n      \"BRENT\": -55.0,\n      \"USDINR\": 8.5,\n      \"GOLD_USD\": 3.0,\n      \"RATES_PROXY\": -6.0\n    },\n    \"propagate\": false\n  }\n}",
-              "options": {"raw": {"language": "json"}}
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
-            "url": {"raw": "{{base_url}}/experiment", "host": ["{{base_url}}"], "path": ["experiment"]}
+            "url": {
+              "raw": "{{base_url}}/experiment",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "experiment"
+              ]
+            }
           },
           "event": [
             {
@@ -1008,13 +1416,30 @@
           "name": "b. ilfs_contagion",
           "request": {
             "method": "POST",
-            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"experiment\": {\n    \"type\": \"FactorShock\",\n    \"shocks_pct\": {\n      \"MARKET\": -15.0,\n      \"USDINR\": 7.0,\n      \"BRENT\": 15.0,\n      \"GOLD_USD\": 2.5,\n      \"RATES_PROXY\": 4.0\n    },\n    \"propagate\": false\n  }\n}",
-              "options": {"raw": {"language": "json"}}
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
-            "url": {"raw": "{{base_url}}/experiment", "host": ["{{base_url}}"], "path": ["experiment"]}
+            "url": {
+              "raw": "{{base_url}}/experiment",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "experiment"
+              ]
+            }
           },
           "event": [
             {
@@ -1035,13 +1460,30 @@
           "name": "c. taper_tantrum_2013",
           "request": {
             "method": "POST",
-            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"experiment\": {\n    \"type\": \"FactorShock\",\n    \"shocks_pct\": {\n      \"MARKET\": -12.0,\n      \"USDINR\": 18.0,\n      \"GOLD_USD\": -18.0,\n      \"BRENT\": -5.0,\n      \"RATES_PROXY\": 5.0\n    },\n    \"propagate\": false\n  }\n}",
-              "options": {"raw": {"language": "json"}}
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
-            "url": {"raw": "{{base_url}}/experiment", "host": ["{{base_url}}"], "path": ["experiment"]}
+            "url": {
+              "raw": "{{base_url}}/experiment",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "experiment"
+              ]
+            }
           },
           "event": [
             {
@@ -1067,13 +1509,30 @@
           "name": "a. POST /experiment - direct",
           "request": {
             "method": "POST",
-            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"experiment\": {\n    \"type\": \"PortfolioPerformance\"\n  }\n}",
-              "options": {"raw": {"language": "json"}}
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
-            "url": {"raw": "{{base_url}}/experiment", "host": ["{{base_url}}"], "path": ["experiment"]}
+            "url": {
+              "raw": "{{base_url}}/experiment",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "experiment"
+              ]
+            }
           },
           "event": [
             {
@@ -1102,13 +1561,30 @@
           "name": "b. POST /ask - How has my portfolio performed lately?",
           "request": {
             "method": "POST",
-            "header": [{"key": "Content-Type", "value": "application/json"}],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"message\": \"How is my portfolio performing recently in terms of market trends?\"\n}",
-              "options": {"raw": {"language": "json"}}
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
             },
-            "url": {"raw": "{{base_url}}/ask", "host": ["{{base_url}}"], "path": ["ask"]}
+            "url": {
+              "raw": "{{base_url}}/ask",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "ask"
+              ]
+            }
           },
           "event": [
             {
@@ -1129,6 +1605,794 @@
                   "    const n = pm.response.json().narration;",
                   "    pm.expect(n).to.be.a('string');",
                   "    pm.expect(n.length).to.be.above(0);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "12. Risk Drift",
+      "item": [
+        {
+          "name": "a. (setup) RiskDecomposition baseline",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/experiment",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "experiment"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"experiment\": {\n    \"type\": \"RiskDecomposition\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Ensures the immediately-following RiskDrift request has a fresh",
+                  "// RiskDecomposition snapshot as its baseline -- RiskDrift with no",
+                  "// explicit baseline_snapshot_id resolves against the *most recent*",
+                  "// snapshot for this portfolio hash, which must itself be a",
+                  "// RiskDecomposition result (see compute::drift::resolve_baseline).",
+                  "pm.test('status 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "b. RiskDrift vs the baseline above",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/experiment",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "experiment"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"experiment\": {\n    \"type\": \"RiskDrift\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('outputs.result.vol_before present', () => {",
+                  "    pm.expect(pm.response.json().outputs.result.vol_before).to.be.a('number');",
+                  "});",
+                  "pm.test('outputs.result.regime_before is Bull/Bear/Crisis', () => {",
+                  "    pm.expect(['Bull', 'Bear', 'Crisis']).to.include(pm.response.json().outputs.result.regime_before);",
+                  "});",
+                  "pm.test('outputs.result.days_elapsed present', () => {",
+                  "    pm.expect(pm.response.json().outputs.result.days_elapsed).to.exist;",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "c. GET /drift",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/drift?portfolio={{computed_portfolio_hash}}&limit=5",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "drift"
+              ],
+              "query": [
+                {
+                  "key": "portfolio",
+                  "value": "{{computed_portfolio_hash}}"
+                },
+                {
+                  "key": "limit",
+                  "value": "5"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Reproduces compute::portfolio::portfolio_hash in JS: SHA-256 of",
+                  "// \"TICKER:weight,...\" pairs, tickers sorted ascending -- no endpoint",
+                  "// returns this hash directly, so it's recomputed here from {{portfolio}}.",
+                  "const portfolio = JSON.parse(pm.collectionVariables.get('portfolio'));",
+                  "const holdings = portfolio.holdings.slice().sort((a, b) => (a.ticker < b.ticker ? -1 : 1));",
+                  "const joined = holdings.map((h) => `${h.ticker}:${h.weight}`).join(',');",
+                  "const hash = CryptoJS.SHA256(joined).toString(CryptoJS.enc.Hex);",
+                  "pm.collectionVariables.set('computed_portfolio_hash', hash);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('response.snapshots is an array', () => {",
+                  "    pm.expect(pm.response.json().snapshots).to.be.an('array');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "13. Reverse Stress",
+      "item": [
+        {
+          "name": "a. Breach a 5L threshold",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/experiment",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "experiment"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"experiment\": {\n    \"type\": \"ReverseStress\",\n    \"loss_threshold_inr\": 500000\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('outputs.result.mahalanobis_severity present and > 0', () => {",
+                  "    const out = pm.response.json().outputs.result;",
+                  "    pm.expect(out.mahalanobis_severity).to.be.a('number');",
+                  "    pm.expect(out.mahalanobis_severity).to.be.above(0);",
+                  "});",
+                  "pm.test('outputs.result.severity_label present', () => {",
+                  "    pm.expect(pm.response.json().outputs.result.severity_label).to.be.a('string');",
+                  "});",
+                  "pm.test('outputs.result.portfolio_pnl_inr < 0', () => {",
+                  "    pm.expect(pm.response.json().outputs.result.portfolio_pnl_inr).to.be.below(0);",
+                  "});",
+                  "pm.test('outputs.result.solver_status present', () => {",
+                  "    pm.expect(pm.response.json().outputs.result.solver_status).to.exist;",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "b. Infeasible threshold",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/experiment",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "experiment"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"experiment\": {\n    \"type\": \"ReverseStress\",\n    \"loss_threshold_inr\": 999999999\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 422', () => pm.response.to.have.status(422));",
+                  "pm.test('body.error contains \"cannot be breached\"', () => {",
+                  "    pm.expect(pm.response.json().error).to.include('cannot be breached');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "14. Policy Check",
+      "item": [
+        {
+          "name": "a. Tight vol limit (breach)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/experiment",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "experiment"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"experiment\": {\n    \"type\": \"PolicyCheck\",\n    \"policy\": {\n      \"max_vol_annualized\": 0.01\n    }\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('policy_result.all_passed === false', () => {",
+                  "    pm.expect(pm.response.json().outputs.result.policy_result.all_passed).to.eql(false);",
+                  "});",
+                  "pm.test('policy_result.breach_count >= 1', () => {",
+                  "    pm.expect(pm.response.json().outputs.result.policy_result.breach_count).to.be.at.least(1);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "b. Loose vol limit (all pass)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/experiment",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "experiment"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"experiment\": {\n    \"type\": \"PolicyCheck\",\n    \"policy\": {\n      \"max_vol_annualized\": 1.0\n    }\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('policy_result.all_passed === true', () => {",
+                  "    pm.expect(pm.response.json().outputs.result.policy_result.all_passed).to.eql(true);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "15. Portfolio Performance (per-holding + _pct fields)",
+      "item": [
+        {
+          "name": "a. POST /experiment - per-holding breakdown",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/experiment",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "experiment"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"experiment\": {\n    \"type\": \"PortfolioPerformance\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('outputs.result.total_return_pct present', () => {",
+                  "    pm.expect(pm.response.json().outputs.result.total_return_pct).to.be.a('number');",
+                  "});",
+                  "pm.test('outputs.result.best_performer present', () => {",
+                  "    pm.expect(pm.response.json().outputs.result.best_performer).to.be.a('string');",
+                  "});",
+                  "pm.test('outputs.result.worst_performer present', () => {",
+                  "    pm.expect(pm.response.json().outputs.result.worst_performer).to.be.a('string');",
+                  "});",
+                  "pm.test('outputs.result.holding_returns is an object with at least 1 key', () => {",
+                  "    const hr = pm.response.json().outputs.result.holding_returns;",
+                  "    pm.expect(hr).to.be.an('object');",
+                  "    pm.expect(Object.keys(hr).length).to.be.at.least(1);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "16. Portfolio Upload",
+      "item": [
+        {
+          "name": "a. Weight-based CSV",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "postman/fixtures/sample_portfolio.csv"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{base_url}}/portfolio/upload",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "portfolio",
+                "upload"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('response.portfolio.holdings has 2 items', () => {",
+                  "    pm.expect(pm.response.json().portfolio.holdings).to.have.lengthOf(2);",
+                  "});",
+                  "pm.test('response.layout_detected === \"weight\"', () => {",
+                  "    pm.expect(pm.response.json().layout_detected).to.eql('weight');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "b. Invalid file type (.txt)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "postman/fixtures/invalid_upload.txt"
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{base_url}}/portfolio/upload",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "portfolio",
+                "upload"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 400', () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "17. Multi-tool Ask",
+      "item": [
+        {
+          "name": "a. What is my risk and how has it changed since my last check?",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/ask",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "ask"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"message\": \"What is my risk and how has it changed since my last check?\",\n  \"conversation_history\": []\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('tool_plans is an array with length >= 2', () => {",
+                  "    pm.expect(body.agent_execution_trace.tool_plans).to.be.an('array');",
+                  "    pm.expect(body.agent_execution_trace.tool_plans.length).to.be.at.least(2);",
+                  "});",
+                  "pm.test('tool_plans[0].tool === \"current_risk\"', () => {",
+                  "    pm.expect(body.agent_execution_trace.tool_plans[0].tool).to.eql('current_risk');",
+                  "});",
+                  "pm.test('tool_plans[1].tool === \"risk_drift\"', () => {",
+                  "    pm.expect(body.agent_execution_trace.tool_plans[1].tool).to.eql('risk_drift');",
+                  "});",
+                  "pm.test('narration non-empty', () => {",
+                  "    pm.expect(body.narration).to.be.a('string');",
+                  "    pm.expect(body.narration.length).to.be.above(0);",
+                  "});",
+                  "pm.test('agent_execution_trace.gemini_calls === 3', () => {",
+                  "    pm.expect(body.agent_execution_trace.gemini_calls).to.eql(3);",
+                  "});",
+                  "pm.collectionVariables.set('last_execution_trace_id', body.agent_execution_trace.id);"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "18. Execution Trace",
+      "item": [
+        {
+          "name": "a. GET /execution-trace/{{last_execution_trace_id}}",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/execution-trace/{{last_execution_trace_id}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "execution-trace",
+                "{{last_execution_trace_id}}"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('response.gemini_calls present', () => {",
+                  "    pm.expect(pm.response.json().gemini_calls).to.exist;",
+                  "});",
+                  "pm.test('response.tool_plans is an array', () => {",
+                  "    pm.expect(pm.response.json().tool_plans).to.be.an('array');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "b. GET /execution-trace/{unknown-id} - 404",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/execution-trace/00000000-0000-0000-0000-000000000000",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "execution-trace",
+                "00000000-0000-0000-0000-000000000000"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 404', () => pm.response.to.have.status(404));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "19. EvidenceTrace v2 fields",
+      "item": [
+        {
+          "name": "a. RiskDecomposition - data_as_of and engine_commit",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/experiment",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "experiment"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"experiment\": {\n    \"type\": \"RiskDecomposition\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('data_as_of is a non-empty string', () => {",
+                  "    pm.expect(body.data_as_of).to.be.a('string');",
+                  "    pm.expect(body.data_as_of.length).to.be.above(0);",
+                  "});",
+                  "pm.test('engine_commit is a non-empty string', () => {",
+                  "    pm.expect(body.engine_commit).to.be.a('string');",
+                  "    pm.expect(body.engine_commit.length).to.be.above(0);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "20. Always-on regime",
+      "item": [
+        {
+          "name": "a. RiskDecomposition - regime_state non-null",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/experiment",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "experiment"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"portfolio\": {{portfolio}},\n  \"experiment\": {\n    \"type\": \"RiskDecomposition\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "const regime = pm.response.json().model_params.regime_state;",
+                  "pm.test('model_params.regime_state is not null', () => {",
+                  "    pm.expect(regime).to.not.be.null;",
+                  "});",
+                  "pm.test('regime_state.current_label is Bull/Bear/Crisis', () => {",
+                  "    pm.expect(['Bull', 'Bear', 'Crisis']).to.include(regime.current_label);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "21. CORS preflight",
+      "item": [
+        {
+          "name": "a. OPTIONS /health",
+          "request": {
+            "method": "OPTIONS",
+            "header": [
+              {
+                "key": "Origin",
+                "value": "https://example.com"
+              },
+              {
+                "key": "Access-Control-Request-Method",
+                "value": "GET"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/health",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "health"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Access-Control-Allow-Origin header present', () => {",
+                  "    pm.expect(pm.response.headers.has('Access-Control-Allow-Origin')).to.be.true;",
                   "});"
                 ]
               }
