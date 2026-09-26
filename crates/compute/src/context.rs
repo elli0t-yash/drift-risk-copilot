@@ -1,11 +1,14 @@
 //! Shared context threaded into `dispatch::run_experiment` for experiment
-//! types that need more than their own input to run. Currently only
-//! `RiskDrift` uses it (read access to the snapshot store, to resolve its
-//! baseline); every other experiment type receives it but ignores it.
+//! types that need more than their own input to run. `RiskDrift` uses
+//! `store` (read access, to resolve its baseline); `PolicyCheck` and
+//! `CvarRebalance` use `policy`; every other experiment type receives the
+//! whole thing but ignores it.
 
 use std::sync::Arc;
 
 use store::SnapshotStore;
+
+use crate::policy::RiskPolicy;
 
 pub struct ExperimentContext {
     pub store: Arc<SnapshotStore>,
@@ -15,4 +18,9 @@ pub struct ExperimentContext {
     /// (`server::backend`) and reused here rather than re-hashed per
     /// experiment.
     pub portfolio_hash: String,
+    /// An optional policy attached to the request (`POST /experiment`'s or
+    /// `POST /ask`'s top-level `policy` field), separate from the
+    /// experiment itself so *any* experiment can be accompanied by a
+    /// passive policy check (see `dispatch::run_experiment`'s doc).
+    pub policy: Option<RiskPolicy>,
 }

@@ -8,6 +8,7 @@ pub mod experiments;
 pub mod format;
 pub mod model;
 pub mod performance;
+pub mod policy;
 pub mod portfolio;
 pub mod regime;
 pub mod reverse_stress;

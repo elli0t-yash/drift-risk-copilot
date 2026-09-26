@@ -22,6 +22,7 @@ crates/
     src/cvar.rs            CvarRebalance: Rockafellar-Uryasev LP via good_lp + clarabel
     src/drift.rs            RiskDrift: diffs current risk against a stored baseline snapshot
     src/reverse_stress.rs    ReverseStress: minimum-severity shock that breaches a loss threshold
+    src/policy.rs            RiskPolicy/PolicyResult; PolicyCheck experiment; evaluate_policy
     src/dispatch.rs          run_experiment: the one fetch+fit+dispatch entry point for every experiment type
     src/context.rs            ExperimentContext (SnapshotStore + portfolio_hash), used by RiskDrift
     src/portfolio.rs           portfolio_hash: order-independent SHA-256 of a portfolio's holdings
@@ -1566,3 +1567,152 @@ new `parse_tests.rs` cases (`ReverseStress` with `null` and with explicit
 `factor_bounds`). `server`: 2 new `tests.rs` cases (valid input returns 200
 with a negative `portfolio_pnl_inr`; an infeasible threshold returns 422
 with the exact infeasibility message).
+
+## Policy Engine (`compute::policy`) and constraint-aware remediation
+
+A deterministic risk-limit checker (`RiskPolicy` -> `PolicyResult`), plus
+two ways to use it: a standalone seventh experiment type (`PolicyCheck`),
+and an extension to `CvarRebalance` that tries to *fix* policy breaches by
+re-solving at a tighter CVaR confidence level. No optimisation and no LLM
+call happens inside the policy engine itself -- every rule is a plain
+comparison against a quantity already computable from a fitted
+`FactorModel` and the historical return series.
+
+### Rules and what each one actually computes
+
+- `max_vol_annualized`: the same `sqrt(w' Sigma w)` formula
+  `RiskDecomposition` uses, against the already-fitted (always
+  regime-conditional) model -- no refit.
+- `max_cvar_95`: historical CVaR at a **fixed** 95% confidence, computed
+  directly from the portfolio's own full-history simple returns -- never
+  via `CvarRebalance`'s LP, and never by reading a stored snapshot (see
+  the judgment call below on why `evaluate_policy` doesn't take a `store`
+  parameter at all, despite an earlier draft of this spec suggesting one).
+- `max_factor_contribution_share`: the largest *signed* (not absolute
+  value) single-factor Euler contribution share -- a large negative
+  (diversifying) contributor is never flagged as "dominant," matching what
+  a risk manager actually means by the limit.
+- `max_position_weight`: `max(w_i)` across holdings.
+- `max_loss_under_scenarios`: for each named scenario, a real
+  `FactorShock` run (`propagate: false`, per spec) against
+  `compute::scenarios::all_scenarios()`'s fixed shock set, loss reported
+  as `abs(portfolio_pnl_inr) / total_value_inr`.
+
+### `PolicyCheck`, the seventh experiment type
+
+Like `RiskDrift`/`ReverseStress`, `PolicyCheckInput` has no `portfolio`
+field of its own -- it reuses the same dispatch-level `portfolio`
+parameter those two already established. `PolicyCheckOutputs` always
+reports the four "actual" values (`portfolio_vol`, `portfolio_cvar_95`,
+`max_position_weight`, `max_factor_share`) regardless of whether the
+matching `RiskPolicy` field was set, so a caller can see where they stand
+even for limits they didn't ask about.
+
+### Constraint-aware remediation (`CvarRebalance`'s new `policy` field)
+
+`CvarRebalanceInput.policy: Option<RiskPolicy>` triggers, after the LP
+solves: evaluate the policy against the proposed weights; if breaches
+remain, tighten `confidence_level` by `0.01` and re-solve, up to 5 times,
+keeping whichever attempt's weights are reported (`weights_after`,
+`stats_after`, `turnover`, etc. all reflect the *final* remediation
+attempt, not the original solve -- `confidence_level` in the output is
+likewise the final, tightened value, not the one the caller originally
+sent). Implemented as a recursive call to `run_cvar_rebalance` itself
+(each retry's own `input.policy` is `None`, so it can't recurse further) --
+reusing the entire existing LP-building/solving path rather than
+extracting a separate "core solver" out of it.
+
+### Judgment calls
+
+- **`evaluate_policy` takes no `store` parameter**, despite an earlier
+  draft of this spec's own function signature listing one ("needed for
+  CVaR: run CvarRebalance or read from latest snapshot"). The spec's own
+  evaluation logic for `max_cvar_95` says the opposite explicitly ("compute
+  CVaR directly from historical scenarios... do not run the LP"), which
+  needs a `MarketData` reference, not a store handle -- so `store` was
+  dropped and `data: &MarketData` added instead. `evaluate_policy` is
+  synchronous, hermetic, and needs nothing beyond what a fitted model
+  already carries.
+- **Passive policy attachment is skipped for `RiskDrift`.** `dispatch::
+  run_experiment` attaches a passive `policy_result` to every experiment
+  except `PolicyCheck`/`CvarRebalance` (which handle policy themselves),
+  but `RiskDrift` fits its "current" factor model *internally*
+  (`drift::run_risk_drift`) and never exposes it back to the dispatcher --
+  re-fitting it a second time purely for a passive check felt like the
+  wrong trade-off for this session. A caller wanting a policy check
+  alongside `RiskDrift` should make a separate `PolicyCheck` request.
+  `PortfolioPerformance` similarly never otherwise fits a factor model, so
+  one is fit there *only* when a policy is actually attached (skipped
+  entirely, no extra cost, when it isn't).
+- **Live-caught bug, fixed before the live runs below**: `run_cvar_rebalance`'s
+  internal `build_portfolio` closure (builds a `Portfolio` from a
+  `weights_before`/`weights_after` map to hand to `evaluate_policy`)
+  originally iterated the map directly -- but `weights_before`/`_after` are
+  `BTreeMap<String, f64>`, hence *alphabetically* ordered, while
+  `evaluate_policy` needs `portfolio.tickers() == model.tickers`
+  *positionally*, not just as a set (the fitted model's `beta_matrix()`
+  rows are in the original portfolio's ticker order). Every existing test
+  happened to use already-alphabetical tickers (`AAA`/`BBB`), so this
+  passed the full test suite before failing immediately on the first real
+  10-ticker Nifty portfolio (`RELIANCE.NS` first, not alphabetically
+  first) with `"portfolio holdings and fitted model tickers must match
+  1:1, in order"`. Fixed by iterating the *original* `tickers` list
+  instead of the map; a new regression test
+  (`cvar_rebalance_with_policy_does_not_care_about_ticker_alphabetical_order`)
+  uses deliberately reverse-alphabetical tickers so this can't silently
+  regress again.
+- **Tightening `confidence_level` is not guaranteed to resolve every
+  breach, and the live run below confirms it doesn't always** -- CVaR
+  minimization at a higher confidence level only changes the
+  historical-scenario tail the LP optimizes over; it has no direct
+  mechanical relationship to a factor-shock scenario limit
+  (`max_loss_under_scenarios`) or a factor-concentration limit
+  (`max_factor_contribution_share`). The live run's `max_position_weight`
+  breach happened to resolve (a side effect of `per_name_cap` binding in
+  the same LP, not of confidence-level tightening itself), while the
+  `covid_crash` scenario-loss breach did not, even after all 5 iterations
+  reached the confidence-level ceiling (`0.999`). This is exactly why the
+  output separately reports `policy_breaches_resolved`/`_remaining` rather
+  than a single pass/fail bit -- remediation is a best-effort heuristic,
+  not a guaranteed fix.
+
+### Live run A: `PolicyCheck` on the 10-stock Nifty portfolio
+
+Policy: `max_vol_annualized: 0.14`, `max_cvar_95: 0.03`,
+`max_factor_contribution_share: 0.80`, `max_position_weight: 0.12`,
+`max_loss_under_scenarios: [{covid_crash, max_loss_pct: 0.30}]`.
+
+`all_passed: false`, `breach_count: 2`:
+
+| rule | actual | limit | passed |
+|---|---|---|---|
+| `max_vol_annualized` | 11.7% | 14.0% | ✓ |
+| `max_cvar_95` | 2.0% | 3.0% | ✓ |
+| `max_factor_contribution_share` (MARKET) | 64.4% | 80.0% | ✓ |
+| `max_position_weight` (RELIANCE.NS) | 15.0% | 12.0% | ✗ (breach 3.0pp) |
+| `max_loss_under_scenarios[covid_crash]` | 37.6% | 30.0% | ✗ (breach 7.6pp) |
+
+`most_severe_breach`: `max_loss_under_scenarios[covid_crash]` (larger
+breach magnitude). Note the portfolio's live vol (11.7%) is well under the
+14% limit and under the 15.5% figure an earlier session's live run
+captured -- real market data moves between sessions; this isn't a
+discrepancy, it's what "live" means.
+
+### Live run B: `CvarRebalance` with the same policy attached
+
+`turnover_limit: 0.4`, `per_name_cap: 0.12`, same policy as above.
+
+`status: "optimal"`, `remediation_iterations: 5`, final
+`confidence_level: 0.999` (tightened from 0.95, hit the ceiling without
+resolving everything):
+
+- `policy_breaches_resolved`: `[]`
+- `policy_breaches_remaining`: `["max_loss_under_scenarios[covid_crash]"]`
+
+The `max_position_weight` breach present in `policy_result_before`
+disappeared from `policy_result_after` -- but, per the judgment call
+above, that's `per_name_cap: 0.12` doing its job in the LP itself (every
+`weights_after` entry sits at essentially exactly 0.12), not the
+confidence-level tightening. The `covid_crash` scenario-loss breach
+remained unresolved through all 5 iterations, demonstrating the
+remediation loop's real limitation rather than a contrived one.

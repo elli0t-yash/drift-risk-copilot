@@ -74,6 +74,7 @@ fn all_experiment_types_have_non_null_regime_state_on_real_data() {
         commission_bps: 10.0,
         frequency: Frequency::Daily,
         window: None,
+        policy: None,
     };
     let (_, trace) = compute::cvar::run_cvar_rebalance(&data.quality, &data, &cvar_input)
         .expect("run_cvar_rebalance failed");

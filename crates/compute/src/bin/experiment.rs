@@ -37,11 +37,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                      server's POST /experiment instead."
             .into());
     }
-    if matches!(experiment, Experiment::ReverseStress(_)) {
-        return Err("ReverseStress has no \"portfolio\" field of its own (the portfolio is a \
-                     separate parameter at the server/dispatch layer, not part of the JSON \
-                     tagged-union input this CLI deserializes) -- run it via the server's \
-                     POST /experiment instead."
+    if matches!(experiment, Experiment::ReverseStress(_) | Experiment::PolicyCheck(_)) {
+        return Err("ReverseStress/PolicyCheck have no \"portfolio\" field of their own (the \
+                     portfolio is a separate parameter at the server/dispatch layer, not part \
+                     of the JSON tagged-union input this CLI deserializes) -- run them via the \
+                     server's POST /experiment instead."
             .into());
     }
 
@@ -71,7 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (portfolio, window, frequency) = match &experiment {
         Experiment::FactorShock(i) => (&i.portfolio, i.resolved_window(), i.frequency),
         Experiment::RiskDecomposition(i) => (&i.portfolio, i.resolved_window(), i.frequency),
-        Experiment::CvarRebalance(_) | Experiment::PortfolioPerformance(_) | Experiment::RiskDrift(_) | Experiment::ReverseStress(_) => {
+        Experiment::CvarRebalance(_) | Experiment::PortfolioPerformance(_) | Experiment::RiskDrift(_) | Experiment::ReverseStress(_) | Experiment::PolicyCheck(_) => {
             unreachable!("handled above")
         }
     };
@@ -96,7 +96,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (_, trace) = run_risk_decomposition(&data.quality, data_window, &model, input)?;
             trace
         }
-        Experiment::CvarRebalance(_) | Experiment::PortfolioPerformance(_) | Experiment::RiskDrift(_) | Experiment::ReverseStress(_) => {
+        Experiment::CvarRebalance(_) | Experiment::PortfolioPerformance(_) | Experiment::RiskDrift(_) | Experiment::ReverseStress(_) | Experiment::PolicyCheck(_) => {
             unreachable!("handled above")
         }
     };

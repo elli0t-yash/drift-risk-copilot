@@ -2,8 +2,8 @@
 //! function-calling turn.
 
 use compute::experiments::{
-    CvarRebalanceInput, Experiment, FactorShockInput, Portfolio, PortfolioPerformanceInput,
-    ReverseStressInput, RiskDecompositionInput, RiskDriftInput,
+    CvarRebalanceInput, Experiment, FactorShockInput, PolicyCheckInput, Portfolio,
+    PortfolioPerformanceInput, ReverseStressInput, RiskDecompositionInput, RiskDriftInput,
 };
 use thiserror::Error;
 
@@ -11,8 +11,8 @@ use crate::conversation::{turn_to_content, ConversationTurn};
 use crate::gemini::{Content, GeminiClient, GeminiError, GeminiRequest, Part, Tool, MODEL_PARSE};
 use crate::schema::{
     experiment_function_declarations, CVAR_REBALANCE_FUNCTION, FACTOR_SHOCK_FUNCTION,
-    PORTFOLIO_PERFORMANCE_FUNCTION, REVERSE_STRESS_FUNCTION, RISK_DECOMPOSITION_FUNCTION,
-    RISK_DRIFT_FUNCTION,
+    POLICY_CHECK_FUNCTION, PORTFOLIO_PERFORMANCE_FUNCTION, REVERSE_STRESS_FUNCTION,
+    RISK_DECOMPOSITION_FUNCTION, RISK_DRIFT_FUNCTION,
 };
 
 /// Adapted from the checkpoint spec's original wording, which named a
@@ -22,12 +22,12 @@ use crate::schema::{
 /// real functions instead. Everything else is unchanged.
 pub const PARSE_SYSTEM_PROMPT: &str = "You are a parameter extraction engine. Your only job is \
 to call the correct function -- run_factor_shock, run_risk_decomposition, run_cvar_rebalance, \
-run_portfolio_performance, run_risk_drift, or run_reverse_stress -- with the parameters \
-extracted from the user's message. Do not add explanation. Do not ask clarifying questions. If \
-the user's intent clearly maps to one of the six experiment types, call the function. If it \
-does not, return a text response with one sentence explaining what you cannot extract. For \
-CvarRebalance: if the user does not mention a per-name cap, omit per_name_cap from the function \
-call.";
+run_portfolio_performance, run_risk_drift, run_reverse_stress, or run_policy_check -- with the \
+parameters extracted from the user's message. Do not add explanation. Do not ask clarifying \
+questions. If the user's intent clearly maps to one of the seven experiment types, call the \
+function. If it does not, return a text response with one sentence explaining what you cannot \
+extract. For CvarRebalance: if the user does not mention a per-name cap, omit per_name_cap from \
+the function call.";
 
 #[derive(Debug, Error)]
 pub enum ParseError {
@@ -109,6 +109,9 @@ pub async fn parse_experiment<C: GeminiClient>(
                 }
                 REVERSE_STRESS_FUNCTION => {
                     Experiment::ReverseStress(serde_json::from_value::<ReverseStressInput>(args)?)
+                }
+                POLICY_CHECK_FUNCTION => {
+                    Experiment::PolicyCheck(serde_json::from_value::<PolicyCheckInput>(args)?)
                 }
                 other => return Err(ParseError::UnexpectedFunction(other.to_string())),
             };

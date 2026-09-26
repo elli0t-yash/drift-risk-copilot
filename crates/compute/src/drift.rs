@@ -291,6 +291,7 @@ pub fn compute_risk_drift(
         invariants,
         engine_version: crate::trace::engine_version(),
         baseline_model_params,
+        policy_result: None,
     };
 
     Ok((output, trace))

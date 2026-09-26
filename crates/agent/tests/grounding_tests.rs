@@ -130,5 +130,6 @@ fn sample_trace() -> compute::trace::EvidenceTrace {
         invariants: vec![],
         engine_version: "0.1.0".to_string(),
         baseline_model_params: None,
+        policy_result: None,
     }
 }

@@ -6,6 +6,7 @@ use agent::gemini::GeminiError;
 use agent::pipeline::PipelineResult;
 use agent::ConversationTurn;
 use compute::experiments::{Experiment, Portfolio};
+use compute::policy::RiskPolicy;
 use compute::trace::EvidenceTrace;
 use thiserror::Error;
 
@@ -106,17 +107,23 @@ pub trait Backend: Send + Sync {
     /// its input, as `FactorShockInput`/etc. all do) because `RiskDrift`'s
     /// own input carries no `portfolio` field of its own -- it diffs the
     /// current portfolio against a *stored* baseline, not two portfolios
-    /// given inline.
+    /// given inline. `policy` is the request's separate top-level `policy`
+    /// field (see `routes::ExperimentRequest`/`AskRequest`), not anything
+    /// embedded in `experiment` itself -- it drives the passive policy
+    /// check every experiment type except `PolicyCheck`/`CvarRebalance`
+    /// gets attached to its trace (see `compute::dispatch::run_experiment`).
     async fn run_experiment(
         &self,
         experiment: Experiment,
         portfolio: Portfolio,
+        policy: Option<RiskPolicy>,
     ) -> Result<EvidenceTrace, BackendError>;
     async fn run_ask(
         &self,
         portfolio: Portfolio,
         message: String,
         conversation_history: Vec<ConversationTurn>,
+        policy: Option<RiskPolicy>,
     ) -> Result<PipelineResult, BackendError>;
 }
 
@@ -137,12 +144,14 @@ impl Backend for RealBackend {
         &self,
         experiment: Experiment,
         portfolio: Portfolio,
+        policy: Option<RiskPolicy>,
     ) -> Result<EvidenceTrace, BackendError> {
         let holdings: Vec<(String, f64)> =
             portfolio.holdings.iter().map(|h| (h.ticker.clone(), h.weight)).collect();
         let ctx = compute::context::ExperimentContext {
             store: self.store.clone(),
             portfolio_hash: compute::portfolio::portfolio_hash(&holdings),
+            policy,
         };
         let trace = tokio::task::spawn_blocking(move || {
             agent::pipeline::compute_trace(&experiment, &portfolio, &ctx)
@@ -157,6 +166,7 @@ impl Backend for RealBackend {
         portfolio: Portfolio,
         message: String,
         conversation_history: Vec<ConversationTurn>,
+        policy: Option<RiskPolicy>,
     ) -> Result<PipelineResult, BackendError> {
         let result = agent::pipeline::run(
             &self.gemini,
@@ -164,6 +174,7 @@ impl Backend for RealBackend {
             portfolio,
             &conversation_history,
             self.store.clone(),
+            policy,
         )
         .await?;
         Ok(result)

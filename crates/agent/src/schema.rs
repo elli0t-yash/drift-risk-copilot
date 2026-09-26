@@ -19,8 +19,8 @@
 use std::collections::HashMap;
 
 use compute::experiments::{
-    CvarRebalanceInput, FactorShockInput, PortfolioPerformanceInput, RiskDecompositionInput,
-    RiskDriftInput, ReverseStressInput,
+    CvarRebalanceInput, FactorShockInput, PolicyCheckInput, PortfolioPerformanceInput,
+    ReverseStressInput, RiskDecompositionInput, RiskDriftInput,
 };
 use serde_json::Value;
 
@@ -32,6 +32,7 @@ pub const CVAR_REBALANCE_FUNCTION: &str = "run_cvar_rebalance";
 pub const PORTFOLIO_PERFORMANCE_FUNCTION: &str = "run_portfolio_performance";
 pub const RISK_DRIFT_FUNCTION: &str = "run_risk_drift";
 pub const REVERSE_STRESS_FUNCTION: &str = "run_reverse_stress";
+pub const POLICY_CHECK_FUNCTION: &str = "run_policy_check";
 
 /// Fields the caller supplies out-of-band (portfolio holdings/weights) and
 /// that are therefore stripped from the schema shown to Gemini, so a small
@@ -110,6 +111,15 @@ pub fn experiment_function_declarations() -> Vec<FunctionDeclaration> {
                 INR."
                 .to_string(),
             parameters: sanitized_schema::<ReverseStressInput>(),
+        },
+        FunctionDeclaration {
+            name: POLICY_CHECK_FUNCTION.to_string(),
+            description: "Check whether a portfolio complies with specified risk limits. Use \
+                when the user asks whether their portfolio is within risk limits, whether they \
+                are breaching any policy, or whether their risk is acceptable. All policy \
+                fields are optional \u{2014} omit any limit the user does not mention."
+                .to_string(),
+            parameters: sanitized_schema::<PolicyCheckInput>(),
         },
     ]
 }

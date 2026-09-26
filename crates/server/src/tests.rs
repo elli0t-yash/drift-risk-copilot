@@ -79,6 +79,7 @@ fn sample_trace() -> EvidenceTrace {
         invariants: vec![],
         engine_version: "0.1.0".to_string(),
         baseline_model_params: None,
+        policy_result: None,
     }
 }
 
@@ -93,6 +94,7 @@ struct MockBackend {
     experiment_error: Option<BackendError>,
     ask_result: Option<agent::pipeline::PipelineResult>,
     received_conversation_history: Mutex<Option<Vec<agent::ConversationTurn>>>,
+    received_policy: Mutex<Option<Option<compute::policy::RiskPolicy>>>,
 }
 
 #[async_trait::async_trait]
@@ -101,7 +103,9 @@ impl Backend for MockBackend {
         &self,
         _experiment: Experiment,
         _portfolio: Portfolio,
+        policy: Option<compute::policy::RiskPolicy>,
     ) -> Result<EvidenceTrace, BackendError> {
+        *self.received_policy.lock().unwrap() = Some(policy);
         if let Some(err) = &self.experiment_error {
             return Err(err.clone());
         }
@@ -115,8 +119,10 @@ impl Backend for MockBackend {
         _portfolio: Portfolio,
         _message: String,
         conversation_history: Vec<agent::ConversationTurn>,
+        policy: Option<compute::policy::RiskPolicy>,
     ) -> Result<agent::pipeline::PipelineResult, BackendError> {
         *self.received_conversation_history.lock().unwrap() = Some(conversation_history);
+        *self.received_policy.lock().unwrap() = Some(policy);
         self.ask_result
             .as_ref()
             .map(|r| agent::pipeline::PipelineResult {
@@ -174,6 +180,7 @@ async fn health_returns_200_and_expected_json() {
         experiment_error: None,
         ask_result: None,
         received_conversation_history: Mutex::new(None),
+        received_policy: Mutex::new(None),
     });
 
     let response = app
@@ -194,6 +201,7 @@ async fn experiment_with_valid_request_returns_a_trace() {
         experiment_error: None,
         ask_result: None,
         received_conversation_history: Mutex::new(None),
+        received_policy: Mutex::new(None),
     });
 
     let req_body = serde_json::json!({
@@ -225,6 +233,7 @@ async fn experiment_with_weights_not_summing_to_one_returns_400() {
         experiment_error: None,
         ask_result: None,
         received_conversation_history: Mutex::new(None),
+        received_policy: Mutex::new(None),
     });
 
     let bad_portfolio = serde_json::json!({
@@ -279,6 +288,7 @@ async fn ask_with_mocked_pipeline_returns_grounding_warnings() {
         experiment_error: None,
         ask_result: Some(pipeline_result),
         received_conversation_history: Mutex::new(None),
+        received_policy: Mutex::new(None),
     });
 
     let req_body = serde_json::json!({
@@ -329,6 +339,7 @@ async fn ask_with_non_empty_conversation_history_forwards_it_to_the_backend() {
         experiment_error: None,
         ask_result: Some(pipeline_result),
         received_conversation_history: Mutex::new(None),
+        received_policy: Mutex::new(None),
     });
     let app = build_router(AppState {
         backend: backend.clone(),
@@ -385,6 +396,7 @@ async fn report_route_returns_pdf_for_a_result_stored_by_a_prior_ask() {
         experiment_error: None,
         ask_result: Some(pipeline_result),
         received_conversation_history: Mutex::new(None),
+        received_policy: Mutex::new(None),
     });
 
     let ask_body = serde_json::json!({
@@ -440,6 +452,7 @@ async fn report_route_returns_404_for_an_unknown_id() {
         experiment_error: None,
         ask_result: None,
         received_conversation_history: Mutex::new(None),
+        received_policy: Mutex::new(None),
     });
 
     let unknown_id = uuid::Uuid::new_v4();
@@ -463,6 +476,7 @@ async fn scenarios_route_returns_three_scenarios_with_expected_fields() {
         experiment_error: None,
         ask_result: None,
         received_conversation_history: Mutex::new(None),
+        received_policy: Mutex::new(None),
     });
 
     let response = app
@@ -488,6 +502,7 @@ async fn static_route_returns_200_and_html_content_type() {
         experiment_error: None,
         ask_result: None,
         received_conversation_history: Mutex::new(None),
+        received_policy: Mutex::new(None),
     });
 
     let response = app
@@ -512,6 +527,7 @@ async fn experiment_still_works_end_to_end_with_snapshot_store() {
         experiment_error: None,
         ask_result: None,
         received_conversation_history: Mutex::new(None),
+        received_policy: Mutex::new(None),
     });
 
     let req_body = serde_json::json!({
@@ -550,6 +566,7 @@ async fn report_route_retrieves_an_experiment_originated_snapshot() {
         experiment_error: None,
         ask_result: None,
         received_conversation_history: Mutex::new(None),
+        received_policy: Mutex::new(None),
     });
 
     let req_body = serde_json::json!({
@@ -590,6 +607,7 @@ async fn regime_state_is_non_null_in_every_experiment_response() {
         experiment_error: None,
         ask_result: None,
         received_conversation_history: Mutex::new(None),
+        received_policy: Mutex::new(None),
     });
 
     let req_body = serde_json::json!({
@@ -649,6 +667,7 @@ fn empty_backend_app() -> axum::Router {
         experiment_error: None,
         ask_result: None,
         received_conversation_history: Mutex::new(None),
+        received_policy: Mutex::new(None),
     })
 }
 
@@ -776,6 +795,7 @@ async fn experiment_risk_drift_with_a_pre_inserted_baseline_returns_200_with_non
         experiment_error: None,
         ask_result: None,
         received_conversation_history: Mutex::new(None),
+        received_policy: Mutex::new(None),
     });
     store.insert(&risk_drift_snapshot("baseline-hash", 0.10, 0.12)).unwrap();
 
@@ -814,6 +834,7 @@ async fn experiment_risk_drift_with_no_prior_snapshot_returns_422() {
         )),
         ask_result: None,
         received_conversation_history: Mutex::new(None),
+        received_policy: Mutex::new(None),
     });
 
     let req_body = serde_json::json!({
@@ -858,6 +879,7 @@ async fn drift_route_returns_summaries_not_full_traces_after_inserting_two_snaps
         experiment_error: None,
         ask_result: None,
         received_conversation_history: Mutex::new(None),
+        received_policy: Mutex::new(None),
     });
     store.insert(&risk_drift_snapshot("drift-hash", 0.10, 0.12)).unwrap();
     store.insert(&risk_drift_snapshot("drift-hash", 0.12, 0.20)).unwrap();
@@ -921,6 +943,7 @@ async fn experiment_reverse_stress_with_valid_input_returns_200_with_negative_pn
         experiment_error: None,
         ask_result: None,
         received_conversation_history: Mutex::new(None),
+        received_policy: Mutex::new(None),
     });
 
     let req_body = serde_json::json!({
@@ -957,6 +980,7 @@ async fn experiment_reverse_stress_with_infeasible_threshold_returns_422() {
         )),
         ask_result: None,
         received_conversation_history: Mutex::new(None),
+        received_policy: Mutex::new(None),
     });
 
     let req_body = serde_json::json!({
@@ -979,4 +1003,147 @@ async fn experiment_reverse_stress_with_infeasible_threshold_returns_422() {
     let body = body_json(response).await;
     assert!(body["error"].as_str().unwrap().contains("cannot be breached"));
     assert!(body["error"].as_str().unwrap().contains("Maximum feasible loss"));
+}
+
+fn sample_policy_result(all_passed: bool) -> serde_json::Value {
+    if all_passed {
+        serde_json::json!({
+            "checks": [
+                {"rule": "max_vol_annualized", "limit": 1.0, "actual": 0.1552, "passed": true, "breach_magnitude": 0.0, "evidence": "Portfolio annualized volatility is 15.5% (limit: 100.0%)"},
+            ],
+            "all_passed": true,
+            "breach_count": 0,
+            "most_severe_breach": null,
+        })
+    } else {
+        serde_json::json!({
+            "checks": [
+                {"rule": "max_vol_annualized", "limit": 0.01, "actual": 0.1552, "passed": false, "breach_magnitude": 0.1452, "evidence": "Portfolio annualized volatility is 15.5% (limit: 1.0%)"},
+            ],
+            "all_passed": false,
+            "breach_count": 1,
+            "most_severe_breach": {"rule": "max_vol_annualized", "limit": 0.01, "actual": 0.1552, "passed": false, "breach_magnitude": 0.1452, "evidence": "Portfolio annualized volatility is 15.5% (limit: 1.0%)"},
+        })
+    }
+}
+
+fn sample_policy_check_trace(all_passed: bool) -> EvidenceTrace {
+    let mut trace = sample_trace();
+    trace.experiment = "PolicyCheck".to_string();
+    trace.outputs = serde_json::json!({
+        "result": {
+            "policy_result": sample_policy_result(all_passed),
+            "regime_label": "Bull",
+            "portfolio_vol": 0.1552,
+            "portfolio_cvar_95": 0.05,
+            "max_position_weight": 0.6,
+            "max_factor_share": 0.4,
+            "scenario_losses": {},
+        }
+    });
+    trace
+}
+
+#[tokio::test]
+async fn experiment_policy_check_with_a_tight_limit_returns_200_with_all_passed_false() {
+    let app = app_with_backend(MockBackend {
+        experiment_result: Some(sample_policy_check_trace(false)),
+        experiment_error: None,
+        ask_result: None,
+        received_conversation_history: Mutex::new(None),
+        received_policy: Mutex::new(None),
+    });
+
+    let req_body = serde_json::json!({
+        "portfolio": sample_portfolio(),
+        "experiment": { "type": "PolicyCheck", "policy": { "max_vol_annualized": 0.01 } },
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/experiment")
+                .header("content-type", "application/json")
+                .body(Body::from(req_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["outputs"]["result"]["policy_result"]["all_passed"], false);
+}
+
+#[tokio::test]
+async fn experiment_policy_check_with_a_loose_limit_returns_200_with_all_passed_true() {
+    let app = app_with_backend(MockBackend {
+        experiment_result: Some(sample_policy_check_trace(true)),
+        experiment_error: None,
+        ask_result: None,
+        received_conversation_history: Mutex::new(None),
+        received_policy: Mutex::new(None),
+    });
+
+    let req_body = serde_json::json!({
+        "portfolio": sample_portfolio(),
+        "experiment": { "type": "PolicyCheck", "policy": { "max_vol_annualized": 1.0 } },
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/experiment")
+                .header("content-type", "application/json")
+                .body(Body::from(req_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["outputs"]["result"]["policy_result"]["all_passed"], true);
+    assert_eq!(body["outputs"]["result"]["policy_result"]["breach_count"], 0);
+}
+
+#[tokio::test]
+async fn experiment_with_an_attached_policy_runs_the_passive_check_and_returns_policy_result() {
+    let (app, _store) = app_with_backend_and_store(MockBackend {
+        // The mock stands in for what a real backend would do: attach
+        // policy_result to whatever experiment actually ran (here
+        // RiskDecomposition, not PolicyCheck itself).
+        experiment_result: Some({
+            let mut trace = sample_trace();
+            trace.policy_result = Some(serde_json::from_value(sample_policy_result(false)).unwrap());
+            trace
+        }),
+        experiment_error: None,
+        ask_result: None,
+        received_conversation_history: Mutex::new(None),
+        received_policy: Mutex::new(None),
+    });
+
+    let req_body = serde_json::json!({
+        "portfolio": sample_portfolio(),
+        "experiment": { "type": "RiskDecomposition" },
+        "policy": { "max_vol_annualized": 0.01 },
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/experiment")
+                .header("content-type", "application/json")
+                .body(Body::from(req_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["experiment"], "RiskDecomposition");
+    assert_eq!(body["policy_result"]["all_passed"], false);
+    assert_eq!(body["policy_result"]["breach_count"], 1);
 }

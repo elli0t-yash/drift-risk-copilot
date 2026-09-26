@@ -92,6 +92,7 @@ fn risk_decomposition_result(
         invariants: vec![],
         engine_version: "0.1.0".to_string(),
         baseline_model_params: None,
+        policy_result: None,
     };
     (output, trace)
 }
@@ -261,7 +262,7 @@ fn risk_became_more_concentrated_uses_a_5pp_threshold() {
 #[test]
 fn no_baseline_snapshot_id_with_no_prior_snapshot_returns_no_prior_snapshot_error() {
     let store = Arc::new(SnapshotStore::open(":memory:").unwrap());
-    let ctx = ExperimentContext { store, portfolio_hash: "empty-hash".to_string() };
+    let ctx = ExperimentContext { store, portfolio_hash: "empty-hash".to_string(), policy: None };
     let portfolio =
         Portfolio { holdings: vec![Holding { ticker: "AAA".to_string(), weight: 1.0 }], total_value_inr: 1.0 };
 

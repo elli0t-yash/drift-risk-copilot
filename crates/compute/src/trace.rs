@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::data::DataQuality;
 use crate::model::Frequency;
+use crate::policy::PolicyResult;
 use crate::regime::RegimeState;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -87,6 +88,14 @@ pub struct EvidenceTrace {
     /// every other experiment type.
     #[serde(default)]
     pub baseline_model_params: Option<BaselineModelParams>,
+    /// A passive policy check run alongside *any* experiment when the
+    /// request carries a top-level `policy` field (see
+    /// `dispatch::run_experiment`'s doc) -- `None` unless one was
+    /// attached. `PolicyCheck`'s own result lives in `outputs.result`
+    /// instead (it's the experiment, not a side effect of one), so this is
+    /// always `None` for a `PolicyCheck` trace.
+    #[serde(default)]
+    pub policy_result: Option<PolicyResult>,
 }
 
 pub fn engine_version() -> String {

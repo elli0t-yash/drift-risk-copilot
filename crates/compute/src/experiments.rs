@@ -52,6 +52,7 @@ pub enum Experiment {
     PortfolioPerformance(PortfolioPerformanceInput),
     RiskDrift(RiskDriftInput),
     ReverseStress(ReverseStressInput),
+    PolicyCheck(PolicyCheckInput),
 }
 
 // ---------------------------------------------------------------------
@@ -578,6 +579,7 @@ pub fn run_factor_shock(
         invariants,
         engine_version: crate::trace::engine_version(),
         baseline_model_params: None,
+        policy_result: None,
     };
 
     Ok((output, trace))
@@ -757,6 +759,7 @@ pub fn run_risk_decomposition(
         invariants,
         engine_version: crate::trace::engine_version(),
         baseline_model_params: None,
+        policy_result: None,
     };
 
     Ok((output, trace))
@@ -785,3 +788,9 @@ pub use crate::drift::RiskDriftInput;
 // ---------------------------------------------------------------------
 
 pub use crate::reverse_stress::ReverseStressInput;
+
+// ---------------------------------------------------------------------
+// (g) PolicyCheck — see crate::policy.
+// ---------------------------------------------------------------------
+
+pub use crate::policy::PolicyCheckInput;

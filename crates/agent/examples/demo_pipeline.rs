@@ -114,6 +114,7 @@ portfolio's substantial equity beta exposure.";
         portfolio,
         &[],
         store,
+        None,
     )
     .await
     .expect("pipeline run failed");

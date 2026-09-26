@@ -5,6 +5,7 @@ use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
 use compute::experiments::{Experiment, Portfolio};
+use compute::policy::RiskPolicy;
 use compute::trace::EvidenceTrace;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -89,6 +90,12 @@ pub struct ExperimentRequest {
     /// above is spliced in server-side before deserializing into
     /// `Experiment`, so callers never have to repeat it.
     pub experiment: serde_json::Value,
+    /// Separate from `experiment` itself, so *any* experiment can be
+    /// accompanied by a passive policy check (see
+    /// `compute::dispatch::run_experiment`'s doc) without the caller
+    /// needing to use `PolicyCheck` directly.
+    #[serde(default)]
+    pub policy: Option<RiskPolicy>,
 }
 
 pub async fn post_experiment(
@@ -113,7 +120,7 @@ pub async fn post_experiment(
         ApiError::bad_request("invalid_experiment", format!("invalid experiment: {e}"))
     })?;
 
-    let trace = state.backend.run_experiment(experiment, req.portfolio.clone()).await?;
+    let trace = state.backend.run_experiment(experiment, req.portfolio.clone(), req.policy).await?;
 
     let snapshot = snapshot_from_trace(&trace, &req.portfolio)?;
     state.store.insert(&snapshot).map_err(|e| {
@@ -131,6 +138,11 @@ pub struct AskRequest {
     /// See `agent::conversation::ConversationTurn`.
     #[serde(default)]
     pub conversation_history: Vec<agent::ConversationTurn>,
+    /// See `ExperimentRequest::policy`'s doc -- same passive-check
+    /// mechanism, attached here regardless of which experiment the NL
+    /// message ends up parsing to.
+    #[serde(default)]
+    pub policy: Option<RiskPolicy>,
 }
 
 #[derive(Serialize)]
@@ -158,7 +170,7 @@ pub async fn post_ask(
     let portfolio = req.portfolio.clone();
     let result = state
         .backend
-        .run_ask(req.portfolio, req.message, req.conversation_history)
+        .run_ask(req.portfolio, req.message, req.conversation_history, req.policy)
         .await?;
 
     let mut snapshot = snapshot_from_trace(&result.trace, &portfolio)?;

@@ -433,6 +433,7 @@ pub fn run_reverse_stress(
         invariants,
         engine_version: crate::trace::engine_version(),
         baseline_model_params: None,
+        policy_result: None,
     };
 
     Ok((output, trace))

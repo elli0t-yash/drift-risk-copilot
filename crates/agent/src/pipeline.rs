@@ -50,17 +50,22 @@ pub struct PipelineResult {
 /// correctly; an empty history behaves exactly as before it existed.
 /// `store` is threaded into the compute layer as part of an
 /// `ExperimentContext` -- only `RiskDrift` actually uses it (to resolve its
-/// baseline snapshot), every other experiment type ignores it.
+/// baseline snapshot), every other experiment type ignores it. `policy`
+/// (from `/ask`'s optional top-level `policy` field) rides along in the
+/// same context, for `PolicyCheck`/`CvarRebalance`'s own handling of it and
+/// the passive policy check every other experiment type gets when it's set
+/// (see `compute::dispatch::run_experiment`'s doc).
 pub async fn run<C: GeminiClient>(
     client: &C,
     user_message: &str,
     portfolio: Portfolio,
     conversation_history: &[ConversationTurn],
     store: Arc<SnapshotStore>,
+    policy: Option<compute::policy::RiskPolicy>,
 ) -> Result<PipelineResult, PipelineError> {
     let holdings: Vec<(String, f64)> =
         portfolio.holdings.iter().map(|h| (h.ticker.clone(), h.weight)).collect();
-    let ctx = ExperimentContext { store, portfolio_hash: compute::portfolio::portfolio_hash(&holdings) };
+    let ctx = ExperimentContext { store, portfolio_hash: compute::portfolio::portfolio_hash(&holdings), policy };
 
     let experiment = parse_experiment(client, user_message, portfolio.clone(), conversation_history).await?;
 
@@ -145,6 +150,14 @@ fn experiment_summary(trace: &EvidenceTrace) -> String {
             ),
             None => "ReverseStress experiment result.".to_string(),
         },
+        "PolicyCheck" => {
+            let all_passed = result.and_then(|r| r.get("policy_result")).and_then(|r| r.get("all_passed")).and_then(|v| v.as_bool());
+            match all_passed {
+                Some(true) => "PolicyCheck experiment result: portfolio passes all policy checks.".to_string(),
+                Some(false) => "PolicyCheck experiment result: portfolio breaches at least one policy check.".to_string(),
+                None => "PolicyCheck experiment result.".to_string(),
+            }
+        }
         other => format!("{other} experiment result."),
     }
 }
