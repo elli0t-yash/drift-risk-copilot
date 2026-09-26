@@ -1,6 +1,17 @@
 //! Shared INR formatting: Indian lakh/crore digit grouping (last 3 digits,
 //! then groups of 2), used both when a trace field carries a pre-formatted
 //! string for the agent's narration to cite, and by `server`'s PDF report.
+//!
+//! Also `to_pct_2dp`: the shared decimal-fraction -> percent conversion
+//! every experiment's `_pct` output fields use, so narration always has an
+//! exact number to cite for a percentage instead of having to multiply a
+//! raw fraction by 100 itself (and risk citing it unconverted, e.g.
+//! "0.113%" instead of "11.3%").
+
+/// Rounds `fraction * 100` to 2 decimal places, e.g. `0.11304 -> 11.3`.
+pub fn to_pct_2dp(fraction: f64) -> f64 {
+    (fraction * 100.0 * 100.0).round() / 100.0
+}
 
 /// Formats `value` as a whole-rupee amount with Indian digit grouping, e.g.
 /// `1_177_846.39 -> "\u{20b9}11,77,846"`. Negative values use the Unicode
@@ -66,5 +77,12 @@ mod tests {
     #[test]
     fn value_under_a_thousand_is_ungrouped() {
         assert_eq!(format_inr(100.0), "\u{20b9}100");
+    }
+
+    #[test]
+    fn to_pct_2dp_converts_and_rounds() {
+        assert_eq!(to_pct_2dp(0.11304), 11.3);
+        assert_eq!(to_pct_2dp(-0.19899), -19.9);
+        assert_eq!(to_pct_2dp(0.0), 0.0);
     }
 }
