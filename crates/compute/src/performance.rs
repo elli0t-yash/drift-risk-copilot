@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::data::DataQuality;
 use crate::error::{ComputeError, Result};
 use crate::experiments::{log_to_simple, Portfolio};
+use crate::format::to_pct_2dp;
 use crate::model::Frequency;
 use crate::regime;
 use crate::trace::{DataWindow, EvidenceTrace, InvariantCheck, ModelParams};
@@ -58,6 +59,19 @@ pub struct PortfolioPerformanceOutput {
     /// used above. `None` only if that fit itself failed (e.g. the window
     /// is narrower than `regime::fit_hmm`'s minimum observation count).
     pub regime_label: Option<String>,
+    /// `total_return * 100`, rounded to 2dp -- narration must never state a
+    /// raw decimal fraction as a percentage (Gemini otherwise has no
+    /// grounded number to cite for "−19.9%" and either invents one or
+    /// states the fraction itself, e.g. "-0.199%"). See the equivalent
+    /// fields below and `RiskDecompositionOutput`/`ReverseStressOutputs`
+    /// for the same fix applied elsewhere.
+    pub total_return_pct: f64,
+    /// `annualized_return * 100`, rounded to 2dp.
+    pub annualized_return_pct: f64,
+    /// `annualized_vol_realized * 100`, rounded to 2dp.
+    pub annualized_vol_pct: f64,
+    /// `max_drawdown * 100`, rounded to 2dp.
+    pub max_drawdown_pct: f64,
 }
 
 pub fn run_portfolio_performance(
@@ -156,6 +170,10 @@ pub fn run_portfolio_performance(
         best_period_return: best,
         worst_period_return: worst,
         regime_label,
+        total_return_pct: to_pct_2dp(total_return),
+        annualized_return_pct: to_pct_2dp(annualized_return),
+        annualized_vol_pct: to_pct_2dp(annualized_vol_realized),
+        max_drawdown_pct: to_pct_2dp(max_drawdown),
     };
 
     let invariant = InvariantCheck::approx_eq(

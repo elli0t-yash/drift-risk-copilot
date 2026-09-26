@@ -616,6 +616,9 @@ pub struct StockContribution {
     pub ticker: String,
     pub contribution: f64,
     pub fraction_of_vol: f64,
+    /// `fraction_of_vol * 100`, rounded to 2dp -- see
+    /// `RiskDecompositionOutput::portfolio_vol_annualized_pct`'s doc.
+    pub fraction_of_vol_pct: f64,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -623,15 +626,28 @@ pub struct FactorContribution {
     pub factor: String,
     pub contribution: f64,
     pub fraction_of_vol: f64,
+    /// `fraction_of_vol * 100`, rounded to 2dp -- see
+    /// `RiskDecompositionOutput::portfolio_vol_annualized_pct`'s doc.
+    pub fraction_of_vol_pct: f64,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct RiskDecompositionOutput {
     pub portfolio_vol_annualized: f64,
+    /// `portfolio_vol_annualized * 100`, rounded to 2dp -- narration must
+    /// never state a raw decimal fraction as a percentage (Gemini
+    /// otherwise has no grounded number to cite for "11.3%" and either
+    /// invents one or states the fraction itself, e.g. "0.113%"). See the
+    /// equivalent `_pct` fields elsewhere in this struct and on
+    /// `StockContribution`/`FactorContribution`, and
+    /// `PortfolioPerformanceOutput` for the same fix applied there.
+    pub portfolio_vol_annualized_pct: f64,
     pub by_stock: Vec<StockContribution>,
     pub by_factor: Vec<FactorContribution>,
     pub specific_risk_contribution: f64,
     pub specific_risk_fraction_of_vol: f64,
+    /// `specific_risk_fraction_of_vol * 100`, rounded to 2dp.
+    pub specific_risk_fraction_of_vol_pct: f64,
     /// Portfolio-level factor exposure, `Sum_i w_i * beta_ik`, per factor.
     /// Added so `RiskDrift` can compare beta exposure across two
     /// snapshots without re-fitting the baseline's own factor model (which
@@ -669,10 +685,12 @@ pub fn run_risk_decomposition(
             } else {
                 0.0
             };
+            let fraction_of_vol = if vol > 0.0 { contribution / vol } else { 0.0 };
             StockContribution {
                 ticker: model.fits[i].ticker.clone(),
                 contribution,
-                fraction_of_vol: if vol > 0.0 { contribution / vol } else { 0.0 },
+                fraction_of_vol,
+                fraction_of_vol_pct: crate::format::to_pct_2dp(fraction_of_vol),
             }
         })
         .collect();
@@ -686,10 +704,12 @@ pub fn run_risk_decomposition(
     let by_factor: Vec<FactorContribution> = (0..factor_names.len())
         .map(|k| {
             let contribution = if vol > 0.0 { x[k] * fx[k] / vol } else { 0.0 };
+            let fraction_of_vol = if vol > 0.0 { contribution / vol } else { 0.0 };
             FactorContribution {
                 factor: factor_names[k].clone(),
                 contribution,
-                fraction_of_vol: if vol > 0.0 { contribution / vol } else { 0.0 },
+                fraction_of_vol,
+                fraction_of_vol_pct: crate::format::to_pct_2dp(fraction_of_vol),
             }
         })
         .collect();
@@ -731,16 +751,16 @@ pub fn run_risk_decomposition(
         ),
     ];
 
+    let specific_risk_fraction_of_vol =
+        if vol > 0.0 { specific_risk_contribution / vol } else { 0.0 };
     let output = RiskDecompositionOutput {
         portfolio_vol_annualized: vol,
+        portfolio_vol_annualized_pct: crate::format::to_pct_2dp(vol),
         by_stock,
         by_factor,
         specific_risk_contribution,
-        specific_risk_fraction_of_vol: if vol > 0.0 {
-            specific_risk_contribution / vol
-        } else {
-            0.0
-        },
+        specific_risk_fraction_of_vol,
+        specific_risk_fraction_of_vol_pct: crate::format::to_pct_2dp(specific_risk_fraction_of_vol),
         portfolio_betas,
         factor_correlation,
     };

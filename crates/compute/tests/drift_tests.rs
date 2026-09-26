@@ -61,13 +61,20 @@ fn risk_decomposition_result(
     let factor_names: Vec<String> = by_factor.iter().map(|(f, _, _)| f.to_string()).collect();
     let output = RiskDecompositionOutput {
         portfolio_vol_annualized: vol,
+        portfolio_vol_annualized_pct: vol * 100.0,
         by_stock: vec![],
         by_factor: by_factor
             .iter()
-            .map(|(f, c, frac)| FactorContribution { factor: f.to_string(), contribution: *c, fraction_of_vol: *frac })
+            .map(|(f, c, frac)| FactorContribution {
+                factor: f.to_string(),
+                contribution: *c,
+                fraction_of_vol: *frac,
+                fraction_of_vol_pct: *frac * 100.0,
+            })
             .collect(),
         specific_risk_contribution: specific_risk_fraction * vol,
         specific_risk_fraction_of_vol: specific_risk_fraction,
+        specific_risk_fraction_of_vol_pct: specific_risk_fraction * 100.0,
         portfolio_betas: betas,
         factor_correlation: CorrelationMatrix { factor_names, rows: vec![vec![1.0, 0.1], vec![0.1, 1.0]] },
     };
