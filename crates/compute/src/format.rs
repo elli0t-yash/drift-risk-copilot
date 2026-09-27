@@ -13,6 +13,14 @@ pub fn to_pct_2dp(fraction: f64) -> f64 {
     (fraction * 100.0 * 100.0).round() / 100.0
 }
 
+/// Rounds an already-percent-scaled value to 2 decimal places, e.g.
+/// `-1.7764 -> -1.78` -- for a value that's a product of other `_pct`
+/// fields (already percent-scaled), where `to_pct_2dp` would incorrectly
+/// multiply by 100 again.
+pub fn round_2dp(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
+}
+
 /// Formats `value` as a whole-rupee amount with Indian digit grouping, e.g.
 /// `1_177_846.39 -> "\u{20b9}11,77,846"`. Negative values use the Unicode
 /// minus sign (U+2212), not an ASCII hyphen, to match how `agent::grounding`

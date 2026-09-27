@@ -94,3 +94,19 @@ async fn an_empty_array_response_also_falls_back_to_current_risk() {
     assert_eq!(plans.len(), 1);
     assert_eq!(plans[0].tool, "current_risk");
 }
+
+#[tokio::test]
+async fn an_off_topic_message_declines_instead_of_running_a_fallback_experiment() {
+    let client = MockGeminiClient::new(vec![text_response(
+        r#"[{"tool": "decline", "params": {}, "reason": "I can only help with questions about your portfolio's risk and performance."}]"#,
+    )]);
+
+    let err = plan_tools(&client, "What is the weather in Mumbai?", &[]).await.unwrap_err();
+
+    match err {
+        agent::orchestrator::OrchestratorError::Unrecognised(text) => {
+            assert_eq!(text, "I can only help with questions about your portfolio's risk and performance.");
+        }
+        other => panic!("expected Unrecognised, got {other:?}"),
+    }
+}

@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use axum::routing::{get, post};
 use axum::Router;
+use tower_http::cors::{Any, CorsLayer};
 
 use backend::{Backend, RealBackend};
 use routes::AppState;
@@ -65,6 +66,16 @@ async fn main() {
 }
 
 fn build_router(state: AppState) -> Router {
+    // Permissive by design: this API has no cookie/session-based auth (no
+    // credentials to leak cross-origin), and the frontend is served from a
+    // different origin than the Cloud Run API in at least one deployment
+    // shape (see the README) -- so every origin/method/header is allowed
+    // rather than hard-coding a single expected frontend origin.
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
     Router::new()
         .route("/health", get(routes::health))
         .route("/scenarios", get(routes::get_scenarios))
@@ -76,6 +87,7 @@ fn build_router(state: AppState) -> Router {
         .route("/portfolio/upload", post(upload::post_portfolio_upload))
         .fallback(routes::static_handler)
         .layer(axum::middleware::from_fn(logging::log_requests))
+        .layer(cors)
         .with_state(state)
 }
 

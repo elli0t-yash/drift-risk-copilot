@@ -56,6 +56,9 @@ impl From<agent::orchestrator::OrchestratorError> for BackendError {
     fn from(err: agent::orchestrator::OrchestratorError) -> Self {
         match err {
             agent::orchestrator::OrchestratorError::Gemini(g) => BackendError::from(g),
+            agent::orchestrator::OrchestratorError::Unrecognised(text) => {
+                BackendError::Unrecognised(text)
+            }
             other => BackendError::Internal(other.to_string()),
         }
     }

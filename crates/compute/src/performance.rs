@@ -7,13 +7,15 @@
 //! hypothetical shock (FactorShock) or a model-implied risk decomposition
 //! (RiskDecomposition) -- neither of those computes realized returns.
 
+use std::collections::BTreeMap;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::data::DataQuality;
 use crate::error::{ComputeError, Result};
 use crate::experiments::{log_to_simple, Portfolio};
-use crate::format::to_pct_2dp;
+use crate::format::{round_2dp, to_pct_2dp};
 use crate::model::Frequency;
 use crate::regime;
 use crate::trace::{DataWindow, EvidenceTrace, InvariantCheck, ModelParams};
@@ -72,6 +74,56 @@ pub struct PortfolioPerformanceOutput {
     pub annualized_vol_pct: f64,
     /// `max_drawdown * 100`, rounded to 2dp.
     pub max_drawdown_pct: f64,
+    /// Per-holding performance over the same window/date range as the
+    /// portfolio-level figures above, keyed by ticker -- lets narration
+    /// name a specific stock ("what is the most underperforming stock?")
+    /// without a separate experiment.
+    pub holding_returns: BTreeMap<String, HoldingPerformance>,
+    /// Ticker with the highest `total_return_pct` in `holding_returns`.
+    pub best_performer: String,
+    /// Ticker with the lowest `total_return_pct` in `holding_returns`.
+    pub worst_performer: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct HoldingPerformance {
+    pub total_return_pct: f64,
+    pub annualized_return_pct: f64,
+    pub annualized_vol_pct: f64,
+    pub max_drawdown_pct: f64,
+    /// `weight * total_return_pct`, rounded to 2dp -- this holding's own
+    /// share of the portfolio's total return, not its return in isolation
+    /// (e.g. a holding that returned 50% at 5% weight contributed 2.5
+    /// points of the portfolio's total return, not 50).
+    pub contribution_to_portfolio_return_pct: f64,
+}
+
+/// `(total_return, annualized_vol, max_drawdown)` for one holding's own
+/// log-return series, over the same `[start, start+window)` slice and
+/// `ann_factor` as the portfolio-level computation in
+/// `run_portfolio_performance` -- same constant-mix-irrelevant math as the
+/// portfolio level (a single holding has no rebalancing to simplify away),
+/// just applied to one series instead of the weighted sum of all of them.
+fn holding_performance(series: &[f64], start: usize, window: usize, ann_factor: f64) -> (f64, f64, f64) {
+    let period_returns: Vec<f64> =
+        (0..window).map(|s| log_to_simple(series[start + s])).collect();
+
+    let mut cumulative = 1.0_f64;
+    let mut peak = 1.0_f64;
+    let mut max_drawdown = 0.0_f64;
+    for &r in &period_returns {
+        cumulative *= 1.0 + r;
+        peak = peak.max(cumulative);
+        max_drawdown = max_drawdown.min(cumulative / peak - 1.0);
+    }
+    let total_return = cumulative - 1.0;
+
+    let mean_r: f64 = period_returns.iter().sum::<f64>() / window as f64;
+    let variance: f64 = period_returns.iter().map(|r| (r - mean_r).powi(2)).sum::<f64>()
+        / (window.max(2) - 1) as f64;
+    let annualized_vol = (variance * ann_factor).sqrt();
+
+    (total_return, annualized_vol, max_drawdown)
 }
 
 pub fn run_portfolio_performance(
@@ -160,6 +212,42 @@ pub fn run_portfolio_performance(
     });
     let regime_label = regime_state.as_ref().map(|s| s.current_label.to_string());
 
+    let holding_returns: BTreeMap<String, HoldingPerformance> = tickers
+        .iter()
+        .enumerate()
+        .map(|(i, ticker)| {
+            let (total_return_i, annualized_vol_i, max_drawdown_i) =
+                holding_performance(series[i], start, window, ann_factor);
+            let annualized_return_i = (1.0 + total_return_i).powf(ann_factor / window as f64) - 1.0;
+            let total_return_pct = to_pct_2dp(total_return_i);
+            (
+                ticker.clone(),
+                HoldingPerformance {
+                    total_return_pct,
+                    annualized_return_pct: to_pct_2dp(annualized_return_i),
+                    annualized_vol_pct: to_pct_2dp(annualized_vol_i),
+                    max_drawdown_pct: to_pct_2dp(max_drawdown_i),
+                    contribution_to_portfolio_return_pct: round_2dp(weights[i] * total_return_pct),
+                },
+            )
+        })
+        .collect();
+
+    let best_performer = tickers
+        .iter()
+        .max_by(|a, b| {
+            holding_returns[*a].total_return_pct.total_cmp(&holding_returns[*b].total_return_pct)
+        })
+        .expect("tickers is non-empty")
+        .clone();
+    let worst_performer = tickers
+        .iter()
+        .min_by(|a, b| {
+            holding_returns[*a].total_return_pct.total_cmp(&holding_returns[*b].total_return_pct)
+        })
+        .expect("tickers is non-empty")
+        .clone();
+
     let output = PortfolioPerformanceOutput {
         start_value_inr,
         end_value_inr,
@@ -174,6 +262,9 @@ pub fn run_portfolio_performance(
         annualized_return_pct: to_pct_2dp(annualized_return),
         annualized_vol_pct: to_pct_2dp(annualized_vol_realized),
         max_drawdown_pct: to_pct_2dp(max_drawdown),
+        holding_returns,
+        best_performer,
+        worst_performer,
     };
 
     let invariant = InvariantCheck::approx_eq(

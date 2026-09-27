@@ -66,6 +66,20 @@ fn numeric_leaves_flattens_nested_trace_json() {
     assert_eq!(leaves, vec![-2.0, 1.5, 3.0, 4.25]);
 }
 
+/// Regression test for a bug caught live verifying this session's
+/// conversational narration style: "Your portfolio lost 17.8%" states the
+/// magnitude as a positive number and conveys the sign through the word
+/// "lost", not a literal minus sign -- `check_grounding` must still match
+/// it against a negative trace value like `total_return_pct: -17.8`.
+#[test]
+fn a_positive_stated_magnitude_matches_a_negative_trace_value() {
+    let trace_numbers = vec![-0.178, -0.204];
+    let narration = "Your portfolio lost 17.8% with a maximum drawdown of 20.4%.";
+    let check = check_grounding(narration, &trace_numbers);
+    assert!(check.passed(), "unmatched: {:?}", check.unmatched);
+    assert_eq!(check.matched.len(), 2);
+}
+
 #[test]
 fn narration_with_all_matching_numbers_passes() {
     let trace_numbers = vec![-0.12, 0.20, -1_175_389.13, 252.0];

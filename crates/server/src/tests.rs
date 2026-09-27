@@ -229,6 +229,37 @@ async fn health_returns_200_and_expected_json() {
 }
 
 #[tokio::test]
+async fn cors_preflight_on_health_returns_200_with_allow_origin_header() {
+    let app = app_with_backend(MockBackend {
+        experiment_result: None,
+        experiment_error: None,
+        ask_result: None,
+        received_conversation_history: Mutex::new(None),
+        received_policy: Mutex::new(None),
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/health")
+                .header("origin", "https://example.com")
+                .header("access-control-request-method", "GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers().contains_key("access-control-allow-origin"),
+        "expected an Access-Control-Allow-Origin header on the preflight response, got {:?}",
+        response.headers()
+    );
+}
+
+#[tokio::test]
 async fn experiment_with_valid_request_returns_a_trace() {
     let app = app_with_backend(MockBackend {
         experiment_result: Some(sample_trace()),

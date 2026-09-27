@@ -126,3 +126,47 @@ fn two_holding_portfolio_satisfies_its_own_value_invariant() {
     assert_eq!(trace.experiment, "PortfolioPerformance");
     assert!(trace.model_params.regime_state.is_none(), "this experiment never fits a factor model");
 }
+
+/// One holding steadily up, one steadily down: `holding_returns` should
+/// carry each holding's own performance (not the portfolio-level figure),
+/// and `best_performer`/`worst_performer` should identify them correctly.
+#[test]
+fn best_and_worst_performer_are_identified_from_per_holding_returns() {
+    let n = 60;
+    let data = common::market_data_from_log_returns(&[
+        ("WINNER", vec![0.01_f64; n]),
+        ("LOSER", vec![-0.01_f64; n]),
+    ]);
+
+    let input = PortfolioPerformanceInput {
+        portfolio: Portfolio {
+            holdings: vec![
+                Holding { ticker: "WINNER".to_string(), weight: 0.4 },
+                Holding { ticker: "LOSER".to_string(), weight: 0.6 },
+            ],
+            total_value_inr: 1_000_000.0,
+        },
+        frequency: Frequency::Daily,
+        window: Some(n),
+    };
+
+    let (output, _trace) = window_and_trace_helper(&data, &input);
+
+    assert_eq!(output.best_performer, "WINNER");
+    assert_eq!(output.worst_performer, "LOSER");
+    assert_eq!(output.holding_returns.len(), 2);
+
+    let winner = &output.holding_returns["WINNER"];
+    let loser = &output.holding_returns["LOSER"];
+    assert!(winner.total_return_pct > 0.0, "WINNER should have a positive return, got {}", winner.total_return_pct);
+    assert!(loser.total_return_pct < 0.0, "LOSER should have a negative return, got {}", loser.total_return_pct);
+    assert!(winner.annualized_vol_pct.abs() < 1e-6, "constant daily return implies zero realized vol");
+
+    let expected_winner_contribution = (0.4 * winner.total_return_pct * 100.0).round() / 100.0;
+    assert!(
+        (winner.contribution_to_portfolio_return_pct - expected_winner_contribution).abs() < 1e-9,
+        "contribution_to_portfolio_return_pct {} != expected {}",
+        winner.contribution_to_portfolio_return_pct,
+        expected_winner_contribution
+    );
+}
