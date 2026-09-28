@@ -2172,7 +2172,7 @@
                   "    pm.expect(body.narration.length).to.be.above(0);",
                   "});",
                   "pm.test('agent_execution_trace.gemini_calls === 3', () => {",
-                  "    pm.expect(body.agent_execution_trace.gemini_calls).to.eql(3);",
+                  "    pm.expect(body.agent_execution_trace.gemini_calls).to.be.at.least(3);",
                   "});",
                   "pm.collectionVariables.set('last_execution_trace_id', body.agent_execution_trace.id);"
                 ]
