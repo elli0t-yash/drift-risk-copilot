@@ -32,6 +32,14 @@ impl ApiError {
             message: message.into(),
         }
     }
+
+    pub fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+        ApiError {
+            status,
+            code,
+            message: message.into(),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {

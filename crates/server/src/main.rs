@@ -4,17 +4,20 @@ mod logging;
 mod pdf;
 mod routes;
 mod upload;
+mod upstox;
 mod validate;
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use axum::routing::{get, post};
 use axum::Router;
 use tower_http::cors::{Any, CorsLayer};
 
 use backend::{Backend, RealBackend};
-use routes::AppState;
+use routes::{AppState, UpstoxConfig};
 use store::SnapshotStore;
+use upstox::{HttpUpstoxClient, UpstoxClient};
 
 /// On Cloud Run, `/data` is ephemeral local disk: it survives a single
 /// warm instance across requests but is not shared across instances or
@@ -23,6 +26,9 @@ use store::SnapshotStore;
 /// deployment would point this at a Cloud SQL instance or a mounted GCS
 /// FUSE volume instead.
 const DEFAULT_SNAPSHOT_DB_PATH: &str = "/data/snapshots.db";
+
+const DEFAULT_UPSTOX_REDIRECT_URI: &str =
+    "https://drift-risk-copilot-99506253437.asia-south1.run.app/auth/upstox/callback";
 
 #[tokio::main]
 async fn main() {
@@ -45,7 +51,25 @@ async fn main() {
         }
     };
     let backend: Arc<dyn Backend> = Arc::new(RealBackend::new(gemini, store.clone()));
-    let state = AppState { backend, store };
+
+    let upstox_api_key = std::env::var("UPSTOX_API_KEY").ok().filter(|s| !s.is_empty());
+    let upstox_api_secret = std::env::var("UPSTOX_API_SECRET").ok().filter(|s| !s.is_empty());
+    let upstox_redirect_uri =
+        std::env::var("UPSTOX_REDIRECT_URI").unwrap_or_else(|_| DEFAULT_UPSTOX_REDIRECT_URI.to_string());
+    let upstox_config = UpstoxConfig {
+        api_key: upstox_api_key,
+        api_secret: upstox_api_secret,
+        redirect_uri: upstox_redirect_uri,
+    };
+    if upstox_config.is_configured() {
+        tracing::info!("Upstox OAuth: configured");
+    } else {
+        tracing::info!("Upstox OAuth: not configured (UPSTOX_API_KEY missing)");
+    }
+    let upstox_client: Arc<dyn UpstoxClient> = Arc::new(HttpUpstoxClient::new());
+    let upstox_state_map = Arc::new(Mutex::new(HashMap::new()));
+
+    let state = AppState { backend, store, upstox_config, upstox_client, upstox_state_map };
 
     let app = build_router(state);
 
@@ -85,6 +109,9 @@ fn build_router(state: AppState) -> Router {
         .route("/execution-trace/:id", get(routes::get_execution_trace))
         .route("/drift", get(routes::get_drift))
         .route("/portfolio/upload", post(upload::post_portfolio_upload))
+        .route("/auth/upstox/login", get(routes::get_upstox_login))
+        .route("/auth/upstox/callback", get(routes::get_upstox_callback))
+        .route("/auth/upstox/status", get(routes::get_upstox_status))
         .fallback(routes::static_handler)
         .layer(axum::middleware::from_fn(logging::log_requests))
         .layer(cors)

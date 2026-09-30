@@ -1,4 +1,6 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
@@ -13,14 +15,37 @@ use store::{RiskSnapshot, SnapshotStore};
 
 use crate::backend::Backend;
 use crate::error::{ApiError, AppJson};
+use crate::upstox::UpstoxClient;
 use crate::validate::validate_portfolio;
 
 const INDEX_HTML: &str = include_str!("../static/index.html");
+
+/// Upstox OAuth config, read from env once at startup (see `main::main`).
+/// `redirect_uri` always has a value (falls back to the production
+/// default); `api_key`/`api_secret` are `None` in an unconfigured
+/// environment (local dev with no credentials set).
+#[derive(Clone)]
+pub struct UpstoxConfig {
+    pub api_key: Option<String>,
+    pub api_secret: Option<String>,
+    pub redirect_uri: String,
+}
+
+impl UpstoxConfig {
+    pub fn is_configured(&self) -> bool {
+        self.api_key.is_some() && self.api_secret.is_some()
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
     pub backend: Arc<dyn Backend>,
     pub store: Arc<SnapshotStore>,
+    pub upstox_config: UpstoxConfig,
+    pub upstox_client: Arc<dyn UpstoxClient>,
+    /// state UUID -> when it was issued; see `upstox::insert_state`/
+    /// `upstox::validate_and_consume_state`.
+    pub upstox_state_map: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 /// Builds the `RiskSnapshot` `SnapshotStore::insert` persists for a
@@ -360,4 +385,122 @@ pub async fn get_drift(
     }
 
     Ok(Json(DriftListResponse { snapshots }))
+}
+
+// ---------------------------------------------------------------------
+// Upstox OAuth
+// ---------------------------------------------------------------------
+
+const UPSTOX_AUTHORIZE_URL: &str = "https://api.upstox.com/v2/login/authorization/dialog";
+
+/// `GET /auth/upstox/login`: redirects to Upstox's OAuth 2.0 authorization
+/// dialog. 503 if Upstox credentials aren't configured in this environment
+/// (see `UpstoxConfig::is_configured`) -- local dev without credentials
+/// fails cleanly here instead of panicking or producing a broken redirect.
+///
+/// **Judgment call**: the spec's own URL host (`api.upstox.com`, given
+/// verbatim in its URL-construction section) and its test description
+/// (asserting the redirect's `Location` contains `accounts.upstox.com`)
+/// disagree. Followed the explicit URL, which also matches Upstox's real,
+/// documented OAuth endpoint -- flagged in this session's report rather
+/// than silently picking one.
+pub async fn get_upstox_login(State(state): State<AppState>) -> Response {
+    let Some(api_key) = state.upstox_config.api_key.as_deref() else {
+        return ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "not_configured", "Upstox OAuth not configured")
+            .into_response();
+    };
+
+    let oauth_state = crate::upstox::insert_state(&state.upstox_state_map);
+    let url = format!(
+        "{UPSTOX_AUTHORIZE_URL}?response_type=code&client_id={}&redirect_uri={}&state={}",
+        urlencoding::encode(api_key),
+        urlencoding::encode(&state.upstox_config.redirect_uri),
+        urlencoding::encode(&oauth_state),
+    );
+
+    (StatusCode::FOUND, [(header::LOCATION, url)]).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct UpstoxCallbackQuery {
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub state: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct UpstoxImportResponse {
+    pub portfolio: Portfolio,
+    pub holdings_count: usize,
+    pub data_as_of: String,
+}
+
+/// `GET /auth/upstox/callback`: receives Upstox's redirect after the user
+/// logs in (`?code=...&state=...`), exchanges the one-time `code` for an
+/// access token, fetches holdings, and returns them as a `Portfolio`. The
+/// access token is used exactly once for the holdings fetch and never
+/// persisted -- this endpoint is stateless and read-only with respect to
+/// the user's Upstox account.
+pub async fn get_upstox_callback(
+    State(state): State<AppState>,
+    Query(query): Query<UpstoxCallbackQuery>,
+) -> Result<Json<UpstoxImportResponse>, ApiError> {
+    let code = query
+        .code
+        .ok_or_else(|| ApiError::bad_request("invalid_callback", "missing \"code\" query parameter"))?;
+    let oauth_state = query
+        .state
+        .ok_or_else(|| ApiError::bad_request("invalid_callback", "missing \"state\" query parameter"))?;
+
+    if !crate::upstox::validate_and_consume_state(&state.upstox_state_map, &oauth_state) {
+        return Err(ApiError::bad_request(
+            "invalid_state",
+            "Invalid or expired OAuth state. Please try again.",
+        ));
+    }
+
+    let (api_key, api_secret) = match (&state.upstox_config.api_key, &state.upstox_config.api_secret) {
+        (Some(k), Some(s)) => (k.clone(), s.clone()),
+        _ => {
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "not_configured",
+                "Upstox OAuth not configured",
+            ))
+        }
+    };
+
+    let access_token = state
+        .upstox_client
+        .exchange_code_for_token(&code, &api_key, &api_secret, &state.upstox_config.redirect_uri)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, "upstox_error", e.to_string()))?;
+
+    let holdings = state
+        .upstox_client
+        .fetch_holdings(&access_token)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, "upstox_error", e.to_string()))?;
+
+    let portfolio = crate::upstox::holdings_to_portfolio(&holdings).map_err(|e| match e {
+        crate::upstox::UpstoxError::InsufficientHoldings => {
+            ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "upstox_error", e.to_string())
+        }
+        other => ApiError::new(StatusCode::BAD_GATEWAY, "upstox_error", other.to_string()),
+    })?;
+
+    let holdings_count = portfolio.holdings.len();
+    Ok(Json(UpstoxImportResponse {
+        portfolio,
+        holdings_count,
+        data_as_of: chrono::Utc::now().to_rfc3339(),
+    }))
+}
+
+/// `GET /auth/upstox/status`: whether Upstox credentials are configured in
+/// this environment, so the UI can decide whether to show the "Connect
+/// with Upstox" button at all.
+pub async fn get_upstox_status(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "configured": state.upstox_config.is_configured() }))
 }

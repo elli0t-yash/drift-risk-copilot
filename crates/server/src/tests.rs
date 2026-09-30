@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -14,7 +16,8 @@ use compute::trace::{DataWindow, EvidenceTrace, ModelParams};
 
 use crate::backend::{Backend, BackendError};
 use crate::build_router;
-use crate::routes::AppState;
+use crate::routes::{AppState, UpstoxConfig};
+use crate::upstox::{UpstoxClient, UpstoxError, UpstoxHolding};
 
 fn sample_portfolio() -> Portfolio {
     Portfolio {
@@ -186,8 +189,87 @@ fn app_with_backend_and_store(backend: MockBackend) -> (axum::Router, Arc<store:
     let app = build_router(AppState {
         backend: Arc::new(backend),
         store: store.clone(),
+        upstox_config: unconfigured_upstox_config(),
+        upstox_client: Arc::new(MockUpstoxClient::unused()),
+        upstox_state_map: Arc::new(Mutex::new(HashMap::new())),
     });
     (app, store)
+}
+
+/// A `Result<T, String>`-backed `UpstoxClient`: the `Err` variant carries
+/// the raw message `UpstoxError::TokenExchange`/`HoldingsFetch` would wrap
+/// (matching their "surface verbatim" contract), so a test configures
+/// exactly what the real API would have returned.
+struct MockUpstoxClient {
+    token_result: Result<String, String>,
+    holdings_result: Result<Vec<UpstoxHolding>, String>,
+}
+
+impl MockUpstoxClient {
+    /// For an `AppState` built by a test that never exercises the Upstox
+    /// routes at all -- any call into this is itself a test bug.
+    fn unused() -> Self {
+        MockUpstoxClient {
+            token_result: Err("MockUpstoxClient::unused() was called".to_string()),
+            holdings_result: Err("MockUpstoxClient::unused() was called".to_string()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl UpstoxClient for MockUpstoxClient {
+    async fn exchange_code_for_token(
+        &self,
+        _code: &str,
+        _client_id: &str,
+        _client_secret: &str,
+        _redirect_uri: &str,
+    ) -> Result<String, UpstoxError> {
+        self.token_result.clone().map_err(UpstoxError::TokenExchange)
+    }
+
+    async fn fetch_holdings(&self, _access_token: &str) -> Result<Vec<UpstoxHolding>, UpstoxError> {
+        self.holdings_result.clone().map_err(UpstoxError::HoldingsFetch)
+    }
+}
+
+fn unconfigured_upstox_config() -> UpstoxConfig {
+    UpstoxConfig { api_key: None, api_secret: None, redirect_uri: "https://example.com/auth/upstox/callback".to_string() }
+}
+
+fn configured_upstox_config() -> UpstoxConfig {
+    UpstoxConfig {
+        api_key: Some("test-client-id".to_string()),
+        api_secret: Some("test-client-secret".to_string()),
+        redirect_uri: "https://example.com/auth/upstox/callback".to_string(),
+    }
+}
+
+/// Builds an app wired for the Upstox routes specifically: `configured`
+/// controls whether `UpstoxConfig` has credentials set, and the returned
+/// state map lets a test insert/inspect OAuth states directly (e.g. to
+/// simulate an expired one) rather than only through HTTP responses.
+fn app_with_upstox(
+    upstox_client: Arc<dyn UpstoxClient>,
+    configured: bool,
+) -> (axum::Router, Arc<Mutex<HashMap<String, Instant>>>) {
+    let backend = MockBackend {
+        experiment_result: None,
+        experiment_error: None,
+        ask_result: None,
+        received_conversation_history: Mutex::new(None),
+        received_policy: Mutex::new(None),
+    };
+    let upstox_config = if configured { configured_upstox_config() } else { unconfigured_upstox_config() };
+    let upstox_state_map = Arc::new(Mutex::new(HashMap::new()));
+    let app = build_router(AppState {
+        backend: Arc::new(backend),
+        store: Arc::new(store::SnapshotStore::open(":memory:").unwrap()),
+        upstox_config,
+        upstox_client,
+        upstox_state_map: upstox_state_map.clone(),
+    });
+    (app, upstox_state_map)
 }
 
 /// Whether `needle` appears in a rendered PDF's actual text content.
@@ -415,6 +497,9 @@ async fn ask_with_non_empty_conversation_history_forwards_it_to_the_backend() {
     let app = build_router(AppState {
         backend: backend.clone(),
         store: Arc::new(store::SnapshotStore::open(":memory:").unwrap()),
+        upstox_config: unconfigured_upstox_config(),
+        upstox_client: Arc::new(MockUpstoxClient::unused()),
+        upstox_state_map: Arc::new(Mutex::new(HashMap::new())),
     });
 
     let req_body = serde_json::json!({
@@ -1308,4 +1393,191 @@ async fn experiment_with_an_attached_policy_runs_the_passive_check_and_returns_p
     assert_eq!(body["experiment"], "RiskDecomposition");
     assert_eq!(body["policy_result"]["all_passed"], false);
     assert_eq!(body["policy_result"]["breach_count"], 1);
+}
+
+// ---------------------------------------------------------------------
+// Upstox OAuth
+// ---------------------------------------------------------------------
+
+fn sample_nse_holding(symbol: &str, quantity: f64, average_price: f64) -> UpstoxHolding {
+    UpstoxHolding {
+        trading_symbol: symbol.to_string(),
+        exchange: "NSE_EQ".to_string(),
+        quantity,
+        average_price,
+    }
+}
+
+#[tokio::test]
+async fn upstox_status_returns_configured_true_when_env_is_set() {
+    let (app, _) = app_with_upstox(Arc::new(MockUpstoxClient::unused()), true);
+
+    let response =
+        app.oneshot(Request::builder().uri("/auth/upstox/status").body(Body::empty()).unwrap()).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["configured"], true);
+}
+
+#[tokio::test]
+async fn upstox_status_returns_configured_false_when_env_is_absent() {
+    let (app, _) = app_with_upstox(Arc::new(MockUpstoxClient::unused()), false);
+
+    let response =
+        app.oneshot(Request::builder().uri("/auth/upstox/status").body(Body::empty()).unwrap()).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["configured"], false);
+}
+
+#[tokio::test]
+async fn upstox_login_returns_302_with_location_containing_upstox_domain_and_state() {
+    let (app, _) = app_with_upstox(Arc::new(MockUpstoxClient::unused()), true);
+
+    let response =
+        app.oneshot(Request::builder().uri("/auth/upstox/login").body(Body::empty()).unwrap()).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::FOUND);
+    let location = response.headers().get("location").unwrap().to_str().unwrap();
+    // See the judgment-call note on `routes::get_upstox_login`: the spec's
+    // own URL construction (api.upstox.com) and its test description
+    // (accounts.upstox.com) disagree -- asserting the former, which is
+    // what the handler actually redirects to.
+    assert!(location.contains("api.upstox.com"), "location was {location:?}");
+    assert!(location.contains("state="), "location was {location:?}");
+}
+
+#[tokio::test]
+async fn upstox_login_returns_503_when_not_configured() {
+    let (app, _) = app_with_upstox(Arc::new(MockUpstoxClient::unused()), false);
+
+    let response =
+        app.oneshot(Request::builder().uri("/auth/upstox/login").body(Body::empty()).unwrap()).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = body_json(response).await;
+    assert_eq!(body["code"], "not_configured");
+}
+
+#[tokio::test]
+async fn upstox_callback_with_invalid_state_returns_400() {
+    let (app, _) = app_with_upstox(Arc::new(MockUpstoxClient::unused()), true);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/auth/upstox/callback?code=some-code&state=not-a-real-state")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(response).await;
+    assert!(body["error"].as_str().unwrap().contains("Invalid or expired OAuth state"));
+}
+
+#[tokio::test]
+async fn upstox_callback_with_expired_state_returns_400() {
+    let (app, state_map) = app_with_upstox(Arc::new(MockUpstoxClient::unused()), true);
+    let expired_state = "expired-state-id".to_string();
+    state_map.lock().unwrap().insert(expired_state.clone(), Instant::now() - Duration::from_secs(601));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/auth/upstox/callback?code=some-code&state={expired_state}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn upstox_callback_with_valid_state_and_mocked_holdings_returns_200_with_portfolio() {
+    let upstox_client = MockUpstoxClient {
+        token_result: Ok("mock-access-token".to_string()),
+        holdings_result: Ok(vec![
+            sample_nse_holding("RELIANCE", 10.0, 2500.0),
+            sample_nse_holding("TCS", 5.0, 3800.0),
+        ]),
+    };
+    let (app, state_map) = app_with_upstox(Arc::new(upstox_client), true);
+    let state = "valid-state-id".to_string();
+    state_map.lock().unwrap().insert(state.clone(), Instant::now());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/auth/upstox/callback?code=some-code&state={state}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["holdings_count"], 2);
+    assert!(!body["data_as_of"].as_str().unwrap().is_empty());
+    let holdings = body["portfolio"]["holdings"].as_array().unwrap();
+    assert_eq!(holdings.len(), 2);
+    assert!(holdings.iter().any(|h| h["ticker"] == "RELIANCE.NS"));
+    assert!(holdings.iter().any(|h| h["ticker"] == "TCS.NS"));
+}
+
+#[tokio::test]
+async fn upstox_callback_with_fewer_than_two_nse_eq_holdings_returns_422() {
+    let upstox_client = MockUpstoxClient {
+        token_result: Ok("mock-access-token".to_string()),
+        holdings_result: Ok(vec![sample_nse_holding("RELIANCE", 10.0, 2500.0)]),
+    };
+    let (app, state_map) = app_with_upstox(Arc::new(upstox_client), true);
+    let state = "valid-state-id".to_string();
+    state_map.lock().unwrap().insert(state.clone(), Instant::now());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/auth/upstox/callback?code=some-code&state={state}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = body_json(response).await;
+    assert_eq!(body["code"], "upstox_error");
+}
+
+#[tokio::test]
+async fn upstox_callback_surfaces_token_exchange_failure_as_502() {
+    let upstox_client = MockUpstoxClient {
+        token_result: Err("invalid_grant: authorization code has expired".to_string()),
+        holdings_result: Err("unused".to_string()),
+    };
+    let (app, state_map) = app_with_upstox(Arc::new(upstox_client), true);
+    let state = "valid-state-id".to_string();
+    state_map.lock().unwrap().insert(state.clone(), Instant::now());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/auth/upstox/callback?code=some-code&state={state}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = body_json(response).await;
+    assert_eq!(body["error"], "invalid_grant: authorization code has expired");
 }
