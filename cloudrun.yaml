@@ -35,6 +35,16 @@ spec:
                 secretKeyRef:
                   name: drift-gemini-key
                   key: latest
+            - name: UPSTOX_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: upstox-api-key
+                  key: latest
+            - name: UPSTOX_API_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: upstox-api-secret
+                  key: latest
             # /data is the container's own ephemeral local disk: it survives
             # requests on a single warm instance but is never shared across
             # instances/revisions and is lost on cold start or scale-to-zero
