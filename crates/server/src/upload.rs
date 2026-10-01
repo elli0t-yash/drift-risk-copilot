@@ -1,11 +1,22 @@
 //! `POST /portfolio/upload`: turns a CSV or XLSX file into a `Portfolio`
 //! the caller can hand straight to `/experiment` or `/ask`.
 //!
-//! Column detection recognises the header conventions of several major
-//! Indian brokers' holdings exports (Zerodha, Upstox, Groww, Angel One,
-//! HDFC Securities, ICICI Direct), not just this codebase's own canonical
-//! `ticker`/`weight`/`shares`/`avg_price_inr` names -- see
-//! `TICKER_ALIASES`/`QUANTITY_ALIASES`/`PRICE_ALIASES`/`WEIGHT_ALIASES`.
+//! Column detection recognises the header conventions of 9 major Indian
+//! brokers' holdings exports (not just this codebase's own canonical
+//! `ticker`/`weight`/`shares`/`avg_price_inr` names) -- known formats, for
+//! reference and as what this module's tests are built against:
+//!
+//! | Broker            | Ticker column        | Quantity column       | Price column      | Notes                              |
+//! |--------------------|----------------------|------------------------|--------------------|-------------------------------------|
+//! | Zerodha (Kite/Console) | `Instrument`      | `Qty.`                 | `Avg. cost`        | ~3 metadata rows above the header   |
+//! | Upstox             | `Symbol`/`trading_symbol` | `Quantity`/`Quantity Available` | `Average Price` | tickers may carry an `NSE:` prefix |
+//! | Groww              | `Symbol`              | `Units`                | `Average Buy Price` |                                    |
+//! | Angel One          | `Symbol`/`Scrip Name` | `Net Quantity`         | `Avg. Buy Price`   |                                     |
+//! | HDFC Securities    | `Symbol`              | `Quantity`             | `Avg Rate`         | multiple title rows above header    |
+//! | ICICI Direct       | `Stock Name`          | `Quantity`             | `Average Rate`     | report header rows above data       |
+//! | 5Paisa             | `Symbol`              | `Qty`                  | `Avg Price`        |                                     |
+//! | Motilal Oswal      | `Scrip Name`          | `Qty`                  | `Buy Avg Price`    |                                     |
+//! | Kotak Securities   | `Scrip`               | `Quantity`             | `Average Price`    |                                     |
 
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -26,68 +37,141 @@ use crate::validate::validate_portfolio;
 /// `Portfolio` before using it.
 const DEFAULT_TOTAL_VALUE_INR: f64 = 1_000_000.0;
 
-/// Header names (lowercase, matching how `parse_csv`/`parse_xlsx` store
-/// them) a ticker column might be called across the brokers this endpoint
-/// supports. `isin`/`script` are deliberately included even though an
-/// ISIN isn't actually a trading symbol -- a few export formats use the
-/// column for the symbol anyway, and there's no other candidate column to
-/// fall back to in those files.
+/// How many leading rows the header-row scan checks before giving up (see
+/// `find_header_row_index`).
+const MAX_HEADER_SCAN_ROWS: usize = 25;
+
+// Alias lists are matched in the order given -- `find_column` tries each
+// alias against the header row in turn, so when a file's headers happen to
+// match more than one alias (unlikely, but e.g. a file with both "symbol"
+// and "ticker" columns), the earlier-listed alias wins.
+
 const TICKER_ALIASES: &[&str] = &[
     "ticker",
     "symbol",
     "instrument",
     "stock",
     "trading_symbol",
+    "trading symbol",
     "scrip",
-    "isin",
     "script",
+    "isin",
     "stock name",
     "company name",
     "name",
+    "security name",
+    "security",
+    "share name",
+    "scrip name",
+    "stock symbol",
+    "nse symbol",
+    "bse symbol",
+    "equity",
 ];
 
-const QUANTITY_ALIASES: &[&str] =
-    &["qty", "qty.", "quantity", "shares", "units", "net quantity", "holdings", "volume", "net qty", "net qty."];
+const QUANTITY_ALIASES: &[&str] = &[
+    "quantity available",
+    "qty",
+    "qty.",
+    "quantity",
+    "net quantity",
+    "net qty",
+    "net qty.",
+    "shares",
+    "units",
+    "holdings",
+    "volume",
+    "quantity long term",
+    "long term quantity",
+    "free quantity",
+    "saleable quantity",
+    "closing balance",
+    "balance quantity",
+    "total quantity",
+    "gross quantity",
+];
 
-/// Includes `ltp`/`last price`: some exports carry only the current market
-/// price, not the original purchase price. Using it still produces a
-/// internally-consistent *current* weight split (qty * price / total) --
-/// it just means the derived `total_value_inr` reflects today's value
-/// rather than cost basis, which is arguably the more useful number for a
-/// risk tool anyway.
+/// Includes `wap`/`weighted average price`/etc: some exports carry the
+/// current market price rather than the original purchase price. Using it
+/// still produces an internally-consistent *current* weight split (qty *
+/// price / total) -- it just means the derived `total_value_inr` reflects
+/// today's value rather than cost basis, which is arguably the more
+/// useful number for a risk tool anyway.
 const PRICE_ALIASES: &[&str] = &[
     "avg_price_inr",
     "avg. cost",
     "avg cost",
-    "average_price",
+    "average cost",
+    "average price",
     "avg price",
     "avg. price",
+    "avg_price",
+    "average_price",
     "avg rate",
     "average rate",
     "average buy price",
     "avg. buy price",
     "avg buy price",
     "buy avg",
+    // Motilal Oswal's documented export uses this exact phrase; not in
+    // the originally-specified alias list, added so that broker's own
+    // stated format actually parses (see this session's report).
+    "buy avg price",
     "avg. buy rate",
     "cost price",
     "purchase price",
-    "ltp",
-    "last price",
+    "buy price",
+    "avg purchase price",
+    "average purchase price",
+    "weighted average price",
+    "wap",
+    "avg. cost price",
+    "cost per share",
+    "book value per share",
+    "book value",
 ];
 
-const WEIGHT_ALIASES: &[&str] = &["weight", "weight%", "weight %", "allocation", "allocation%", "%"];
+const WEIGHT_ALIASES: &[&str] = &[
+    "weight",
+    "weight%",
+    "weight %",
+    "allocation",
+    "allocation%",
+    "allocation %",
+    "portfolio weight",
+    "portfolio %",
+    "%",
+    "percentage",
+    "percent",
+];
 
-/// How many leading rows `parse_xlsx` scans for the real header row before
-/// giving up and treating row 0 as the header (see its doc comment).
-const MAX_HEADER_SCAN_ROWS: usize = 20;
+/// Row-skip values (see `should_skip_row`), beyond "empty" and "starts
+/// with a digit" which get their own checks.
+const SKIP_ROW_VALUES: &[&str] = &[
+    "total",
+    "grand total",
+    "sub total",
+    "subtotal",
+    "net total",
+    "overall total",
+    // A broker's footer sometimes repeats the header row verbatim.
+    "instrument",
+    "symbol",
+    "stock",
+    "-",
+    "--",
+    "n/a",
+    "na",
+    "nil",
+];
 
 #[derive(Debug, Serialize)]
 pub struct UploadResponse {
     pub portfolio: Portfolio,
     pub layout_detected: &'static str,
     /// `"RELIANCE" -> "RELIANCE.NS"` for every ticker that got normalised
-    /// (suffix appended and/or exchange prefix stripped); empty if none
-    /// needed it.
+    /// (suffix appended, exchange prefix/"-EQ" stripped, or flagged as an
+    /// ISIN needing manual mapping); empty if none needed it.
     pub tickers_normalised: Vec<String>,
     pub row_count: usize,
 }
@@ -140,10 +224,10 @@ pub async fn post_portfolio_upload(mut multipart: Multipart) -> Result<axum::Jso
     }
 
     let lower_name = filename.to_lowercase();
-    let records = if lower_name.ends_with(".csv") {
-        parse_csv(&bytes)?
+    let rows = if lower_name.ends_with(".csv") {
+        read_csv_rows(&bytes)?
     } else if lower_name.ends_with(".xlsx") {
-        parse_xlsx(&bytes)?
+        read_xlsx_rows(&bytes)?
     } else {
         return Err(ApiError::bad_request(
             "unsupported_file_type",
@@ -151,8 +235,13 @@ pub async fn post_portfolio_upload(mut multipart: Multipart) -> Result<axum::Jso
         ));
     };
 
-    if records.is_empty() {
+    if rows.is_empty() {
         return Err(ApiError::bad_request("empty_file", "file contains no data rows"));
+    }
+
+    let records = records_from_rows(&rows)?;
+    if records.is_empty() {
+        return Err(ApiError::bad_request("empty_file", "file contains no data rows below the header"));
     }
 
     let headers: Vec<String> = records[0].keys().cloned().collect();
@@ -161,6 +250,14 @@ pub async fn post_portfolio_upload(mut multipart: Multipart) -> Result<axum::Jso
         Layout::Weight => build_weight_based(&records, &columns)?,
         Layout::Value => build_value_based(&records, &columns)?,
     };
+
+    if holdings.len() < 2 {
+        return Err(ApiError::new(
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "insufficient_holdings",
+            format!("portfolio must have at least 2 holdings after filtering, got {}", holdings.len()),
+        ));
+    }
 
     let row_count = holdings.len();
     let portfolio = Portfolio { holdings, total_value_inr };
@@ -178,68 +275,76 @@ pub async fn post_portfolio_upload(mut multipart: Multipart) -> Result<axum::Jso
 }
 
 /// Case-insensitive header lookup: `field()` on a `Record` (whose keys are
-/// already lowercased in `parse_csv`/`parse_xlsx`).
+/// already lowercased by `records_from_rows`).
 fn field<'a>(record: &'a Record, name: &str) -> Option<&'a str> {
     record.get(name).map(|s| s.as_str())
 }
 
-/// The first header in `headers` matching one of `aliases` (both sides
-/// already lowercase/trimmed by the caller).
+/// The first alias (in list order) that matches one of `headers` (both
+/// sides already lowercase/trimmed by the caller).
 fn find_column(headers: &[String], aliases: &[&str]) -> Option<String> {
-    headers.iter().find(|h| aliases.contains(&h.as_str())).cloned()
+    aliases.iter().find_map(|alias| headers.iter().find(|h| h.as_str() == *alias).cloned())
 }
 
 fn resolve_columns(headers: &[String]) -> Result<ColumnMap, ApiError> {
-    let Some(ticker) = find_column(headers, TICKER_ALIASES) else {
-        return Err(unsupported_format_error(headers));
+    let ticker = find_column(headers, TICKER_ALIASES);
+    let weight = find_column(headers, WEIGHT_ALIASES);
+    let quantity = find_column(headers, QUANTITY_ALIASES);
+    let price = find_column(headers, PRICE_ALIASES);
+
+    let Some(ticker) = ticker else {
+        return Err(unsupported_format_error(headers, "ticker"));
     };
 
     // Weight takes precedence when a file happens to carry both a weight
     // column and quantity+price columns -- it's the more direct signal of
     // intended allocation, not a derived one.
-    if let Some(weight) = find_column(headers, WEIGHT_ALIASES) {
+    if let Some(weight) = weight {
         return Ok(ColumnMap { ticker, quantity: None, price: None, weight: Some(weight), layout: Layout::Weight });
     }
 
-    let quantity = find_column(headers, QUANTITY_ALIASES);
-    let price = find_column(headers, PRICE_ALIASES);
-    if let (Some(quantity), Some(price)) = (quantity, price) {
-        return Ok(ColumnMap {
+    match (quantity, price) {
+        (Some(quantity), Some(price)) => Ok(ColumnMap {
             ticker,
             quantity: Some(quantity),
             price: Some(price),
             weight: None,
             layout: Layout::Value,
-        });
+        }),
+        (None, _) => Err(unsupported_format_error(headers, "quantity")),
+        (Some(_), None) => Err(unsupported_format_error(headers, "price")),
     }
-
-    Err(unsupported_format_error(headers))
 }
 
-fn unsupported_format_error(headers: &[String]) -> ApiError {
+fn unsupported_format_error(headers: &[String], missing: &'static str) -> ApiError {
     let columns = headers.join(", ");
-    ApiError::bad_request(
-        "missing_columns",
+    ApiError::bad_request_with_extra(
+        "unsupported_format",
         format!(
-            "Could not parse portfolio file. Columns found: [{columns}]. Supported brokers: Zerodha, \
-             Upstox, Groww, Angel One, HDFC Securities, ICICI Direct. Expected columns: a ticker \
-             column (Instrument/Symbol/trading_symbol) and either a weight column or quantity + price \
-             columns."
+            "Could not parse portfolio file. Columns found: [{columns}]. Could not identify: {missing} \
+             column.\n\nSupported formats: Zerodha, Upstox, Groww, Angel One, HDFC Securities, ICICI \
+             Direct, 5Paisa, Motilal Oswal, Kotak Securities.\n\nIf your broker is not listed, use our \
+             template:\nCSV with columns: ticker, weight (e.g. RELIANCE.NS, 0.15)\nor: ticker, shares, \
+             avg_price_inr"
         ),
+        serde_json::json!({
+            "columns_found": headers,
+            "missing": missing,
+        }),
     )
 }
 
 /// Whether a row should be skipped rather than treated as a holding: an
-/// empty ticker, a "Total"/"Grand Total" summary row brokers routinely
-/// append, or a row whose ticker cell starts with a digit (seen in some
-/// exports' footnote/disclaimer rows).
+/// empty ticker, a summary/total row, a repeated header row, a
+/// placeholder value ("-", "n/a", "nil", ...), or a row whose ticker cell
+/// starts with a digit (seen in some exports' footnote/disclaimer rows).
 fn should_skip_row(raw_ticker: &str) -> bool {
     let trimmed = raw_ticker.trim();
     if trimmed.is_empty() {
         return true;
     }
     let lower = trimmed.to_lowercase();
-    if lower == "total" || lower == "grand total" {
+    if SKIP_ROW_VALUES.contains(&lower.as_str()) {
         return true;
     }
     trimmed.chars().next().is_some_and(|c| c.is_ascii_digit())
@@ -253,32 +358,50 @@ fn parse_number(record: &Record, name: &str, row_index: usize) -> Result<f64, Ap
     })
 }
 
-/// Strips a leading exchange prefix ("NSE:RELIANCE", "BSE:RELIANCE" ->
-/// "RELIANCE"), then appends `.NS` to a ticker that has no suffix and
-/// looks like a bare NSE symbol (letters/digits only, no `.`) -- both
-/// exchanges normalise to the same `.NS` Yahoo Finance suffix this
-/// codebase uses everywhere else (see `compute::data`), not `.BO`; the two
-/// trade near-identical prices for any name liquid enough to appear in a
-/// retail holdings export, and introducing a second suffix convention
-/// nothing else in the pipeline understands isn't worth it for that
-/// difference. Returns `(normalised_ticker, Some("ORIGINAL -> NORMALISED")
-/// if it changed)`.
+fn is_isin(ticker: &str) -> bool {
+    ticker.len() == 12 && ticker.starts_with("IN") && ticker.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// Normalises a raw ticker cell value, in order:
+/// 1. trim whitespace
+/// 2. uppercase
+/// 3. strip a leading exchange prefix (`NSE:`, `BSE:`, `NSE/`, `BSE/`)
+/// 4. strip a trailing `-EQ` suffix (`RELIANCE-EQ` -> `RELIANCE`)
+/// 5. if it already ends in `.NS` or `.BO`, stop here
+/// 6. if it looks like an ISIN (`IN` + 10 more alphanumerics, 12 chars
+///    total), stop here too -- an ISIN isn't a trading symbol this
+///    codebase (or Yahoo Finance) can resolve on its own, so it's left
+///    as-is with a note flagging that it needs manual mapping, rather
+///    than silently appending `.NS` to something that isn't a symbol
+/// 7. otherwise, append `.NS`
+///
+/// Returns `(normalised_ticker, Some(note) if it changed or needs
+/// attention)`.
 fn normalise_ticker(raw: &str) -> (String, Option<String>) {
-    let trimmed = raw.trim();
-    let without_prefix = trimmed.split_once(':').map(|(_, rest)| rest.trim()).unwrap_or(trimmed);
+    let original = raw.trim();
+    let mut ticker = original.to_uppercase();
 
-    let looks_bare_nse = !without_prefix.contains('.')
-        && !without_prefix.is_empty()
-        && without_prefix.chars().all(|c| c.is_ascii_alphanumeric());
-
-    if looks_bare_nse {
-        let normalised = format!("{}.NS", without_prefix.to_uppercase());
-        (normalised.clone(), Some(format!("{trimmed} -> {normalised}")))
-    } else if without_prefix != trimmed {
-        (without_prefix.to_string(), Some(format!("{trimmed} -> {without_prefix}")))
-    } else {
-        (without_prefix.to_string(), None)
+    for prefix in ["NSE:", "BSE:", "NSE/", "BSE/"] {
+        if let Some(rest) = ticker.strip_prefix(prefix) {
+            ticker = rest.to_string();
+            break;
+        }
     }
+    if let Some(stripped) = ticker.strip_suffix("-EQ") {
+        ticker = stripped.to_string();
+    }
+
+    if ticker.ends_with(".NS") || ticker.ends_with(".BO") {
+        let note = if ticker != original { Some(format!("{original} -> {ticker}")) } else { None };
+        return (ticker, note);
+    }
+
+    if is_isin(&ticker) {
+        return (ticker.clone(), Some(format!("{ticker}: ISIN, needs manual ticker mapping")));
+    }
+
+    let normalised = format!("{ticker}.NS");
+    (normalised.clone(), Some(format!("{original} -> {normalised}")))
 }
 
 fn build_weight_based(records: &[Record], columns: &ColumnMap) -> Result<(Vec<Holding>, Vec<String>, f64), ApiError> {
@@ -332,9 +455,8 @@ fn build_value_based(records: &[Record], columns: &ColumnMap) -> Result<(Vec<Hol
         .collect();
     // Rounding each weight to 6dp independently can leave the reported
     // weights summing to slightly more/less than 1.0 once enough holdings
-    // are involved (the same issue `upstox::holdings_to_portfolio` hit and
-    // fixed the same way) -- absorb the residual into the last holding so
-    // the sum is exact to float precision rather than left to chance.
+    // are involved -- absorb the residual into the last holding so the
+    // sum is exact to float precision rather than left to chance.
     if total_value_inr > 0.0 {
         let rounded_sum: f64 = weights.iter().sum();
         if let Some(last) = weights.last_mut() {
@@ -347,33 +469,28 @@ fn build_value_based(records: &[Record], columns: &ColumnMap) -> Result<(Vec<Hol
     Ok((holdings, tickers_normalised, total_value_inr))
 }
 
-fn parse_csv(bytes: &[u8]) -> Result<Vec<Record>, ApiError> {
-    let mut reader = csv::ReaderBuilder::new().has_headers(true).from_reader(bytes);
-    let headers: Vec<String> = reader
-        .headers()
-        .map_err(|e| ApiError::bad_request("invalid_upload", format!("failed to read CSV headers: {e}")))?
-        .iter()
-        .map(|h| h.trim().to_lowercase())
-        .collect();
-
-    let mut records = Vec::new();
+/// Reads every row of a CSV file as raw string cells, with no header
+/// interpretation -- `records_from_rows` (shared with XLSX) does the
+/// header-row scan instead, so a broker CSV export with metadata rows
+/// above its real header is handled the same way an XLSX one is.
+fn read_csv_rows(bytes: &[u8]) -> Result<Vec<Vec<String>>, ApiError> {
+    // `flexible(true)`: metadata/title rows above the real header (see
+    // `find_header_row_index`'s doc) routinely have a different field
+    // count than the data rows below them (e.g. a single-cell report
+    // title above a 3-column table) -- the csv crate's default strict
+    // mode treats that as a malformed-row error, which would reject every
+    // broker CSV export with metadata rows before we even get a chance to
+    // scan past them.
+    let mut reader = csv::ReaderBuilder::new().has_headers(false).flexible(true).from_reader(bytes);
+    let mut rows = Vec::new();
     for result in reader.records() {
         let row = result.map_err(|e| ApiError::bad_request("invalid_upload", format!("malformed CSV row: {e}")))?;
-        let mut record = Record::new();
-        for (header, value) in headers.iter().zip(row.iter()) {
-            record.insert(header.clone(), value.trim().to_string());
-        }
-        records.push(record);
+        rows.push(row.iter().map(|cell| cell.to_string()).collect());
     }
-    Ok(records)
+    Ok(rows)
 }
 
-/// Scans the first `MAX_HEADER_SCAN_ROWS` rows for the real header row
-/// (the one containing a recognised ticker-column name) before falling
-/// back to row 0 -- Zerodha's XLSX export (and similar broker exports)
-/// prepends metadata rows (account name, date range, disclaimers) above
-/// the actual table.
-fn parse_xlsx(bytes: &[u8]) -> Result<Vec<Record>, ApiError> {
+fn read_xlsx_rows(bytes: &[u8]) -> Result<Vec<Vec<String>>, ApiError> {
     let cursor = Cursor::new(bytes.to_vec());
     let mut workbook: Xlsx<_> = open_workbook_from_rs(cursor)
         .map_err(|e| ApiError::bad_request("invalid_upload", format!("failed to open XLSX file: {e}")))?;
@@ -387,26 +504,43 @@ fn parse_xlsx(bytes: &[u8]) -> Result<Vec<Record>, ApiError> {
         .worksheet_range(&sheet_name)
         .map_err(|e| ApiError::bad_request("invalid_upload", format!("failed to read XLSX sheet: {e}")))?;
 
-    let all_rows: Vec<&[Data]> = range.rows().collect();
-    if all_rows.is_empty() {
-        return Ok(Vec::new());
-    }
+    Ok(range.rows().map(|row| row.iter().map(cell_to_string).collect()).collect())
+}
 
-    let header_idx = all_rows
-        .iter()
-        .take(MAX_HEADER_SCAN_ROWS)
-        .position(|row| {
-            row.iter().any(|cell| TICKER_ALIASES.contains(&cell_to_string(cell).to_lowercase().as_str()))
-        })
-        .unwrap_or(0);
+/// Scans the first `MAX_HEADER_SCAN_ROWS` rows for the real header row:
+/// the first row containing at least one recognised ticker-column name
+/// *and* at least one recognised quantity-or-weight-column name. Broker
+/// exports (Zerodha, ICICI Direct, HDFC Securities, ...) routinely prepend
+/// metadata rows (account name, report title, date range) above the
+/// actual table, so row 0 can't always be trusted as the header.
+fn find_header_row_index(rows: &[Vec<String>]) -> Option<usize> {
+    rows.iter().take(MAX_HEADER_SCAN_ROWS).position(|row| {
+        let lowered: Vec<String> = row.iter().map(|c| c.trim().to_lowercase()).collect();
+        let has_ticker = lowered.iter().any(|c| TICKER_ALIASES.contains(&c.as_str()));
+        let has_quantity_or_weight = lowered
+            .iter()
+            .any(|c| QUANTITY_ALIASES.contains(&c.as_str()) || WEIGHT_ALIASES.contains(&c.as_str()));
+        has_ticker && has_quantity_or_weight
+    })
+}
 
-    let headers: Vec<String> = all_rows[header_idx].iter().map(|cell| cell_to_string(cell).to_lowercase()).collect();
+fn records_from_rows(rows: &[Vec<String>]) -> Result<Vec<Record>, ApiError> {
+    let Some(header_idx) = find_header_row_index(rows) else {
+        // No row in the scanned window had a recognisable ticker *and*
+        // quantity-or-weight column together -- report whatever columns
+        // row 0 has (the most likely candidate a human would call "the
+        // header"), same as `resolve_columns`'s own "ticker not found"
+        // error shape, for a consistent response either way.
+        let headers: Vec<String> = rows[0].iter().map(|c| c.trim().to_lowercase()).collect();
+        return Err(unsupported_format_error(&headers, "ticker"));
+    };
 
+    let headers: Vec<String> = rows[header_idx].iter().map(|c| c.trim().to_lowercase()).collect();
     let mut records = Vec::new();
-    for row in &all_rows[header_idx + 1..] {
+    for row in &rows[header_idx + 1..] {
         let mut record = Record::new();
-        for (header, cell) in headers.iter().zip(row.iter()) {
-            record.insert(header.clone(), cell_to_string(cell));
+        for (header, value) in headers.iter().zip(row.iter()) {
+            record.insert(header.clone(), value.trim().to_string());
         }
         records.push(record);
     }
