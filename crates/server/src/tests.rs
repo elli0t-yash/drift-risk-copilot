@@ -1203,6 +1203,41 @@ async fn a_row_with_an_empty_ticker_is_skipped() {
 }
 
 #[tokio::test]
+async fn zero_weight_holdings_are_dropped_and_counted() {
+    // A zero-quantity row survives row-filtering (it's not an empty/
+    // "Total"/placeholder ticker) but produces a 0.0 weight -- it must not
+    // appear in the returned holdings, and must be counted separately
+    // from `row_count` (which reflects the real, non-zero holdings only).
+    let csv = "ticker,shares,avg_price_inr\nRELIANCE.NS,10,2850.00\nHDFCBANK.NS,25,1640.00\nZEROCO.NS,0,500.00\n";
+    let response = upload(empty_backend_app(), "holdings.csv", "text/csv", csv.as_bytes()).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["skipped_zero_weight"], 1);
+    assert_eq!(body["row_count"], 2);
+    let holdings = body["portfolio"]["holdings"].as_array().unwrap();
+    assert_eq!(holdings.len(), 2);
+    assert!(!holdings.iter().any(|h| h["ticker"] == "ZEROCO.NS"));
+}
+
+#[tokio::test]
+async fn total_value_inr_is_rounded_to_2dp_in_the_response() {
+    // 10 * 2850.333 + 25 * 1640.111 = 28503.33 + 41002.775 = 69506.105,
+    // which must come back rounded to 69506.11 (or 69506.10 -- either is
+    // a valid 2dp rounding of the exact .105 midpoint), never the raw
+    // 3-decimal-place sum.
+    let csv = "ticker,shares,avg_price_inr\nRELIANCE.NS,10,2850.333\nHDFCBANK.NS,25,1640.111\n";
+    let response = upload(empty_backend_app(), "holdings.csv", "text/csv", csv.as_bytes()).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    let total = body["portfolio"]["total_value_inr"].as_f64().unwrap();
+    let rounded_to_2dp = (total * 100.0).round() / 100.0;
+    assert_eq!(total, rounded_to_2dp, "total_value_inr {total} is not already rounded to 2dp");
+    assert!((total - 69506.11).abs() < 0.01 || (total - 69506.10).abs() < 0.01, "got {total}");
+}
+
+#[tokio::test]
 async fn fewer_than_two_holdings_after_filtering_returns_422() {
     // Only one real holding survives filtering (the other two rows are a
     // blank ticker and a "Total" row) -- /portfolio/upload must reject

@@ -174,6 +174,9 @@ pub struct UploadResponse {
     /// ISIN needing manual mapping); empty if none needed it.
     pub tickers_normalised: Vec<String>,
     pub row_count: usize,
+    /// Holdings dropped because their computed weight was 0.0 or below
+    /// 1e-6 after normalisation -- not returned in `portfolio.holdings`.
+    pub skipped_zero_weight: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -251,6 +254,15 @@ pub async fn post_portfolio_upload(mut multipart: Multipart) -> Result<axum::Jso
         Layout::Value => build_value_based(&records, &columns)?,
     };
 
+    // A holding whose weight rounds to ~0 (a zero-share row, a rounding
+    // artifact, ...) isn't a real position -- drop it rather than
+    // returning a portfolio entry that will just fail downstream
+    // validation (every weight must be > 0) or add noise with no actual
+    // risk contribution.
+    let holdings_before = holdings.len();
+    let holdings: Vec<Holding> = holdings.into_iter().filter(|h| h.weight.abs() > 1e-6).collect();
+    let skipped_zero_weight = holdings_before - holdings.len();
+
     if holdings.len() < 2 {
         return Err(ApiError::new(
             axum::http::StatusCode::UNPROCESSABLE_ENTITY,
@@ -260,7 +272,8 @@ pub async fn post_portfolio_upload(mut multipart: Multipart) -> Result<axum::Jso
     }
 
     let row_count = holdings.len();
-    let portfolio = Portfolio { holdings, total_value_inr };
+    let round2 = |x: f64| (x * 100.0).round() / 100.0;
+    let portfolio = Portfolio { holdings, total_value_inr: round2(total_value_inr) };
     validate_portfolio(&portfolio)?;
 
     Ok(axum::Json(UploadResponse {
@@ -271,6 +284,7 @@ pub async fn post_portfolio_upload(mut multipart: Multipart) -> Result<axum::Jso
         },
         tickers_normalised,
         row_count,
+        skipped_zero_weight,
     }))
 }
 
