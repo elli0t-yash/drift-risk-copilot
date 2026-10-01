@@ -9,18 +9,19 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/models";
-// Cheap models for the two non-narration calls; the narration call keeps the
-// stronger flash model since its output is user-facing prose that also has
-// to survive the grounding check in `grounding::grounded_narrate`.
-//
-// Both gemini-2.5-flash-lite and gemini-2.5-flash are documented as still
-// valid but return live 404s for this project ("no longer available to new
-// users... use models/gemini-3.5-flash-lite" / "...models/gemini-3.8-flash"
-// — confirmed 2026-09-26), so this uses Google's own suggested replacements
-// instead.
-pub const MODEL_PARSE: &str = "gemini-3.5-flash-lite";
-pub const MODEL_SUGGEST: &str = "gemini-3.5-flash-lite";
-pub const MODEL_NARRATE: &str = "gemini-3.8-flash";
+// gemini-2.5-flash-lite (tried first, per this session's cost-reduction
+// pass) still 404s for this project -- "no longer available to new
+// users... use models/gemini-3.5-flash-lite" -- confirmed live again
+// 2026-10-01. gemini-3.1-flash-lite ($0.25/$1.50 per 1M, 5x cheaper than
+// the narrate model this replaces) returned 200 live, so all three calls
+// (parse, suggest, *and* narrate) now use it -- confirmed via a live /ask
+// that narration quality and grounding are unaffected (see this session's
+// report). Previously the narrate call alone used a stronger model
+// (gemini-3.8-flash); that tradeoff is gone now that flash-lite's output
+// has been verified to hold up for user-facing narration too.
+pub const MODEL_PARSE: &str = "gemini-3.1-flash-lite";
+pub const MODEL_SUGGEST: &str = "gemini-3.1-flash-lite";
+pub const MODEL_NARRATE: &str = "gemini-3.1-flash-lite";
 const MAX_ATTEMPTS: u32 = 3;
 
 #[derive(Debug, Error)]
