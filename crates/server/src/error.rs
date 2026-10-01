@@ -14,6 +14,10 @@ pub struct ApiError {
     pub status: StatusCode,
     pub code: &'static str,
     pub message: String,
+    /// Extra top-level fields merged into the `{error, code}` response
+    /// object (e.g. `portfolio/upload`'s `columns_found`/`missing`) --
+    /// `None` for every error that only ever needed the base two fields.
+    pub extra: Option<serde_json::Value>,
 }
 
 impl ApiError {
@@ -22,6 +26,7 @@ impl ApiError {
             status: StatusCode::BAD_REQUEST,
             code,
             message: message.into(),
+            extra: None,
         }
     }
 
@@ -30,6 +35,7 @@ impl ApiError {
             status: StatusCode::NOT_FOUND,
             code,
             message: message.into(),
+            extra: None,
         }
     }
 
@@ -38,17 +44,35 @@ impl ApiError {
             status,
             code,
             message: message.into(),
+            extra: None,
+        }
+    }
+
+    /// Like `bad_request`, but with extra fields merged into the response
+    /// JSON alongside `error`/`code`. `extra` must serialize to a JSON
+    /// object -- its keys become top-level response fields.
+    pub fn bad_request_with_extra(code: &'static str, message: impl Into<String>, extra: serde_json::Value) -> Self {
+        ApiError {
+            status: StatusCode::BAD_REQUEST,
+            code,
+            message: message.into(),
+            extra: Some(extra),
         }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = Json(serde_json::json!({
+        let mut body = serde_json::json!({
             "error": self.message,
             "code": self.code,
-        }));
-        (self.status, body).into_response()
+        });
+        if let Some(extra) = self.extra {
+            if let (Some(base), Some(extra)) = (body.as_object_mut(), extra.as_object()) {
+                base.extend(extra.clone());
+            }
+        }
+        (self.status, Json(body)).into_response()
     }
 }
 
@@ -59,21 +83,25 @@ impl From<BackendError> for ApiError {
                 status: StatusCode::UNPROCESSABLE_ENTITY,
                 code: "unrecognised_request",
                 message,
+                extra: None,
             },
             BackendError::Compute(message) => ApiError {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "compute_error",
                 message,
+                extra: None,
             },
             BackendError::GeminiUnavailable(message) => ApiError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 code: "gemini_unavailable",
                 message,
+                extra: None,
             },
             BackendError::Internal(message) => ApiError {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "internal_error",
                 message,
+                extra: None,
             },
         }
     }
@@ -100,6 +128,7 @@ where
                 status: rejection.status(),
                 code: "invalid_json",
                 message: rejection.body_text(),
+                extra: None,
             }),
         }
     }
