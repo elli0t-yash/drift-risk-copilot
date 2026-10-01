@@ -994,6 +994,127 @@ async fn upload_single_holding_returns_400() {
     assert_eq!(body["code"], "invalid_portfolio");
 }
 
+// ---------------------------------------------------------------------
+// Broker-format upload support
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn zerodha_xlsx_with_metadata_rows_above_the_header_parses_correctly() {
+    let bytes = include_bytes!("../tests/fixtures/zerodha_holdings.xlsx");
+    let response = upload(
+        empty_backend_app(),
+        "holdings.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        bytes,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["layout_detected"], "value");
+    // 3 metadata rows + header + 2 holdings + a "Total" row -- the "Total"
+    // row must be skipped, not counted as a third holding.
+    assert_eq!(body["row_count"], 2);
+    let holdings = body["portfolio"]["holdings"].as_array().unwrap();
+    assert!(holdings.iter().any(|h| h["ticker"] == "RELIANCE.NS"));
+    assert!(holdings.iter().any(|h| h["ticker"] == "HDFCBANK.NS"));
+}
+
+#[tokio::test]
+async fn upstox_format_parses_correctly() {
+    let csv = "trading_symbol,quantity,average_price\nRELIANCE,10,2850.00\nHDFCBANK,25,1640.00\n";
+    let response = upload(empty_backend_app(), "holdings.csv", "text/csv", csv.as_bytes()).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["layout_detected"], "value");
+    let holdings = body["portfolio"]["holdings"].as_array().unwrap();
+    assert_eq!(holdings.len(), 2);
+    assert!(holdings.iter().any(|h| h["ticker"] == "RELIANCE.NS"));
+    assert!(holdings.iter().any(|h| h["ticker"] == "HDFCBANK.NS"));
+}
+
+#[tokio::test]
+async fn groww_format_parses_correctly() {
+    let csv = "Symbol,Units,Average Buy Price\nRELIANCE,10,2850.00\nHDFCBANK,25,1640.00\n";
+    let response = upload(empty_backend_app(), "holdings.csv", "text/csv", csv.as_bytes()).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["layout_detected"], "value");
+    let holdings = body["portfolio"]["holdings"].as_array().unwrap();
+    assert_eq!(holdings.len(), 2);
+}
+
+#[tokio::test]
+async fn angel_one_format_parses_correctly() {
+    let csv = "Symbol,Net Quantity,Avg. Buy Price\nRELIANCE,10,2850.00\nHDFCBANK,25,1640.00\n";
+    let response = upload(empty_backend_app(), "holdings.csv", "text/csv", csv.as_bytes()).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["layout_detected"], "value");
+    let holdings = body["portfolio"]["holdings"].as_array().unwrap();
+    assert_eq!(holdings.len(), 2);
+}
+
+#[tokio::test]
+async fn exchange_prefixed_ticker_is_normalised() {
+    let csv = "ticker,weight\nNSE:RELIANCE,0.6\nBSE:TCS,0.4\n";
+    let response = upload(empty_backend_app(), "holdings.csv", "text/csv", csv.as_bytes()).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    let holdings = body["portfolio"]["holdings"].as_array().unwrap();
+    assert!(holdings.iter().any(|h| h["ticker"] == "RELIANCE.NS"));
+    assert!(holdings.iter().any(|h| h["ticker"] == "TCS.NS"));
+    let notes = body["tickers_normalised"].as_array().unwrap();
+    assert!(notes.iter().any(|n| n == "NSE:RELIANCE -> RELIANCE.NS"));
+    assert!(notes.iter().any(|n| n == "BSE:TCS -> TCS.NS"));
+}
+
+#[tokio::test]
+async fn a_total_row_is_skipped() {
+    let csv = "ticker,weight\nRELIANCE.NS,0.6\nTCS.NS,0.4\nTotal,1.0\n";
+    let response = upload(empty_backend_app(), "holdings.csv", "text/csv", csv.as_bytes()).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["row_count"], 2);
+    let holdings = body["portfolio"]["holdings"].as_array().unwrap();
+    assert!(!holdings.iter().any(|h| h["ticker"] == "Total" || h["ticker"] == "Total.NS"));
+}
+
+#[tokio::test]
+async fn broker_format_weights_sum_to_one_within_tolerance() {
+    let csv = "Symbol,Net Quantity,Avg. Buy Price\nRELIANCE,7,111.11\nHDFCBANK,13,222.22\nINFY,3,333.33\nTCS,9,77.77\nITC,1,999.99\n";
+    let response = upload(empty_backend_app(), "holdings.csv", "text/csv", csv.as_bytes()).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    let holdings = body["portfolio"]["holdings"].as_array().unwrap();
+    let sum: f64 = holdings.iter().map(|h| h["weight"].as_f64().unwrap()).sum();
+    assert!((sum - 1.0).abs() < 1e-6, "weights should sum to 1.0 within 1e-6, got {sum}");
+}
+
+#[tokio::test]
+async fn unrecognised_columns_returns_the_improved_error_message() {
+    let csv = "foo,bar\nx,y\n";
+    let response = upload(empty_backend_app(), "holdings.csv", "text/csv", csv.as_bytes()).await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(response).await;
+    let message = body["error"].as_str().unwrap();
+    assert!(message.contains("Could not parse portfolio file"));
+    assert!(message.contains("Columns found: [bar, foo]"));
+    assert!(message.contains("Zerodha"));
+    assert!(message.contains("Upstox"));
+    assert!(message.contains("Groww"));
+    assert!(message.contains("Angel One"));
+    assert!(message.contains("HDFC Securities"));
+    assert!(message.contains("ICICI Direct"));
+}
+
 fn sample_risk_drift_trace(vol_before: f64, vol_after: f64, regime_before: &str, regime_after: &str) -> EvidenceTrace {
     let mut trace = sample_trace();
     trace.experiment = "RiskDrift".to_string();
