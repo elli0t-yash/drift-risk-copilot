@@ -108,6 +108,11 @@ impl From<compute::ComputeError> for BackendError {
             // bounds" case.
             compute::ComputeError::NoPriorSnapshot(message) => BackendError::Unrecognised(message),
             compute::ComputeError::ReverseStressInfeasible(message) => BackendError::Unrecognised(message),
+            // A ticker that still 404s after `ticker_map::resolve_ticker`'s
+            // resolution order is the caller's problem (bad/delisted
+            // symbol in the uploaded portfolio), not this service's -- 422,
+            // same reasoning as the two cases above.
+            compute::ComputeError::UnresolvedTicker(message) => BackendError::Unrecognised(message),
             other => BackendError::Compute(other.to_string()),
         }
     }

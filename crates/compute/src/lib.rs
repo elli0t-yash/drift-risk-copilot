@@ -13,6 +13,7 @@ pub mod portfolio;
 pub mod regime;
 pub mod reverse_stress;
 pub mod scenarios;
+pub mod ticker_map;
 pub mod trace;
 
 pub use error::{ComputeError, Result};
