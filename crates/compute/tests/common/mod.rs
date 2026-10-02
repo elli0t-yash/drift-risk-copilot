@@ -93,6 +93,7 @@ pub fn synthetic_single_stock(
             forward_filled_days: 0,
             dropped_days: 0,
         }],
+        skipped_tickers: vec![],
     };
 
     MarketData {
@@ -139,6 +140,7 @@ pub fn market_data_from_log_returns(stocks: &[(&str, Vec<f64>)]) -> MarketData {
         date_range_end: *dates.last().unwrap(),
         trading_days: dates.len(),
         per_series,
+        skipped_tickers: vec![],
     };
 
     MarketData {
@@ -197,6 +199,7 @@ pub fn synthetic_multi_stock(
         date_range_end: *dates.last().unwrap(),
         trading_days: dates.len(),
         per_series,
+        skipped_tickers: vec![],
     };
 
     MarketData {

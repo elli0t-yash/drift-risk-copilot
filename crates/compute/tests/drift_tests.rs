@@ -44,6 +44,7 @@ fn sample_data_quality() -> DataQuality {
         date_range_end: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
         trading_days: 1500,
         per_series: vec![],
+        skipped_tickers: vec![],
     }
 }
 
