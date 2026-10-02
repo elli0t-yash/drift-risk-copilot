@@ -40,6 +40,23 @@ pub struct ModelParams {
     /// (see `cvar::CvarRebalanceInput::per_name_cap`). `None` for
     /// `FactorShock`/`RiskDecomposition`, which have no such field.
     pub cap_source: Option<String>,
+    /// Holdings fit with fewer return observations than `window_periods`
+    /// (e.g. a recently listed stock) -- each still fit independently on
+    /// its own available history (down to `model::MIN_TICKER_OBSERVATIONS`),
+    /// not on the shared window. Empty when every holding has at least
+    /// `window_periods` observations, or for experiment types that fit no
+    /// per-ticker factor model at all (`CvarRebalance`, standalone
+    /// performance).
+    #[serde(default)]
+    pub short_history_tickers: Vec<ShortHistoryTicker>,
+}
+
+/// One holding fit with fewer observations than the model's configured
+/// window -- see `ModelParams::short_history_tickers`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ShortHistoryTicker {
+    pub ticker: String,
+    pub obs_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

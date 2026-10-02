@@ -229,6 +229,22 @@ Enforce these client-side before any API call:
 
 Show inline errors — do not submit if validation fails.
 
+## IMPORTANT: Weight format
+The API always expects weights as decimals summing to 1.0 (e.g. 0.10 for 10%).
+
+When displaying weights in the UI from an upload response, multiply by 100 for display only.
+When sending weights to /ask or /experiment, always divide the displayed value by 100 first.
+
+Example:
+  API returns: weight: 0.3797
+  Display as: 37.97%
+  Send back:  weight: 0.3797 (not 37.97)
+
+A weight sent back as a raw percentage (e.g. 37.97 instead of 0.3797) fails the "all weights > 0%"
+validation above in a confusing way — the weight itself isn't 0%, but the sum of all weights will be
+wildly over 1.0 ± 0.01, since every holding was multiplied by 100 again. If you see that failure, check
+this conversion first.
+
 ---
 
 ## Default portfolio (pre-load on first visit)

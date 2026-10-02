@@ -167,6 +167,7 @@ fn sample_trace() -> compute::trace::EvidenceTrace {
             regime_state: None,
             regime_fallback_warnings: vec![],
             cap_source: None,
+            short_history_tickers: vec![],
         },
         outputs: serde_json::json!({ "result": { "portfolio_vol_annualized": 0.1552 } }),
         invariants: vec![],

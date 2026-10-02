@@ -79,6 +79,7 @@ fn sample_trace() -> EvidenceTrace {
             regime_state: Some(sample_regime_state()),
             regime_fallback_warnings: vec![],
             cap_source: None,
+            short_history_tickers: vec![],
         },
         outputs: serde_json::json!({ "result": { "portfolio_vol_annualized": 0.1552 } }),
         invariants: vec![],
