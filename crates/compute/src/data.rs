@@ -72,6 +72,14 @@ pub struct DataQuality {
     pub date_range_end: NaiveDate,
     pub trading_days: usize,
     pub per_series: Vec<SeriesQuality>,
+    /// Stock tickers (holdings) that returned HTTP 404 from Yahoo Finance
+    /// and were excluded from the fitted dataset rather than failing the
+    /// whole request -- see `load_series_skippable`. Never includes the
+    /// five fixed factor tickers (`FACTOR_TICKERS`): those are required
+    /// infrastructure the factor model itself depends on, not an
+    /// individual holding, so a 404 there still hard-fails the request.
+    #[serde(default)]
+    pub skipped_tickers: Vec<String>,
 }
 
 /// Aligned, return-space dataset ready for factor-model fitting.
@@ -267,6 +275,66 @@ pub fn load_series(cache_dir: &Path, ticker: &str, refresh: bool) -> Result<Pric
     Ok(fetched)
 }
 
+/// Whether `err` represents an HTTP 404 from Yahoo Finance specifically
+/// (as opposed to a network error, a 5xx, a malformed response, ...) --
+/// the only failure mode this module tolerates by skipping the ticker
+/// rather than failing the whole request (`.error_for_status()` in
+/// `fetch_yahoo_chart` turns a 404 response into exactly this
+/// `reqwest::Error` variant).
+fn is_http_404(err: &ComputeError) -> bool {
+    matches!(err, ComputeError::Http(e) if e.status() == Some(reqwest::StatusCode::NOT_FOUND))
+}
+
+/// If `ticker` ends in `.NS` and the symbol part before that suffix
+/// contains a hyphen, the de-hyphenated form to retry on a 404 (e.g.
+/// `"DIL-BZ.NS"` -> `"DILBZ.NS"`) -- some NSE symbols are listed under
+/// both forms depending on the data source, and Yahoo Finance's own
+/// symbol for a given company doesn't always match the hyphenated form a
+/// broker export uses. `None` if there's no hyphen to strip (nothing to
+/// retry with).
+fn dehyphenated_variant(ticker: &str) -> Option<String> {
+    let prefix = ticker.strip_suffix(".NS")?;
+    if prefix.contains('-') {
+        Some(format!("{}.NS", prefix.replace('-', "")))
+    } else {
+        None
+    }
+}
+
+/// Like `load_series`, but tolerates a 404 from Yahoo Finance for this
+/// specific ticker: returns `Ok(None)` instead of failing, after first
+/// retrying the de-hyphenated form (see `dehyphenated_variant`) if one
+/// exists. Any other kind of error (network failure, a non-404 HTTP
+/// status, a malformed response, ...) still propagates as `Err` --
+/// 404 is the only failure mode this codebase has evidence is a
+/// "this specific symbol doesn't exist on Yahoo" signal rather than a
+/// transient or systemic problem worth failing the whole request over.
+fn load_series_skippable(cache_dir: &Path, ticker: &str, refresh: bool) -> Result<Option<PriceSeries>> {
+    match load_series(cache_dir, ticker, refresh) {
+        Ok(series) => Ok(Some(series)),
+        Err(e) if is_http_404(&e) => {
+            let Some(alt) = dehyphenated_variant(ticker) else {
+                tracing::warn!(ticker, "Yahoo Finance returned 404 for ticker; skipping holding");
+                return Ok(None);
+            };
+            tracing::warn!(ticker, alt = alt.as_str(), "Yahoo Finance returned 404; retrying de-hyphenated form");
+            match load_series(cache_dir, &alt, refresh) {
+                Ok(series) => Ok(Some(series)),
+                Err(e2) if is_http_404(&e2) => {
+                    tracing::warn!(
+                        ticker,
+                        alt = alt.as_str(),
+                        "de-hyphenated form also 404'd; skipping holding"
+                    );
+                    Ok(None)
+                }
+                Err(e2) => Err(e2),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Aligns a raw series onto `calendar` (ascending, deduplicated master
 /// dates), forward-filling gaps of up to `MAX_FORWARD_FILL_DAYS` calendar
 /// slots and dropping the series' value on dates beyond that. Returns the
@@ -333,12 +401,48 @@ pub fn load_aligned_prices(
     let mut per_series_quality = Vec::new();
     let mut aligned_closes: BTreeMap<String, Vec<Option<f64>>> = BTreeMap::new();
 
-    let mut all_tickers: Vec<String> = stock_tickers.to_vec();
-    for t in FACTOR_TICKERS {
-        all_tickers.push(t.to_string());
+    // Stock tickers (the portfolio's own holdings): a 404 from Yahoo
+    // Finance is tolerated here -- skip that holding and continue, rather
+    // than failing the whole request over one bad/delisted symbol.
+    let mut skipped_tickers: Vec<String> = Vec::new();
+    let mut fetched_stock_tickers: Vec<String> = Vec::new();
+    for ticker in stock_tickers {
+        match load_series_skippable(cache_dir, ticker, refresh)? {
+            Some(series) => {
+                let (aligned, fills, drops) = align_to_calendar(&series, &calendar);
+                per_series_quality.push(SeriesQuality {
+                    ticker: ticker.clone(),
+                    raw_observations: series.dates.len(),
+                    forward_filled_days: fills,
+                    dropped_days: drops,
+                });
+                aligned_closes.insert(ticker.clone(), aligned);
+                fetched_stock_tickers.push(ticker.clone());
+            }
+            None => skipped_tickers.push(ticker.clone()),
+        }
     }
 
-    for ticker in &all_tickers {
+    if fetched_stock_tickers.is_empty() {
+        return Err(ComputeError::Data(format!(
+            "No valid tickers: all {} holdings returned 404 from Yahoo Finance. Skipped: {skipped_tickers:?}",
+            stock_tickers.len()
+        )));
+    }
+    if fetched_stock_tickers.len() < 2 {
+        return Err(ComputeError::Data(format!(
+            "Insufficient valid tickers: only {} of {} holdings could be fetched from market data. \
+             Skipped: {skipped_tickers:?}",
+            fetched_stock_tickers.len(),
+            stock_tickers.len()
+        )));
+    }
+
+    // Factor tickers: required infrastructure the factor model itself
+    // depends on (RATES_PROXY is derived from BANK and MARKET together),
+    // not an individual holding -- a 404 here still hard-fails via
+    // `load_series`'s ordinary `?` propagation, not the skip path above.
+    for ticker in FACTOR_TICKERS {
         let series = if ticker == MARKET {
             market_series.clone()
         } else {
@@ -346,12 +450,12 @@ pub fn load_aligned_prices(
         };
         let (aligned, fills, drops) = align_to_calendar(&series, &calendar);
         per_series_quality.push(SeriesQuality {
-            ticker: ticker.clone(),
+            ticker: ticker.to_string(),
             raw_observations: series.dates.len(),
             forward_filled_days: fills,
             dropped_days: drops,
         });
-        aligned_closes.insert(ticker.clone(), aligned);
+        aligned_closes.insert(ticker.to_string(), aligned);
     }
 
     // Trim leading calendar dates where any series is still None (before its
@@ -373,7 +477,7 @@ pub fn load_aligned_prices(
     }
 
     let mut stock_closes = BTreeMap::new();
-    for ticker in stock_tickers {
+    for ticker in &fetched_stock_tickers {
         let closes = aligned_closes
             .get(ticker)
             .ok_or_else(|| ComputeError::Data(format!("missing series for {ticker}")))?;
@@ -401,6 +505,7 @@ pub fn load_aligned_prices(
         date_range_end: *calendar.last().unwrap(),
         trading_days: calendar.len(),
         per_series: per_series_quality,
+        skipped_tickers,
     };
 
     Ok(AlignedPrices {
@@ -470,6 +575,7 @@ pub fn to_returns(prices: &AlignedPrices, frequency: crate::model::Frequency) ->
                 date_range_end: *dates.last().unwrap(),
                 trading_days: dates.len(),
                 per_series: prices.quality.per_series.clone(),
+                skipped_tickers: prices.quality.skipped_tickers.clone(),
             };
             (dates, stock_closes, factor_closes, quality)
         }
@@ -545,5 +651,38 @@ mod tests {
                 NaiveDate::from_ymd_opt(2024, 1, 9).unwrap(),
             ]
         );
+    }
+
+    #[test]
+    fn dehyphenated_variant_strips_the_hyphen_and_keeps_the_ns_suffix() {
+        assert_eq!(dehyphenated_variant("DIL-BZ.NS"), Some("DILBZ.NS".to_string()));
+    }
+
+    #[test]
+    fn dehyphenated_variant_is_none_without_a_hyphen() {
+        assert_eq!(dehyphenated_variant("RELIANCE.NS"), None);
+    }
+
+    #[test]
+    fn dehyphenated_variant_is_none_without_the_ns_suffix() {
+        // A hyphenated factor/raw ticker (none exist today, but nothing
+        // should panic if one ever did) with no ".NS" to anchor on.
+        assert_eq!(dehyphenated_variant("DIL-BZ"), None);
+    }
+
+    /// `skipped_tickers` must deserialize to an empty `Vec` for a
+    /// `DataQuality` JSON blob stored before this field existed (the same
+    /// backward-compatible-additive-field pattern every other trace
+    /// field addition in this codebase has used).
+    #[test]
+    fn skipped_tickers_defaults_to_empty_when_absent_from_stored_json() {
+        let json = serde_json::json!({
+            "date_range_start": "2021-09-27",
+            "date_range_end": "2026-09-24",
+            "trading_days": 1234,
+            "per_series": [],
+        });
+        let quality: DataQuality = serde_json::from_value(json).unwrap();
+        assert_eq!(quality.skipped_tickers, Vec::<String>::new());
     }
 }

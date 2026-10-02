@@ -69,6 +69,7 @@ fn sample_trace() -> EvidenceTrace {
             date_range_end: NaiveDate::from_ymd_opt(2026, 9, 24).unwrap(),
             trading_days: 1234,
             per_series: vec![],
+            skipped_tickers: vec![],
         },
         model_params: ModelParams {
             frequency: Frequency::Daily,
