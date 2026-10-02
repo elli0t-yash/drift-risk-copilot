@@ -89,7 +89,9 @@ parameters. Available tools and their params:
 scenario (e.g. small talk, general knowledge, something unrelated like the weather). params: {}. \
 reason must be exactly the one-sentence, polite decline to show the user directly (not a note to \
 yourself) -- e.g. \"I can only help with questions about your portfolio's risk and performance.\" \
-This must be the only entry in the array when used.
+This must be the only entry in the array when used. Only use this for questions completely \
+unrelated to finance, investing, markets, or portfolio risk. Never use this for scenario \
+questions, historical market events, or hypothetical market moves.
 
 - If the user asks about a specific stock, best/worst performer, or individual holding returns, use \
 portfolio_performance -- it includes per-holding data.
@@ -100,6 +102,12 @@ clarification.
 cvar_rebalance.
 - If the user expresses concern about a market event ('what if RBI raises rates', 'what about the US \
 election', 'crude is spiking'), select factor_shock with the relevant factor shocked.
+- If the user asks what a named historical event would have done to their portfolio, or asks about \
+the COVID crash, IL&FS, taper tantrum, or any named market event, use historical_stress with the \
+matching scenario_id: 'COVID' or 'covid crash' -> covid_crash; 'IL&FS' or 'ILFS' -> ilfs_contagion; \
+'taper tantrum' -> taper_tantrum_2013. This is always a portfolio risk question.
+- Questions containing 'what would X have done', 'what would happen if', 'what if there was', \
+'impact of', 'effect of' are always portfolio risk questions -- never decline them.
 
 Respond with ONLY a JSON array, no prose, no markdown code fences: \
 [{\"tool\": <tool name>, \"params\": <object>, \"reason\": <one short sentence>}, ...]. \
