@@ -49,6 +49,8 @@ fn sample_regime_state() -> RegimeState {
         log_likelihood: -123.45,
         n_iter: 12,
         smoothing_note: "full-history smoothed, not suitable for live trading signals",
+        transition_matrix: [[0.0; 3]; 3],
+        regime_forecast: vec![],
     }
 }
 

@@ -177,6 +177,7 @@ pub fn portfolio_cvar_95(portfolio: &Portfolio, data: &MarketData) -> Result<f64
 pub fn scenario_loss_pct(
     data_quality: &DataQuality,
     data_window: DataWindow,
+    data: &MarketData,
     portfolio: &Portfolio,
     model: &FactorModel,
     scenario_id: &str,
@@ -196,7 +197,7 @@ pub fn scenario_loss_pct(
         frequency: model.frequency,
         window: Some(model.window),
     };
-    let (output, _trace) = run_factor_shock(data_quality, data_window, model, &input)?;
+    let (output, _trace) = run_factor_shock(data_quality, data_window, data, model, &input)?;
     Ok(output.portfolio_pnl_inr.abs() / portfolio.total_value_inr.abs())
 }
 
@@ -268,6 +269,7 @@ pub fn evaluate_policy(
             let loss_pct = scenario_loss_pct(
                 &data.quality,
                 data_window.clone(),
+                data,
                 portfolio,
                 model,
                 &scenario_limit.scenario_id,
@@ -355,6 +357,7 @@ pub fn run_policy_check(
             let loss_pct = scenario_loss_pct(
                 data_quality,
                 data_window.clone(),
+                data,
                 portfolio,
                 model,
                 &scenario_limit.scenario_id,

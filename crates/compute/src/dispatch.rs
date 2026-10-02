@@ -82,7 +82,7 @@ pub fn run_experiment(
                 crate::model::ModelConfig::new(window, input.frequency),
             )?;
             let data_window = build_data_window(&data, window, input.frequency);
-            let (_, trace) = crate::experiments::run_factor_shock(&data.quality, data_window, &model, input)?;
+            let (_, trace) = crate::experiments::run_factor_shock(&data.quality, data_window, &data, &model, input)?;
             maybe_attach_policy(trace, ctx, &input.portfolio, &data, &model)
         }
         Experiment::RiskDecomposition(input) => {
@@ -96,7 +96,7 @@ pub fn run_experiment(
             )?;
             let data_window = build_data_window(&data, window, input.frequency);
             let (_, trace) =
-                crate::experiments::run_risk_decomposition(&data.quality, data_window, &model, input)?;
+                crate::experiments::run_risk_decomposition(&data.quality, data_window, &data, &model, input)?;
             maybe_attach_policy(trace, ctx, &input.portfolio, &data, &model)
         }
         Experiment::CvarRebalance(input) => {

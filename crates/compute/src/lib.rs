@@ -6,6 +6,7 @@ pub mod drift;
 pub mod error;
 pub mod experiments;
 pub mod format;
+pub mod garch;
 pub mod model;
 pub mod performance;
 pub mod policy;

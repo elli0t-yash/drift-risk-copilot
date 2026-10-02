@@ -127,6 +127,7 @@ pub fn run_risk_drift(
     let (current_output, current_trace) = crate::experiments::run_risk_decomposition(
         &data.quality,
         data_window,
+        &data,
         &model,
         &current_input,
     )?;
