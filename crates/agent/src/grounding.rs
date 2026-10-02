@@ -202,17 +202,38 @@ fn approx_eq(a: f64, b: f64, relative_tolerance: f64) -> bool {
 pub fn check_grounding(narration: &str, trace_numbers: &[f64]) -> GroundingCheck {
     let mut check = GroundingCheck::default();
     for extracted in extract_numbers(narration) {
-        // Matches the extracted value against a trace number either
-        // signed or negated: the conversational narration style (see
-        // `NARRATE_SYSTEM_PROMPT`) routinely conveys a loss/decline's sign
-        // through the surrounding words instead of a literal minus sign
-        // ("lost 17.8%", "a drawdown of 20.4%"), which is exactly the
-        // magnitude a negative trace value like `total_return_pct: -17.8`
-        // grounds, just without the model repeating the sign character.
-        // Caught live verifying this session's narration style change.
+        // Matches the extracted value against a trace number under four
+        // equivalent readings:
+        //   - as-is, or negated: the conversational narration style (see
+        //     `NARRATE_SYSTEM_PROMPT`) routinely conveys a loss/decline's
+        //     sign through the surrounding words instead of a literal minus
+        //     sign ("lost 17.8%", "a drawdown of 20.4%"), which is exactly
+        //     the magnitude a negative trace value like
+        //     `total_return_pct: -17.8` grounds, just without the model
+        //     repeating the sign character. Caught live verifying this
+        //     session's narration style change.
+        //   - divided or multiplied by 100: this crate's trace structs
+        //     frequently carry *both* a raw fraction (e.g.
+        //     `portfolio_vol_annualized: 0.1386`) and its `_pct` sibling
+        //     (`portfolio_vol_annualized_pct: 13.86`) for the same
+        //     quantity. Gemini sometimes cites the fraction's own value
+        //     with a literal "%" suffix (extracted as 0.1386, since the
+        //     `pct` regex branch divides by 100) when only the `_pct`
+        //     field's value (13.86) is what's actually present nearby in
+        //     the trace, or the reverse (states "13.86" plainly when only
+        //     the raw fraction 0.1386 exists) -- either way the same
+        //     number, just scaled, so it should still ground.
+        let candidates = [
+            extracted.value,
+            -extracted.value,
+            extracted.value / 100.0,
+            -extracted.value / 100.0,
+            extracted.value * 100.0,
+            -extracted.value * 100.0,
+        ];
         let is_match = trace_numbers
             .iter()
-            .any(|&t| approx_eq(extracted.value, t, RELATIVE_TOLERANCE) || approx_eq(-extracted.value, t, RELATIVE_TOLERANCE));
+            .any(|&t| candidates.iter().any(|&c| approx_eq(c, t, RELATIVE_TOLERANCE)));
         if is_match {
             check.matched.push(extracted.value);
         } else {
