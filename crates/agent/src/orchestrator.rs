@@ -311,11 +311,34 @@ fn snapshot_from_trace(
     })
 }
 
-/// One tool's outcome: either its `EvidenceTrace` or the compute error it
-/// failed with (kept as a string -- see `execution_trace::ToolResult`).
+/// One tool's failure: a structured `compute::ComputeError` when the
+/// failure came from `dispatch::run_experiment`, or a plain message for
+/// anything else (an unrecognised tool name, bad params). Kept distinct
+/// from a plain `String` (unlike `execution_trace::ToolResult::error`,
+/// which always renders to one via `Display`) so `pipeline::PipelineError::
+/// AllToolsFailed` can reclassify a single compute failure into its proper
+/// HTTP status (see `server::backend`'s `From<ComputeError>` impl) instead
+/// of collapsing every tool failure into a generic 500.
+#[derive(Debug)]
+pub enum ToolError {
+    Compute(compute::ComputeError),
+    Other(String),
+}
+
+impl std::fmt::Display for ToolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ToolError::Compute(e) => write!(f, "{e}"),
+            ToolError::Other(s) => write!(f, "{s}"),
+        }
+    }
+}
+
+/// One tool's outcome: either its `EvidenceTrace` or the error it failed
+/// with.
 pub enum ToolOutcome {
     Trace(Box<compute::trace::EvidenceTrace>),
-    Error(String),
+    Error(ToolError),
 }
 
 /// Runs `plan` (an unrecognised `plan.tool` name is also an error outcome,
@@ -329,11 +352,11 @@ fn execute_one(
     baseline_override: Option<String>,
 ) -> ToolOutcome {
     let Some(tool) = RiskTool::parse(&plan.tool) else {
-        return ToolOutcome::Error(format!("unknown tool {:?}", plan.tool));
+        return ToolOutcome::Error(ToolError::Other(format!("unknown tool {:?}", plan.tool)));
     };
     let experiment = match build_experiment(tool, &plan.params, portfolio, ctx, baseline_override) {
         Ok(e) => e,
-        Err(e) => return ToolOutcome::Error(e.to_string()),
+        Err(e) => return ToolOutcome::Error(ToolError::Other(e.to_string())),
     };
     match compute::dispatch::run_experiment(&experiment, portfolio, ctx) {
         Ok(mut trace) => {
@@ -350,7 +373,7 @@ fn execute_one(
             }
             ToolOutcome::Trace(Box::new(trace))
         }
-        Err(e) => ToolOutcome::Error(e.to_string()),
+        Err(e) => ToolOutcome::Error(ToolError::Compute(e)),
     }
 }
 
@@ -372,9 +395,14 @@ pub fn run_tool_plans(
     plans: &[ToolPlan],
     portfolio: &Portfolio,
     ctx: &ExperimentContext,
-) -> (Vec<compute::trace::EvidenceTrace>, Vec<crate::execution_trace::ToolResult>) {
+) -> (
+    Vec<compute::trace::EvidenceTrace>,
+    Vec<crate::execution_trace::ToolResult>,
+    Vec<ToolError>,
+) {
     let mut traces = Vec::new();
     let mut results = Vec::new();
+    let mut errors = Vec::new();
     let mut current_risk_snapshot_id: Option<String> = None;
 
     for (i, plan) in plans.iter().enumerate() {
@@ -413,11 +441,12 @@ pub fn run_tool_plans(
                     trace_id: String::new(),
                     latency_ms,
                     success: false,
-                    error: Some(error),
+                    error: Some(error.to_string()),
                 });
+                errors.push(error);
             }
         }
     }
 
-    (traces, results)
+    (traces, results, errors)
 }

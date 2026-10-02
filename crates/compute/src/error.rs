@@ -49,6 +49,15 @@ pub enum ComputeError {
     /// map it to its own HTTP status (422) instead of a generic 500.
     #[error("{0}")]
     UnresolvedTicker(String),
+
+    /// Not enough return observations to fit the factor model reliably --
+    /// either a single ticker has fewer than `model::MIN_TICKER_OBSERVATIONS`
+    /// return observations (too recently listed), or the shared factor-model
+    /// window itself (bounded by how much factor history exists) has fallen
+    /// below `model::MIN_MODEL_WINDOW`. A request problem (the caller's
+    /// portfolio/time window), not an internal failure -- maps to 422.
+    #[error("{0}")]
+    InsufficientData(String),
 }
 
 pub type Result<T> = std::result::Result<T, ComputeError>;

@@ -27,9 +27,12 @@ pub enum PipelineError {
     #[error("suggestion error: {0}")]
     Suggest(#[from] crate::suggest::SuggestError),
     /// No planned tool produced a trace (every one failed) -- there is
-    /// nothing left to narrate or persist. Carries the per-tool errors.
+    /// nothing left to narrate or persist. Carries the per-tool errors
+    /// (see `orchestrator::ToolError`) so `server::backend` can still
+    /// reclassify a single compute failure into its proper HTTP status
+    /// instead of a generic 500 -- see its `From<PipelineError>` impl.
     #[error("every planned tool failed: {0:?}")]
-    AllToolsFailed(Vec<String>),
+    AllToolsFailed(Vec<crate::orchestrator::ToolError>),
 }
 
 #[derive(Clone)]
@@ -81,15 +84,14 @@ pub async fn run<C: GeminiClient>(
     let portfolio_for_tools = portfolio.clone();
     let ctx_for_tools = ctx.clone();
     let tool_plans_for_compute = tool_plans.clone();
-    let (traces, tool_results) = tokio::task::spawn_blocking(move || {
+    let (traces, tool_results, tool_errors) = tokio::task::spawn_blocking(move || {
         run_tool_plans(&tool_plans_for_compute, &portfolio_for_tools, &ctx_for_tools)
     })
     .await
     .expect("run_tool_plans task panicked");
 
     if traces.is_empty() {
-        let errors: Vec<String> = tool_results.into_iter().filter_map(|r| r.error).collect();
-        return Err(PipelineError::AllToolsFailed(errors));
+        return Err(PipelineError::AllToolsFailed(tool_errors));
     }
 
     let summary = traces.iter().map(experiment_summary).collect::<Vec<_>>().join(" ");

@@ -96,6 +96,7 @@ fn risk_decomposition_result(
             regime_state: Some(regime),
             regime_fallback_warnings: vec![],
             cap_source: None,
+            short_history_tickers: vec![],
         },
         outputs: serde_json::json!({ "result": output }),
         invariants: vec![],

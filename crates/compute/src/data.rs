@@ -340,6 +340,23 @@ fn align_to_calendar(
     (aligned, fills, drops)
 }
 
+/// The longest contiguous run of `Some` values ending at `closes`'s last
+/// element, converted to plain `f64`s -- i.e. "whatever recent, unbroken
+/// price history this series actually has," discarding anything before a
+/// gap (a too-recent listing, or a forward-fill gap too large to bridge;
+/// see `MAX_FORWARD_FILL_DAYS`). Empty if `closes` ends in `None` (no
+/// recent price at all).
+fn trailing_non_none_run(closes: &[Option<f64>]) -> Vec<f64> {
+    let mut start = closes.len();
+    for (i, c) in closes.iter().enumerate().rev() {
+        if c.is_none() {
+            break;
+        }
+        start = i;
+    }
+    closes[start..].iter().map(|c| c.expect("trailing run is all Some by construction")).collect()
+}
+
 fn log_returns(prices: &[f64]) -> Vec<f64> {
     prices.windows(2).map(|w| (w[1] / w[0]).ln()).collect()
 }
@@ -398,13 +415,17 @@ pub fn load_aligned_prices(
         aligned_closes.insert(ticker.to_string(), aligned);
     }
 
-    // Trim leading calendar dates where any series is still None (before its
-    // first observed price) so every series has a valid price for the whole
-    // remaining window.
+    // Trim leading calendar dates where any *factor* series is still None
+    // (before its first observed price) so every factor has a valid price
+    // for the whole remaining window. Deliberately excludes stock closes:
+    // a recently listed holding's late start date must not truncate the
+    // factor history (and every other holding's history) down to its own
+    // short window -- see `model::fit_factor_model`'s per-ticker windowing,
+    // which instead lets each holding use whatever history it actually has.
     let mut start_idx = 0usize;
     'outer: for i in 0..calendar.len() {
-        for closes in aligned_closes.values() {
-            if closes[i].is_none() {
+        for ticker in FACTOR_TICKERS {
+            if aligned_closes[ticker][i].is_none() {
                 start_idx = i + 1;
                 continue 'outer;
             }
@@ -421,10 +442,12 @@ pub fn load_aligned_prices(
         let closes = aligned_closes
             .get(ticker)
             .ok_or_else(|| ComputeError::Data(format!("missing series for {ticker}")))?;
-        let closes: Vec<f64> = closes
-            .iter()
-            .map(|c| c.expect("trimmed to a common non-None prefix"))
-            .collect();
+        let closes = trailing_non_none_run(closes);
+        if closes.is_empty() {
+            return Err(ComputeError::Data(format!(
+                "no price history available for {ticker} within the aligned window"
+            )));
+        }
         stock_closes.insert(ticker.clone(), closes);
     }
 
@@ -496,8 +519,18 @@ pub fn to_returns(prices: &AlignedPrices, frequency: crate::model::Frequency) ->
         crate::model::Frequency::Weekly => {
             let idx = weekly_resample_indices(&prices.dates);
             let dates: Vec<NaiveDate> = idx.iter().map(|&i| prices.dates[i]).collect();
+            let full_len = prices.dates.len();
+            // `series` may be shorter than `prices.dates` (a holding with
+            // less history than the factor calendar -- see
+            // `trailing_non_none_run`), always right-aligned to the same
+            // last date. Re-anchor `idx` (indices into the full calendar)
+            // onto `series`'s own indices, dropping any resampled week that
+            // predates this series' own history.
             let resample = |series: &Vec<f64>| -> Vec<f64> {
-                idx.iter().map(|&i| series[i]).collect()
+                let offset = full_len - series.len();
+                idx.iter()
+                    .filter_map(|&i| if i >= offset { Some(series[i - offset]) } else { None })
+                    .collect()
             };
             let stock_closes = prices
                 .stock_closes

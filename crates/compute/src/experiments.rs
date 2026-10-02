@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::data::{DataQuality, FACTOR_NAMES};
 use crate::error::{ComputeError, Result};
 use crate::model::{annualize_scalar, FactorModel, Frequency};
-use crate::trace::{DataWindow, EvidenceTrace, InvariantCheck, ModelParams};
+use crate::trace::{DataWindow, EvidenceTrace, InvariantCheck, ModelParams, ShortHistoryTicker};
 
 /// One portfolio line: ticker plus portfolio weight (fraction of total
 /// value, not percent).
@@ -573,6 +573,7 @@ pub fn run_factor_shock(
             regime_state: model.regime_state.clone(),
             regime_fallback_warnings: model.regime_fallback_warnings.clone(),
             cap_source: None,
+            short_history_tickers: model.short_history_tickers.iter().map(|(t, n)| ShortHistoryTicker { ticker: t.clone(), obs_count: *n }).collect(),
         },
         outputs: serde_json::json!({
             "result": output,
@@ -781,6 +782,7 @@ pub fn run_risk_decomposition(
             regime_state: model.regime_state.clone(),
             regime_fallback_warnings: model.regime_fallback_warnings.clone(),
             cap_source: None,
+            short_history_tickers: model.short_history_tickers.iter().map(|(t, n)| ShortHistoryTicker { ticker: t.clone(), obs_count: *n }).collect(),
         },
         outputs: serde_json::json!({ "result": output }),
         invariants,
