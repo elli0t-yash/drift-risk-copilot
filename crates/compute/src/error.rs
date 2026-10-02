@@ -41,6 +41,14 @@ pub enum ComputeError {
     /// problem, not an internal failure.
     #[error("{0}")]
     ReverseStressInfeasible(String),
+
+    /// A ticker still 404'd from Yahoo Finance after `ticker_map::resolve_ticker`
+    /// ran its full resolution order -- a request problem (the symbol is
+    /// delisted, suspended, or genuinely unknown), not an internal failure.
+    /// Distinct from `Data` for the same reason as `NoPriorSnapshot`: callers
+    /// map it to its own HTTP status (422) instead of a generic 500.
+    #[error("{0}")]
+    UnresolvedTicker(String),
 }
 
 pub type Result<T> = std::result::Result<T, ComputeError>;
