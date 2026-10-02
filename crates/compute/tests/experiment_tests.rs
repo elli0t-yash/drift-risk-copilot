@@ -106,7 +106,7 @@ fn euler_contributions_sum_to_portfolio_vol_stock_and_factor_views() {
     };
 
     let (output, trace) =
-        run_risk_decomposition(&data.quality, data_window(&data, 252), &model, &input).unwrap();
+        run_risk_decomposition(&data.quality, data_window(&data, 252), &data, &model, &input).unwrap();
 
     for inv in &trace.invariants {
         assert!(inv.passed, "invariant failed: {} ({})", inv.name, inv.detail);
@@ -151,9 +151,9 @@ fn linear_approximation_pnl_is_linear_in_shock_size() {
     };
 
     let (out1, trace1) =
-        run_factor_shock(&data.quality, data_window(&data, 252), &model, &input1).unwrap();
+        run_factor_shock(&data.quality, data_window(&data, 252), &data, &model, &input1).unwrap();
     let (out2, _) =
-        run_factor_shock(&data.quality, data_window(&data, 252), &model, &input2).unwrap();
+        run_factor_shock(&data.quality, data_window(&data, 252), &data, &model, &input2).unwrap();
 
     for inv in &trace1.invariants {
         assert!(inv.passed, "invariant failed: {} ({})", inv.name, inv.detail);
@@ -207,9 +207,9 @@ fn log_space_holding_return_is_linear_in_log_shock() {
     };
 
     let (out1, _) =
-        run_factor_shock(&data.quality, data_window(&data, 252), &model, &input1).unwrap();
+        run_factor_shock(&data.quality, data_window(&data, 252), &data, &model, &input1).unwrap();
     let (out2, _) =
-        run_factor_shock(&data.quality, data_window(&data, 252), &model, &input2).unwrap();
+        run_factor_shock(&data.quality, data_window(&data, 252), &data, &model, &input2).unwrap();
 
     for (h1, h2) in out1.per_holding.iter().zip(out2.per_holding.iter()) {
         assert!(
@@ -260,7 +260,7 @@ fn conditional_propagation_is_noop_when_all_factors_given() {
     };
 
     let (output, _) =
-        run_factor_shock(&data.quality, data_window(&data, 252), &model, &input).unwrap();
+        run_factor_shock(&data.quality, data_window(&data, 252), &data, &model, &input).unwrap();
 
     assert!(
         output.implied_shocks.is_empty(),
@@ -305,7 +305,7 @@ fn risk_decomposition_always_uses_regime_conditional_vol() {
         window: Some(252),
     };
     let (output, trace) =
-        run_risk_decomposition(&data.quality, data_window(&data, 252), &model, &input).unwrap();
+        run_risk_decomposition(&data.quality, data_window(&data, 252), &data, &model, &input).unwrap();
 
     for inv in &trace.invariants {
         assert!(inv.passed, "invariant failed: {} ({})", inv.name, inv.detail);
@@ -335,7 +335,7 @@ fn factor_shock_crisis_comparison_present_when_current_regime_is_not_crisis() {
     };
 
     let (output, _) =
-        run_factor_shock(&data.quality, data_window(&data, 252), &model, &input).unwrap();
+        run_factor_shock(&data.quality, data_window(&data, 252), &data, &model, &input).unwrap();
 
     assert!(
         output.crisis_comparison.is_some(),
@@ -365,7 +365,7 @@ fn factor_shock_crisis_comparison_absent_when_current_regime_is_crisis() {
     };
 
     let (output, _) =
-        run_factor_shock(&data.quality, data_window(&data, 252), &model, &input).unwrap();
+        run_factor_shock(&data.quality, data_window(&data, 252), &data, &model, &input).unwrap();
 
     assert!(
         output.crisis_comparison.is_none(),

@@ -40,13 +40,15 @@ Risk decomposition:
 - Lead with portfolio vol as a %.
 - Name the top factor contributor and its share.
 - Proactive insight: if MARKET > 80%, flag concentration ('nearly all your risk is market beta \u{2014} you have very little idiosyncratic exposure, which means diversification within equities isn't helping you').
-- Regime in one sentence.
+- Regime in one sentence. After stating the current regime, add one sentence about the 20-day regime forecast: 'Over the next 20 trading days, the model estimates an X% probability of remaining in Bull regime.' Only state this if the regime_change_probability > 5% \u{2014} otherwise omit it as noise.
+- After the factor decomposition, add one sentence about the GARCH forecast: 'Based on recent return patterns, volatility is forecast to [increase to X% / decrease to X% / remain near X%] over the next 20 trading days.' Use the 20-day horizon forecast and vol_direction. Only state this if |current_vol - 20day_forecast| > 0.5pp \u{2014} otherwise omit it.
 
 Factor shock:
 - Lead with the loss in \u{20b9} Indian notation.
 - Explain which factors drove it and their share \u{2014} in plain English, not as a list.
 - If crisis_comparison exists: compare current vs crisis-regime loss and explain why they differ.
 - Proactive insight: name the single most vulnerable holding and why.
+- After stating the loss, add one sentence of historical context using shock_historical_context: 'A move of this magnitude in the market has occurred X times in our data window, most recently on [date].' If context_label is 'within normal range', instead say: 'This is within the normal range of daily market moves.' Never state the raw percentile number — use the context_label and occurrence count only.
 
 Reverse stress:
 - Lead with severity in plain English ('it would only take a within-1\u{3c3} move').
