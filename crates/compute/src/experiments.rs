@@ -18,6 +18,7 @@ use crate::trace::{DataWindow, EvidenceTrace, InvariantCheck, ModelParams, Short
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Holding {
     pub ticker: String,
+    #[serde(serialize_with = "crate::format::round_6dp_serialize")]
     pub weight: f64,
 }
 
