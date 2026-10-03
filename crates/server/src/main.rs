@@ -6,6 +6,7 @@ mod routes;
 mod upload;
 mod upstox;
 mod validate;
+mod visualization;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
