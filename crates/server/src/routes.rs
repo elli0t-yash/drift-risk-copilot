@@ -190,6 +190,11 @@ pub struct AskResponse {
     /// Also independently retrievable via
     /// `GET /execution-trace/{agent_execution_trace.id}`.
     pub agent_execution_trace: agent::AgentExecutionTrace,
+    /// Chart-ready data derived from `trace`, for the frontend to render
+    /// without re-deriving it from the raw trace itself. `None` if
+    /// `trace.experiment` isn't one of the seven recognised types (see
+    /// `visualization::build_visualization`).
+    pub visualization: Option<crate::visualization::VisualizationData>,
 }
 
 pub async fn post_ask(
@@ -228,6 +233,8 @@ pub async fn post_ask(
             ApiError::bad_request("internal_error", format!("failed to persist execution trace: {e}"))
         })?;
 
+    let visualization = crate::visualization::build_visualization(&result.trace);
+
     Ok(Json(AskResponse {
         experiment: result.experiment,
         trace: result.trace,
@@ -237,6 +244,7 @@ pub async fn post_ask(
         suggestion: result.suggestion,
         result_id,
         agent_execution_trace: result.execution_trace,
+        visualization,
     }))
 }
 
