@@ -289,6 +289,179 @@ if (conversationHistory.length > 20) {
 
 ---
 
+## Visualization Data (charts for "View Details")
+
+Every successful POST /ask response includes a `visualization` field with
+pre-computed, chart-ready data. Use this to render charts in a "View
+Details" expandable panel below the narration, above the Evidence Trace.
+
+### Response shape
+
+{
+  "narration": "...",
+  "visualization": {
+    "chart_type": "factor_breakdown",
+    "charts": [
+      {
+        "id": "factor_contributions",
+        "title": "What's driving your risk",
+        "chart_kind": "bar",
+        "insight": "MARKET dominates at 66.3% of total volatility",
+        "data": {
+          "labels": ["MARKET", "RATES_PROXY", "USDINR", "BRENT", "GOLD_USD", "Specific Risk"],
+          "values": [66.3, 3.6, 1.2, 0.8, 0.4, 30.2],
+          "colors": ["#2563EB", "#10B981", "#F59E0B", "#EF4444", "#8B5CF6", "#64748B"],
+          "unit": "%"
+        }
+      }
+    ]
+  }
+}
+
+visualization is null for POST /experiment responses — only /ask returns it.
+
+### chart_kind values and how to render each
+
+"bar"
+  Fields: labels[], values[], colors[], unit
+  Render as a vertical or horizontal bar chart.
+  If colors[] is present, use per-bar colours.
+  If values contain negatives, use red (#EF4444) for negative bars and
+  green (#10B981) for positive bars, overriding colors[].
+  Show unit as axis label.
+  PolicyCheck's "policy_compliance" chart is also chart_kind "bar", but
+  its data shape is `checks[]` (rule, limit, actual, passed, unit), not
+  labels[]/values[] — branch on the presence of data.checks, not on
+  chart_kind alone, and render it as a list of progress bars instead:
+  passed=true → green bar; passed=false → red bar, show limit as a marker.
+
+"comparison"
+  Fields: metrics[] where each metric has:
+    label, before, after, unit, lower_is_better
+  Render as side-by-side before/after cards.
+  If lower_is_better and after < before: highlight after in green.
+  If lower_is_better and after > before: highlight after in red.
+  Some comparison charts (PortfolioPerformance's "portfolio_summary") carry
+  single-value metrics instead — each metric then has label, value, unit
+  with no before/after/lower_is_better. Render those as plain stat cards.
+
+### Charts returned per experiment type
+
+RiskDecomposition (2 charts):
+  1. id: "factor_contributions"
+     chart_kind: "bar"
+     Shows factor risk breakdown as % of vol.
+     "Specific Risk" is always the last bar.
+
+  2. id: "vol_forecast"
+     chart_kind: "bar"
+     Shows current vol + GARCH forecasts at 5, 10, 20, 60 days.
+     data.highlight_index marks the 20-day bar.
+
+FactorShock (2 charts):
+  1. id: "shock_impact"
+     chart_kind: "bar"
+     Per-holding P&L in INR.
+     data.formatted[] has pre-formatted ₹ strings.
+     data.total is the portfolio-level P&L.
+
+  2. id: "factor_attribution"
+     chart_kind: "bar"
+     Per-factor P&L attribution in INR.
+     Positive values = factors that helped.
+     Negative values = factors that hurt.
+
+CvarRebalance (1 chart):
+  1. id: "rebalance_comparison"
+     chart_kind: "comparison"
+     Before/after CVaR and vol.
+     Also has: turnover_pct, commission_inr, commission_formatted at the
+     top level of data{}.
+
+ReverseStress (1 chart):
+  1. id: "stress_shocks"
+     chart_kind: "bar"
+     The minimum shock vector per factor.
+     data.severity and data.severity_color for the severity badge.
+     Colors: #10B981 within-1σ, #F59E0B 1-2σ, #EF4444 2-3σ, #7F1D1D >3σ
+
+PolicyCheck (1 chart):
+  1. id: "policy_compliance"
+     chart_kind: "bar"
+     data.checks[] — one entry per policy rule checked (rule, limit,
+     actual, passed, unit). Render as a list of progress bars per the
+     "bar" section above, not a generic labels[]/values[] bar chart.
+
+RiskDrift (1 chart):
+  1. id: "risk_drift"
+     chart_kind: "comparison"
+     Before/after vol, plus days_elapsed, regime_before, regime_after,
+     regime_changed.
+
+PortfolioPerformance (2 charts):
+  1. id: "holding_returns"
+     chart_kind: "bar"
+     Per-holding total return %, sorted descending.
+     Positive bars green, negative bars red.
+
+  2. id: "portfolio_summary"
+     chart_kind: "comparison"
+     Single-value metrics (no before/after).
+     Each metric has: label, value, unit.
+
+### UI placement
+
+Show charts in a collapsible "View Details ▾" panel below the narration
+in each AI message. Collapsed by default on mobile, expanded on desktop.
+
+Always show chart.insight as a subtitle above each chart — it is a
+one-sentence human summary.
+
+Render charts in the array order returned.
+
+If visualization is null: no "View Details" panel — show only narration
+and Evidence Trace.
+
+### Colour conventions (use exactly)
+
+#2563EB  blue     primary / market factor
+#10B981  green    positive / safe / bull regime
+#F59E0B  amber    warning / bear regime
+#EF4444  red      danger / loss / crisis
+#8B5CF6  purple   secondary factors
+#64748B  grey     specific risk / neutral
+
+### Suggested libraries
+
+Chart.js or Recharts — the data format works with both out of the box.
+
+For Chart.js:
+  labels[] → labels
+  values[] → data
+  colors[] → backgroundColor
+
+For Recharts:
+  Map labels[i] + values[i] → { name: labels[i], value: values[i] }
+
+### Key things that will break if done wrong
+
+1. Do not parse the trace JSON to build charts — use only the
+   visualization field. The trace is for the Evidence Trace panel only.
+2. Do not render charts for /experiment responses — visualization is null
+   there.
+3. Always check visualization !== null before rendering the View Details
+   panel.
+4. data.formatted[] strings are already in Indian ₹ notation — use them
+   directly, do not reformat the raw values[] for display.
+5. For comparison charts with single-value metrics (no before/after),
+   render each metric as a stat card, not a progress bar.
+6. PolicyCheck's chart_kind is "bar", not "gauge" — do not switch on
+   chart_kind to detect it. Switch on the presence of data.checks[]
+   instead (every other "bar" chart carries data.labels[]/data.values[],
+   never data.checks[]).
+
+---
+
 ## Regime badge
 Source: response.trace.model_params.regime_state.current_label
 Values: "Bull" | "Bear" | "Crisis"
