@@ -157,6 +157,13 @@ pub struct FactorShockOutput {
     /// did not specify (empty if `propagate` is false, or if all factors
     /// were given), in both simple and log form.
     pub implied_shocks: BTreeMap<String, ShockValue>,
+    /// Display-ready mirror of the input `shocks_pct`, in percentage
+    /// points (e.g. -15.0 for -15%). Unlike `given_shocks` (fractions),
+    /// no conversion is needed to show this.
+    pub given_shocks_pct: BTreeMap<String, f64>,
+    /// `implied_shocks.simple * 100`, rounded to 2dp: display-ready
+    /// percentage points.
+    pub implied_shocks_pct: BTreeMap<String, f64>,
     pub per_holding: Vec<HoldingShockResult>,
     /// Sum of `per_holding.pnl_inr`: value * simple_return per holding,
     /// summed. Exact (not an approximation) regardless of
@@ -550,10 +557,18 @@ pub fn run_factor_shock(
         _ => (None, None),
     };
 
+    let given_shocks_pct = input.shocks_pct.clone();
+    let implied_shocks_pct: BTreeMap<String, f64> = implied_shocks
+        .iter()
+        .map(|(k, v)| (k.clone(), (v.simple * 100.0 * 100.0).round() / 100.0))
+        .collect();
+
     let output = FactorShockOutput {
         linear_approximation: input.linear_approximation,
         given_shocks,
         implied_shocks,
+        given_shocks_pct,
+        implied_shocks_pct,
         per_holding: primary.per_holding,
         portfolio_pnl_inr: primary.portfolio_pnl_inr,
         formatted_pnl_inr: crate::format::format_inr(primary.portfolio_pnl_inr),

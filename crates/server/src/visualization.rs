@@ -202,6 +202,7 @@ fn build_factor_shock(result: &Value) -> VisualizationData {
             "formatted": formatted,
             "unit": "INR",
             "total": total,
+            "shocks_pct": result.get("given_shocks_pct").cloned().unwrap_or_else(|| json!({})),
         }),
         insight: format!(
             "Total {direction} of {}, {most_affected} most affected",
@@ -579,6 +580,7 @@ mod tests {
                 {"ticker": "HDFCBANK.NS", "value_inr": 300000.0, "pnl_inr": -198000.0},
             ],
             "portfolio_pnl_inr": -443000.0,
+            "given_shocks_pct": {"MARKET": -15.0, "BRENT": 20.0},
             "factor_attribution_log_inr": {
                 "MARKET": -980000.0,
                 "USDINR": 23000.0,
@@ -607,6 +609,7 @@ mod tests {
         assert_eq!(chart1.data["labels"], json!(["RELIANCE.NS", "HDFCBANK.NS"]));
         assert_eq!(chart1.data["values"], json!([-245000.0, -198000.0]));
         assert_eq!(chart1.data["total"], json!(-443000.0));
+        assert_eq!(chart1.data["shocks_pct"], json!({"MARKET": -15.0, "BRENT": 20.0}));
         assert!(chart1.insight.contains("RELIANCE.NS"));
 
         let chart2 = &viz.charts[1];

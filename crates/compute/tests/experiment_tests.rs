@@ -373,3 +373,32 @@ fn factor_shock_crisis_comparison_absent_when_current_regime_is_crisis() {
     );
     assert!(output.crisis_comparison_note.is_none());
 }
+
+/// `given_shocks_pct` mirrors the input exactly (percentage points);
+/// `implied_shocks_pct` is `implied_shocks.simple * 100` rounded to 2dp.
+#[test]
+fn shock_pct_display_fields_are_percentage_points() {
+    let (data, model) = two_stock_model();
+    let mut shocks = BTreeMap::new();
+    shocks.insert("MARKET".to_string(), -15.0);
+    let input = FactorShockInput {
+        portfolio: two_holding_portfolio(),
+        shocks_pct: shocks.clone(),
+        propagate: true,
+        linear_approximation: false,
+        frequency: compute::model::Frequency::Daily,
+        window: Some(252),
+    };
+    let (out, _) =
+        run_factor_shock(&data.quality, data_window(&data, 252), &data, &model, &input).unwrap();
+
+    assert_eq!(out.given_shocks_pct, shocks);
+    assert_eq!(
+        out.implied_shocks_pct.keys().collect::<Vec<_>>(),
+        out.implied_shocks.keys().collect::<Vec<_>>()
+    );
+    for (k, pct) in &out.implied_shocks_pct {
+        let expected = (out.implied_shocks[k].simple * 100.0 * 100.0).round() / 100.0;
+        assert_eq!(*pct, expected, "{k}");
+    }
+}

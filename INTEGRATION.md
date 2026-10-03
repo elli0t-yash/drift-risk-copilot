@@ -345,6 +345,19 @@ visualization is null for POST /experiment responses — only /ask returns it.
   single-value metrics instead — each metric then has label, value, unit
   with no before/after/lower_is_better. Render those as plain stat cards.
 
+### FactorShock unit guide
+
+Use these fields for display (percentage points):
+  experiment.shocks_pct          -> input shocks
+  outputs.given_shocks_pct       -> confirmed inputs
+  outputs.implied_shocks_pct     -> model-estimated
+  visualization.data.shocks_pct  -> chart display
+
+Do NOT use for display (these are fractions):
+  outputs.given_shocks.simple    -> internal use
+  outputs.given_shocks.log       -> internal use
+  outputs.implied_shocks.simple/log -> internal
+
 ### Charts returned per experiment type
 
 RiskDecomposition (2 charts):
@@ -364,6 +377,7 @@ FactorShock (2 charts):
      Per-holding P&L in INR.
      data.formatted[] has pre-formatted ₹ strings.
      data.total is the portfolio-level P&L.
+     data.shocks_pct is the given shocks in percentage points, for shock chips.
 
   2. id: "factor_attribution"
      chart_kind: "bar"
