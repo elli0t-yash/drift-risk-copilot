@@ -9,7 +9,12 @@ spec:
     metadata:
       annotations:
         autoscaling.knative.dev/minScale: "1"
-        autoscaling.knative.dev/maxScale: "10"
+        # Capped at 3 on purpose: snapshots live in a per-instance SQLite
+        # file (see SNAPSHOT_DB_PATH below), so with more instances a
+        # risk_drift request is increasingly likely to land on an instance
+        # that never stored the baseline snapshot. Raise this only after
+        # snapshots move to a shared store (planned: Cloud Firestore).
+        autoscaling.knative.dev/maxScale: "3"
     spec:
       containerConcurrency: 80
       # 60s (the checkpoint spec's original value, sized for the compute
