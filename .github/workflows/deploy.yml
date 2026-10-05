@@ -102,7 +102,7 @@ jobs:
         run: |
           set -euo pipefail
           sed \
-            -e "s#gcr.io/PROJECT_ID/drift-risk-copilot:latest#gcr.io/${{ vars.GCP_PROJECT_ID }}/drift-risk-copilot:${{ github.sha }}#" \
+            -e "s#gcr.io/drift-ai-builder-cup/drift-risk-copilot:latest#gcr.io/${{ vars.GCP_PROJECT_ID }}/drift-risk-copilot:${{ github.sha }}#" \
             cloudrun.yaml > cloudrun.deploy.yaml
           cat cloudrun.deploy.yaml
 

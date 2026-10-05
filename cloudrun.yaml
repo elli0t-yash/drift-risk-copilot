@@ -27,7 +27,7 @@ spec:
       # unbounded.
       timeoutSeconds: 300
       containers:
-        - image: gcr.io/PROJECT_ID/drift-risk-copilot:latest
+        - image: gcr.io/drift-ai-builder-cup/drift-risk-copilot:latest
           ports:
             - containerPort: 8080
           resources:
