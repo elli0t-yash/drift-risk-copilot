@@ -10,6 +10,7 @@
 //! for `RiskDrift` summaries.
 
 use compute::data::FACTOR_NAMES;
+use compute::portfolio_history::PortfolioHistory;
 use compute::trace::EvidenceTrace;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -28,7 +29,7 @@ pub struct Chart {
     /// Unique within the response.
     pub id: String,
     pub title: String,
-    /// "bar" | "donut" | "comparison" | "gauge".
+    /// "bar" | "donut" | "comparison" | "gauge" | "timeseries".
     pub chart_kind: String,
     /// Chart-specific shape; see each `build_*` function's doc for what it
     /// contains.
@@ -66,7 +67,7 @@ fn round2(v: f64) -> f64 {
 /// either; see `routes::post_experiment`'s doc).
 pub fn build_visualization(trace: &EvidenceTrace) -> Option<VisualizationData> {
     let result = trace.outputs.get("result")?;
-    match trace.experiment.as_str() {
+    let mut viz = match trace.experiment.as_str() {
         "RiskDecomposition" => Some(build_risk_decomposition(result)),
         "FactorShock" => Some(build_factor_shock(result)),
         "CvarRebalance" => Some(build_cvar_rebalance(result)),
@@ -75,6 +76,40 @@ pub fn build_visualization(trace: &EvidenceTrace) -> Option<VisualizationData> {
         "RiskDrift" => Some(build_risk_drift(result)),
         "PortfolioPerformance" => Some(build_portfolio_performance(result)),
         _ => None,
+    }?;
+    if let Some(history) = &trace.portfolio_history {
+        viz.charts.insert(0, build_portfolio_history_chart(history));
+    }
+    Some(viz)
+}
+
+/// "portfolio_history" (always first when the trace carries a history):
+/// the daily portfolio value series, plus total-return and max-drawdown
+/// summaries. All arrays have length `window_days`.
+fn build_portfolio_history_chart(h: &PortfolioHistory) -> Chart {
+    let total_return_pct = h.portfolio_return_pct.last().copied().unwrap_or(0.0);
+    let max_drawdown_pct = h.drawdown_pct.iter().copied().fold(0.0_f64, f64::min);
+    let span = if h.window_days >= 250 {
+        "the past year".to_string()
+    } else {
+        format!("the past {} trading days", h.window_days)
+    };
+    let verb = if total_return_pct >= 0.0 { "gained" } else { "lost" };
+    Chart {
+        id: "portfolio_history".to_string(),
+        title: "Portfolio value over time".to_string(),
+        chart_kind: "timeseries".to_string(),
+        data: json!({
+            "dates": h.dates,
+            "portfolio_value": h.portfolio_value,
+            "portfolio_return_pct": h.portfolio_return_pct,
+            "regime_sequence": h.regime_sequence,
+            "drawdown_pct": h.drawdown_pct,
+            "total_return_pct": total_return_pct,
+            "max_drawdown_pct": max_drawdown_pct,
+            "window_days": h.window_days,
+        }),
+        insight: format!("Portfolio {verb} {}% over {span}", total_return_pct.abs()),
     }
 }
 
@@ -510,6 +545,7 @@ mod tests {
             parent_trace_ids: Vec::new(),
             baseline_model_params: None,
             policy_result: None,
+            portfolio_history: None,
         }
     }
 
@@ -697,5 +733,73 @@ mod tests {
             let viz = build_visualization(&trace).unwrap_or_else(|| panic!("{experiment} should produce a visualization"));
             assert!(!viz.charts.is_empty(), "{experiment} produced an empty charts list");
         }
+    }
+
+    fn history(returns: &[f64]) -> PortfolioHistory {
+        let mut values = vec![1_000_000.0];
+        for r in returns {
+            values.push(values.last().unwrap() * (1.0 + r));
+        }
+        let mut peak = f64::MIN;
+        let drawdown = values
+            .iter()
+            .map(|v| {
+                peak = peak.max(*v);
+                round2((v / peak - 1.0) * 100.0)
+            })
+            .collect();
+        PortfolioHistory {
+            dates: (0..values.len()).map(|i| format!("2025-01-{:02}", i + 1)).collect(),
+            portfolio_return_pct: values.iter().map(|v| round2((v / 1_000_000.0 - 1.0) * 100.0)).collect(),
+            regime_sequence: vec!["Bull".to_string(); values.len()],
+            portfolio_value: values,
+            drawdown_pct: drawdown,
+            window_days: returns.len() + 1,
+        }
+    }
+
+    #[test]
+    fn portfolio_history_chart_is_first_for_every_experiment_type() {
+        for exp in [
+            "RiskDecomposition",
+            "FactorShock",
+            "CvarRebalance",
+            "ReverseStress",
+            "PolicyCheck",
+            "RiskDrift",
+            "PortfolioPerformance",
+        ] {
+            let mut trace = trace_with(exp, json!({}));
+            trace.portfolio_history = Some(history(&[0.01, -0.02, 0.005]));
+            let viz = build_visualization(&trace).unwrap_or_else(|| panic!("{exp}: no visualization"));
+            assert_eq!(viz.charts[0].id, "portfolio_history", "{exp}");
+            assert_eq!(viz.charts[0].chart_kind, "timeseries", "{exp}");
+            assert_eq!(viz.charts.iter().filter(|c| c.id == "portfolio_history").count(), 1, "{exp}");
+        }
+    }
+
+    #[test]
+    fn portfolio_history_chart_data_and_summaries() {
+        let mut trace = trace_with("RiskDecomposition", risk_decomposition_result());
+        let n_before = build_visualization(&trace).unwrap().charts.len();
+        trace.portfolio_history = Some(history(&[0.10, -0.20, 0.05]));
+        let viz = build_visualization(&trace).unwrap();
+        assert_eq!(viz.charts.len(), n_before + 1);
+        let d = &viz.charts[0].data;
+        let last = trace.portfolio_history.as_ref().unwrap().portfolio_return_pct.last().copied().unwrap();
+        assert!((d["total_return_pct"].as_f64().unwrap() - last).abs() < 0.01);
+        assert_eq!(d["window_days"], json!(4));
+        for key in ["dates", "portfolio_value", "portfolio_return_pct", "regime_sequence", "drawdown_pct"] {
+            assert_eq!(d[key].as_array().unwrap().len(), 4, "{key}");
+        }
+        assert_eq!(d["max_drawdown_pct"], json!(-20.0));
+        assert_eq!(viz.charts[0].insight, "Portfolio lost 7.6% over the past 4 trading days");
+    }
+
+    #[test]
+    fn no_history_means_no_history_chart() {
+        let trace = trace_with("RiskDecomposition", risk_decomposition_result());
+        let viz = build_visualization(&trace).unwrap();
+        assert!(viz.charts.iter().all(|c| c.id != "portfolio_history"));
     }
 }

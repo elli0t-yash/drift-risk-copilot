@@ -409,6 +409,7 @@ pub fn run_policy_check(
         parent_trace_ids: Vec::new(),
         baseline_model_params: None,
         policy_result: None,
+        portfolio_history: None,
     };
 
     Ok((output, trace))

@@ -160,6 +160,12 @@ pub struct EvidenceTrace {
     /// always `None` for a `PolicyCheck` trace.
     #[serde(default)]
     pub policy_result: Option<PolicyResult>,
+    /// Daily portfolio value series for charting (see
+    /// `portfolio_history`), attached by `dispatch::run_experiment` for
+    /// every experiment type. `None` only if market data or a regime path
+    /// is unavailable.
+    #[serde(default)]
+    pub portfolio_history: Option<crate::portfolio_history::PortfolioHistory>,
 }
 
 pub fn engine_version() -> String {
