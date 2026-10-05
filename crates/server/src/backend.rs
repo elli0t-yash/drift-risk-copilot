@@ -16,6 +16,16 @@ pub enum BackendError {
     /// one-sentence explanation. Maps to 422.
     #[error("{0}")]
     Unrecognised(String),
+    /// A ticker Yahoo Finance doesn't know even after resolution (or an
+    /// ISIN given in place of a symbol); the message names it. Maps to 422.
+    #[error("{0}")]
+    UnresolvedTicker(String),
+    /// Too little price history to analyse; the message explains. Maps to 422.
+    #[error("{0}")]
+    InsufficientData(String),
+    /// Market data couldn't be fetched in time (Yahoo timeout/5xx). Maps to 503.
+    #[error("{0}")]
+    DataUnavailable(String),
     /// Any error from the compute layer (data fetch, model fit, LP solve,
     /// invalid input). Maps to 500.
     #[error("compute error: {0}")]
@@ -132,14 +142,15 @@ impl From<compute::ComputeError> for BackendError {
             // same reasoning as the two cases above. Its message is already
             // user-friendly (see `data::load_series_resolved`), so it's
             // passed through as-is.
-            compute::ComputeError::UnresolvedTicker(message) => BackendError::Unrecognised(message),
+            compute::ComputeError::UnresolvedTicker(message) => BackendError::UnresolvedTicker(message),
+            compute::ComputeError::DataUnavailable(message) => BackendError::DataUnavailable(message),
             // Likewise a request problem (the portfolio/time window the
             // caller chose), not an internal failure -- the compute-layer
             // message is wrapped with user-facing framing and a concrete
             // suggestion.
             compute::ComputeError::InsufficientData(message) => {
                 let message = message.trim_end_matches('.');
-                BackendError::Unrecognised(format!(
+                BackendError::InsufficientData(format!(
                     "One or more holdings don't have enough price history for analysis. {message}. \
                      Try removing recently listed stocks from your portfolio."
                 ))
@@ -262,8 +273,8 @@ mod tests {
             .to_string();
         let err: BackendError = compute::ComputeError::UnresolvedTicker(original.clone()).into();
         match err {
-            BackendError::Unrecognised(msg) => assert_eq!(msg, original),
-            other => panic!("expected BackendError::Unrecognised, got {other:?}"),
+            BackendError::UnresolvedTicker(msg) => assert_eq!(msg, original),
+            other => panic!("expected BackendError::UnresolvedTicker, got {other:?}"),
         }
     }
 
@@ -273,15 +284,28 @@ mod tests {
             compute::ComputeError::InsufficientData("ticker FOO.NS has only 20 return observations".to_string())
                 .into();
         match err {
-            BackendError::Unrecognised(msg) => {
+            BackendError::InsufficientData(msg) => {
                 assert!(msg.starts_with(
                     "One or more holdings don't have enough price history for analysis."
                 ));
                 assert!(msg.contains("ticker FOO.NS has only 20 return observations"));
                 assert!(msg.contains("Try removing recently listed stocks from your portfolio."));
             }
-            other => panic!("expected BackendError::Unrecognised, got {other:?}"),
+            other => panic!("expected BackendError::InsufficientData, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn data_unavailable_maps_to_its_own_variant() {
+        let err: BackendError = compute::ComputeError::DataUnavailable("x".to_string()).into();
+        assert!(matches!(err, BackendError::DataUnavailable(m) if m == "x"));
+    }
+
+    #[test]
+    fn exhausted_gemini_retries_map_to_gemini_unavailable() {
+        let err: BackendError =
+            GeminiError::Unavailable { attempts: 6, last_error: "status 503".to_string() }.into();
+        assert!(matches!(err, BackendError::GeminiUnavailable(_)));
     }
 
     #[test]

@@ -110,3 +110,37 @@ async fn an_off_topic_message_declines_instead_of_running_a_fallback_experiment(
         other => panic!("expected Unrecognised, got {other:?}"),
     }
 }
+
+// The two tests below pin the planning prompt's rules text -- the model's
+// actual behaviour on these questions can only be verified live (the mock
+// returns canned plans), so these guard against the rules being lost or
+// reworded away in a later edit.
+
+#[test]
+fn planning_prompt_maps_commodity_questions_to_factor_shocks() {
+    use agent::orchestrator::PLANNING_SYSTEM_PROMPT as P;
+    assert!(P.contains("'crude', 'oil', 'petrol', 'diesel', 'Brent' going up/spike/rise -> factor_shock BRENT: +20.0"));
+    assert!(P.contains("'crude', 'oil' going down/fall/crash -> factor_shock BRENT: -20.0"));
+    assert!(P.contains("'what would happen if'"));
+    assert!(P.contains("ALWAYS portfolio risk questions"));
+}
+
+#[test]
+fn planning_prompt_analyses_stock_questions_and_declines_only_unrelated_topics() {
+    use agent::orchestrator::PLANNING_SYSTEM_PROMPT as P;
+    assert!(P.contains("'Ratnaveer Precision') -> portfolio_performance"));
+    assert!(P.contains("Never refuse stock questions"));
+    assert!(P.contains("Decline ONLY for: weather, sports scores, cooking, entertainment"));
+    assert!(P.contains("Never decline when a finance connection exists"));
+}
+
+#[tokio::test]
+async fn a_crude_spike_plan_carries_brent_plus_20_through_planning() {
+    let client = MockGeminiClient::new(vec![text_response(
+        r#"[{"tool": "factor_shock", "params": {"shocks_pct": {"BRENT": 20.0}}, "reason": "crude spike"}]"#,
+    )]);
+    let (plans, _raw) = plan_tools(&client, "crude prices go higher", &[]).await.unwrap();
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0].tool, "factor_shock");
+    assert_eq!(plans[0].params["shocks_pct"]["BRENT"], 20.0);
+}

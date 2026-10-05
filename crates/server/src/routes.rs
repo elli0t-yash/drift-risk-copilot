@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
@@ -46,7 +46,21 @@ pub struct AppState {
     /// state UUID -> when it was issued; see `upstox::insert_state`/
     /// `upstox::validate_and_consume_state`.
     pub upstox_state_map: Arc<Mutex<HashMap<String, Instant>>>,
+    /// Bounds concurrent `POST /ask` requests (each fans out to several
+    /// Gemini calls plus a CPU-heavy compute step) -- see `post_ask`.
+    pub semaphore: Arc<tokio::sync::Semaphore>,
+    /// The semaphore's total permits, reported by `GET /health`.
+    pub capacity: usize,
+    /// How long a `/ask` waits for a permit before answering 503
+    /// `service_busy`.
+    pub ask_queue_timeout: Duration,
+    pub gemini_configured: bool,
 }
+
+/// Concurrent `/ask` requests allowed at once.
+pub const MAX_CONCURRENT_ASKS: usize = 8;
+/// How long a queued `/ask` waits for a free permit.
+pub const ASK_QUEUE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Builds the `RiskSnapshot` `SnapshotStore::insert` persists for a
 /// completed experiment: `trace_json` is the full trace (so `GET
@@ -98,12 +112,31 @@ fn snapshot_from_trace(trace: &EvidenceTrace, portfolio: &Portfolio) -> Result<R
 pub struct HealthResponse {
     pub status: &'static str,
     pub version: &'static str,
+    /// "configured" | "not_configured"
+    pub gemini: &'static str,
+    /// "configured" | "not_configured"
+    pub upstox: &'static str,
+    /// `/ask` requests currently holding a concurrency permit.
+    pub active_requests: usize,
+    pub capacity: usize,
 }
 
-pub async fn health() -> Json<HealthResponse> {
+fn configured(yes: bool) -> &'static str {
+    if yes {
+        "configured"
+    } else {
+        "not_configured"
+    }
+}
+
+pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
+        gemini: configured(state.gemini_configured),
+        upstox: configured(state.upstox_config.is_configured()),
+        active_requests: state.capacity.saturating_sub(state.semaphore.available_permits()),
+        capacity: state.capacity,
     })
 }
 
@@ -202,6 +235,14 @@ pub async fn post_ask(
     AppJson(req): AppJson<AskRequest>,
 ) -> Result<Json<AskResponse>, ApiError> {
     validate_portfolio(&req.portfolio)?;
+
+    // Held until the handler returns. Cheap validation above runs first so
+    // a malformed request never occupies a permit.
+    let _permit = match tokio::time::timeout(state.ask_queue_timeout, state.semaphore.acquire()).await {
+        Ok(Ok(permit)) => permit,
+        // Timed out waiting, or the semaphore was closed (never, today).
+        Ok(Err(_)) | Err(_) => return Err(ApiError::service_busy()),
+    };
 
     let portfolio = req.portfolio.clone();
     let result = state

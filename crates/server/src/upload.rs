@@ -263,6 +263,20 @@ pub async fn post_portfolio_upload(mut multipart: Multipart) -> Result<axum::Jso
     let holdings: Vec<Holding> = holdings.into_iter().filter(|h| h.weight.abs() > 1e-6).collect();
     let skipped_zero_weight = holdings_before - holdings.len();
 
+    // A file keyed by ISIN instead of NSE symbol can't be priced: no ISIN
+    // resolves on Yahoo Finance, and `normalise_ticker` can't map one to a
+    // symbol. Reject it up front with instructions rather than let the
+    // first analysis fail on a market-data fetch.
+    let isin_count = holdings.iter().filter(|h| is_isin(&h.ticker)).count();
+    if isin_count * 2 > holdings.len() {
+        return Err(ApiError::bad_request(
+            "isin_not_supported",
+            "Your file contains ISIN codes instead of NSE ticker symbols. Please export your \
+             holdings by symbol (e.g. RELIANCE.NS) rather than ISIN. Most brokers offer both \
+             options.",
+        ));
+    }
+
     if holdings.len() < 2 {
         return Err(ApiError::new(
             axum::http::StatusCode::UNPROCESSABLE_ENTITY,

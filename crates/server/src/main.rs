@@ -70,7 +70,19 @@ async fn main() {
     let upstox_client: Arc<dyn UpstoxClient> = Arc::new(HttpUpstoxClient::new());
     let upstox_state_map = Arc::new(Mutex::new(HashMap::new()));
 
-    let state = AppState { backend, store, upstox_config, upstox_client, upstox_state_map };
+    let state = AppState {
+        backend,
+        store,
+        upstox_config,
+        upstox_client,
+        upstox_state_map,
+        semaphore: Arc::new(tokio::sync::Semaphore::new(routes::MAX_CONCURRENT_ASKS)),
+        capacity: routes::MAX_CONCURRENT_ASKS,
+        ask_queue_timeout: routes::ASK_QUEUE_TIMEOUT,
+        // `HttpGeminiClient::new` above already exited the process if the
+        // key was missing.
+        gemini_configured: true,
+    };
 
     let app = build_router(state);
 
@@ -84,6 +96,8 @@ async fn main() {
         .await
         .unwrap_or_else(|err| panic!("failed to bind {addr}: {err}"));
     tracing::info!(%addr, "listening");
+
+    tokio::spawn(warm_market_data_cache());
 
     axum::serve(listener, app)
         .await
@@ -114,9 +128,40 @@ fn build_router(state: AppState) -> Router {
         .route("/auth/upstox/callback", get(routes::get_upstox_callback))
         .route("/auth/upstox/status", get(routes::get_upstox_status))
         .fallback(routes::static_handler)
+        .layer(axum::middleware::from_fn(error::ensure_json_errors))
         .layer(axum::middleware::from_fn(logging::log_requests))
         .layer(cors)
         .with_state(state)
+}
+
+/// Tickers most portfolios and every experiment need: common large caps
+/// plus the five factor series.
+const WARMUP_TICKERS: [&str; 15] = [
+    "RELIANCE.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS", "TCS.NS", "LT.NS", "ITC.NS",
+    "KOTAKBANK.NS", "BHARTIARTL.NS", "TMPV.NS", "^NSEI", "INR=X", "BZ=F", "GC=F", "^NSEBANK",
+];
+
+/// Pre-fetches `WARMUP_TICKERS` into the on-disk price cache shortly after
+/// startup so the first real request doesn't pay the Yahoo round trips. A
+/// failure for any ticker is logged and skipped -- never fatal.
+async fn warm_market_data_cache() {
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    let outcome = tokio::task::spawn_blocking(|| {
+        let dir = std::path::Path::new(compute::dispatch::CACHE_DIR);
+        let mut failed = Vec::new();
+        for ticker in WARMUP_TICKERS {
+            if let Err(err) = compute::data::load_series(dir, ticker, false) {
+                failed.push(format!("{ticker}: {err}"));
+            }
+        }
+        failed
+    })
+    .await;
+    match outcome {
+        Ok(failed) if failed.is_empty() => tracing::info!("Market data cache warmed"),
+        Ok(failed) => tracing::warn!(?failed, "Market data cache warmup incomplete"),
+        Err(err) => tracing::warn!(error = %err, "Market data cache warmup task failed"),
+    }
 }
 
 fn init_tracing() {

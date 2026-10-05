@@ -20,7 +20,29 @@ pub struct ApiError {
     pub extra: Option<serde_json::Value>,
 }
 
+/// User-facing messages for the 503/500 codes. The detail behind a 500 or
+/// 503 (raw Rust error text, upstream bodies) is logged, never returned.
+pub const MSG_SERVICE_BUSY: &str =
+    "The service is handling many requests. Please wait 30 seconds and try again.";
+pub const MSG_DATA_UNAVAILABLE: &str =
+    "Market data is temporarily unavailable. Please try again in a moment.";
+pub const MSG_AI_UNAVAILABLE: &str = "The AI service is temporarily busy. Please try again in a moment.";
+pub const MSG_INTERNAL: &str = "Something went wrong on our end. Please try again.";
+
+/// `retry_after_seconds` in a `service_busy` body, and its `Retry-After` header.
+pub const RETRY_AFTER_SECONDS: u64 = 30;
+
 impl ApiError {
+    /// 503 `service_busy`: the `/ask` concurrency limiter's queue timed out.
+    pub fn service_busy() -> Self {
+        ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "service_busy",
+            message: MSG_SERVICE_BUSY.to_string(),
+            extra: Some(serde_json::json!({ "retry_after_seconds": RETRY_AFTER_SECONDS })),
+        }
+    }
+
     pub fn bad_request(code: &'static str, message: impl Into<String>) -> Self {
         ApiError {
             status: StatusCode::BAD_REQUEST,
@@ -62,7 +84,18 @@ impl ApiError {
 }
 
 impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
+    fn into_response(mut self) -> Response {
+        // Internal failures never expose their raw detail to the caller.
+        if matches!(self.code, "internal_error" | "compute_error") {
+            tracing::error!(code = self.code, detail = %self.message, "internal error");
+            self.message = MSG_INTERNAL.to_string();
+            self.status = StatusCode::INTERNAL_SERVER_ERROR;
+        }
+        let retry_after = self
+            .extra
+            .as_ref()
+            .and_then(|e| e.get("retry_after_seconds"))
+            .and_then(serde_json::Value::as_u64);
         let mut body = serde_json::json!({
             "error": self.message,
             "code": self.code,
@@ -72,7 +105,11 @@ impl IntoResponse for ApiError {
                 base.extend(extra.clone());
             }
         }
-        (self.status, Json(body)).into_response()
+        let mut response = (self.status, Json(body)).into_response();
+        if let Some(secs) = retry_after {
+            response.headers_mut().insert(axum::http::header::RETRY_AFTER, secs.into());
+        }
+        response
     }
 }
 
@@ -85,18 +122,42 @@ impl From<BackendError> for ApiError {
                 message,
                 extra: None,
             },
+            BackendError::UnresolvedTicker(message) => ApiError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "unresolved_ticker",
+                message,
+                extra: None,
+            },
+            BackendError::InsufficientData(message) => ApiError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "insufficient_data",
+                message,
+                extra: None,
+            },
+            BackendError::DataUnavailable(detail) => {
+                tracing::warn!(%detail, "market data unavailable");
+                ApiError {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    code: "data_unavailable",
+                    message: MSG_DATA_UNAVAILABLE.to_string(),
+                    extra: None,
+                }
+            }
             BackendError::Compute(message) => ApiError {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "compute_error",
                 message,
                 extra: None,
             },
-            BackendError::GeminiUnavailable(message) => ApiError {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                code: "gemini_unavailable",
-                message,
-                extra: None,
-            },
+            BackendError::GeminiUnavailable(detail) => {
+                tracing::warn!(%detail, "gemini unavailable");
+                ApiError {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    code: "ai_unavailable",
+                    message: MSG_AI_UNAVAILABLE.to_string(),
+                    extra: None,
+                }
+            }
             BackendError::Internal(message) => ApiError {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "internal_error",
@@ -132,4 +193,52 @@ where
             }),
         }
     }
+}
+
+/// Safety net: any error response a handler or extractor produced that is
+/// not already JSON (axum's plain-text extractor rejections, a bare 405,
+/// a body-limit 413, ...) is rewritten into the standard `{error, code}`
+/// shape, so no error path ever returns an empty body or raw text.
+pub async fn ensure_json_errors(req: Request, next: axum::middleware::Next) -> Response {
+    let response = next.run(req).await;
+    let status = response.status();
+    if !(status.is_client_error() || status.is_server_error()) {
+        return response;
+    }
+    let is_json = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("application/json"));
+    if is_json {
+        return response;
+    }
+    let (code, fallback) = match status {
+        StatusCode::NOT_FOUND => ("not_found", "Not found."),
+        StatusCode::METHOD_NOT_ALLOWED => ("method_not_allowed", "That method is not allowed here."),
+        StatusCode::PAYLOAD_TOO_LARGE => ("payload_too_large", "The request body is too large."),
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => ("unsupported_media_type", "Unsupported content type."),
+        s if s.is_server_error() => ("internal_error", MSG_INTERNAL),
+        _ => ("bad_request", "The request could not be processed."),
+    };
+    let (parts, body) = response.into_parts();
+    let text = axum::body::to_bytes(body, 8 * 1024).await.unwrap_or_default();
+    let text = String::from_utf8_lossy(&text).trim().to_string();
+    let message = if status.is_server_error() {
+        if !text.is_empty() {
+            tracing::error!(%status, detail = %text, "non-JSON server error");
+        }
+        MSG_INTERNAL.to_string()
+    } else if text.is_empty() {
+        fallback.to_string()
+    } else {
+        text
+    };
+    let mut out = (parts.status, Json(serde_json::json!({ "error": message, "code": code }))).into_response();
+    for name in [axum::http::header::ALLOW, axum::http::header::RETRY_AFTER] {
+        if let Some(v) = parts.headers.get(&name) {
+            out.headers_mut().insert(name, v.clone());
+        }
+    }
+    out
 }

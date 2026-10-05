@@ -510,6 +510,47 @@ For Recharts:
 
 ---
 
+## Error handling for users
+
+Every error response is JSON: `{ "error": "...", "code": "..." }`. Show
+these messages based on `code`:
+
+service_busy (503):
+  Show countdown: "High demand right now — retrying in Xs" and auto-retry
+  after retry_after_seconds. Do NOT show "Something went wrong."
+
+data_unavailable (503):
+  Show: "Market data is temporarily unavailable. Please try again."
+  Add a retry button.
+
+ai_unavailable (503):
+  Show: "AI service is busy. Please try again in a moment."
+  Add a retry button.
+
+isin_not_supported (400, on upload):
+  Show the error.error field directly — it explains exactly what to do.
+
+unresolved_ticker (422, on ask/experiment):
+  Show the error.error field directly — it names the ticker and explains
+  the fix.
+
+insufficient_data (422): show error.error directly.
+unrecognised_request (422): show error.error directly.
+
+For all 503 responses with retry_after_seconds:
+  Auto-retry after that many seconds. Show a countdown timer, not an
+  error message. After 2 auto-retries, show the error message with a
+  manual retry button.
+
+(`ai_unavailable` replaces the former `gemini_unavailable` code. 500s —
+`internal_error`/`compute_error` — always carry the same generic message:
+"Something went wrong on our end. Please try again.")
+
+### GET /health additions
+
+`{"status","version","gemini":"configured"|"not_configured",
+"upstox":"configured"|"not_configured","active_requests":N,"capacity":8}`
+
 ## Regime badge
 Source: response.trace.model_params.regime_state.current_label
 Values: "Bull" | "Bear" | "Crisis"
