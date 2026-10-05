@@ -55,6 +55,10 @@ pub struct AppState {
     /// `service_busy`.
     pub ask_queue_timeout: Duration,
     pub gemini_configured: bool,
+    /// Shared HTTP client for ISIN lookups on upload. It must send a
+    /// browser-like User-Agent (see `main`).
+    pub isin_client: reqwest::Client,
+    pub isin_config: compute::isin::ResolverConfig,
 }
 
 /// Concurrent `/ask` requests allowed at once.

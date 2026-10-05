@@ -70,6 +70,14 @@ async fn main() {
     let upstox_client: Arc<dyn UpstoxClient> = Arc::new(HttpUpstoxClient::new());
     let upstox_state_map = Arc::new(Mutex::new(HashMap::new()));
 
+    // Yahoo Finance throttles the default reqwest User-Agent, so ISIN lookups
+    // present a browser-like one.
+    let isin_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent("Mozilla/5.0")
+        .build()
+        .expect("failed to build ISIN HTTP client");
+
     let state = AppState {
         backend,
         store,
@@ -82,6 +90,8 @@ async fn main() {
         // `HttpGeminiClient::new` above already exited the process if the
         // key was missing.
         gemini_configured: true,
+        isin_client,
+        isin_config: compute::isin::ResolverConfig::default(),
     };
 
     let app = build_router(state);

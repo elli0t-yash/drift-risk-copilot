@@ -200,6 +200,8 @@ fn app_with_backend_and_store(backend: MockBackend) -> (axum::Router, Arc<store:
         capacity: 8,
         ask_queue_timeout: std::time::Duration::from_millis(200),
         gemini_configured: true,
+        isin_client: reqwest::Client::new(),
+        isin_config: compute::isin::ResolverConfig { search_url: "http://127.0.0.1:1/unreachable".to_string(), ..fast_isin_config() },
     });
     (app, store)
 }
@@ -280,6 +282,8 @@ fn app_with_upstox(
         capacity: 8,
         ask_queue_timeout: std::time::Duration::from_millis(200),
         gemini_configured: true,
+        isin_client: reqwest::Client::new(),
+        isin_config: compute::isin::ResolverConfig { search_url: "http://127.0.0.1:1/unreachable".to_string(), ..fast_isin_config() },
     });
     (app, upstox_state_map)
 }
@@ -516,6 +520,8 @@ async fn ask_with_non_empty_conversation_history_forwards_it_to_the_backend() {
         capacity: 8,
         ask_queue_timeout: std::time::Duration::from_millis(200),
         gemini_configured: true,
+        isin_client: reqwest::Client::new(),
+        isin_config: compute::isin::ResolverConfig { search_url: "http://127.0.0.1:1/unreachable".to_string(), ..fast_isin_config() },
     });
 
     let req_body = serde_json::json!({
@@ -1183,17 +1189,16 @@ async fn eq_suffixed_ticker_is_normalised() {
 }
 
 #[tokio::test]
-async fn isin_ticker_is_kept_as_is_with_a_trace_note() {
+async fn a_known_isin_is_converted_to_its_nse_symbol_not_kept_as_is() {
     let csv = "ticker,weight\nINE002A01018,0.6\nTCS.NS,0.4\n";
     let response = upload(empty_backend_app(), "holdings.csv", "text/csv", csv.as_bytes()).await;
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
     let holdings = body["portfolio"]["holdings"].as_array().unwrap();
-    // Kept as-is -- no ".NS" appended to something that isn't a symbol.
-    assert!(holdings.iter().any(|h| h["ticker"] == "INE002A01018"));
-    let notes = body["tickers_normalised"].as_array().unwrap();
-    assert!(notes.iter().any(|n| n.as_str().unwrap().contains("INE002A01018") && n.as_str().unwrap().contains("manual")));
+    assert!(holdings.iter().any(|h| h["ticker"] == "RELIANCE.NS"));
+    assert!(!holdings.iter().any(|h| h["ticker"] == "INE002A01018"));
+    assert_eq!(body["isins_resolved"]["INE002A01018"], "RELIANCE.NS");
 }
 
 #[tokio::test]
@@ -2018,6 +2023,8 @@ async fn nine_concurrent_asks_eight_proceed_and_one_gets_503_service_busy() {
         capacity: 8,
         ask_queue_timeout: std::time::Duration::from_millis(300),
         gemini_configured: true,
+        isin_client: reqwest::Client::new(),
+        isin_config: compute::isin::ResolverConfig { search_url: "http://127.0.0.1:1/unreachable".to_string(), ..fast_isin_config() },
     });
     let ask = |app: axum::Router| {
         let body = serde_json::json!({"portfolio": sample_portfolio(), "message": "risk?"});
@@ -2135,19 +2142,188 @@ async fn insufficient_data_maps_to_422_insufficient_data() {
     assert_error_body(experiment_request(app).await, StatusCode::UNPROCESSABLE_ENTITY, "insufficient_data").await;
 }
 
+/// A stub Yahoo search endpoint: `answer(isin)` gives `(status, quotes)`,
+/// each quote `(symbol, exchange, quoteType)`.
+fn yahoo_stub(
+    answer: impl Fn(&str) -> (u16, Vec<(&'static str, &'static str, &'static str)>) + Send + 'static,
+) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1/finance/search", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut conn) = conn else { return };
+            let mut buf = [0u8; 4096];
+            let n = conn.read(&mut buf).unwrap_or(0);
+            let head = String::from_utf8_lossy(&buf[..n]).to_string();
+            let isin = head.split("q=").nth(1).and_then(|s| s.split(['&', ' ']).next()).unwrap_or("").to_string();
+            let (status, quotes) = answer(&isin);
+            let items: Vec<String> = quotes
+                .iter()
+                .map(|(s, e, t)| format!(r#"{{"symbol":"{s}","exchange":"{e}","quoteType":"{t}"}}"#))
+                .collect();
+            let body = format!(r#"{{"quotes":[{}]}}"#, items.join(","));
+            let _ = write!(
+                conn,
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    url
+}
+
+fn fast_isin_config() -> compute::isin::ResolverConfig {
+    use std::time::Duration;
+    compute::isin::ResolverConfig {
+        first_timeout: Duration::from_millis(500),
+        retry_timeout: Duration::from_millis(800),
+        rate_limit_wait: Duration::from_millis(50),
+        batch_gap: Duration::from_millis(10),
+        ..Default::default()
+    }
+}
+
+fn app_with_isin_url(url: String) -> axum::Router {
+    build_router(AppState {
+        backend: Arc::new(empty_mock()),
+        store: Arc::new(store::SnapshotStore::open(":memory:").unwrap()),
+        upstox_config: unconfigured_upstox_config(),
+        upstox_client: Arc::new(MockUpstoxClient::unused()),
+        upstox_state_map: Arc::new(Mutex::new(HashMap::new())),
+        semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+        capacity: 8,
+        ask_queue_timeout: std::time::Duration::from_millis(200),
+        gemini_configured: true,
+        isin_client: reqwest::Client::new(),
+        isin_config: compute::isin::ResolverConfig { search_url: url, ..fast_isin_config() },
+    })
+}
+
+const NO_QUOTES: (u16, Vec<(&str, &str, &str)>) = (200, Vec::new());
+
 #[tokio::test]
-async fn upload_with_mostly_isins_is_rejected_with_isin_not_supported() {
-    let csv = "ticker,weight\nINE672A01026,0.4\nINE002A01018,0.4\nTCS.NS,0.2\n";
-    let response = upload(empty_backend_app(), "p.csv", "text/csv", csv.as_bytes()).await;
-    let body = assert_error_body(response, StatusCode::BAD_REQUEST, "isin_not_supported").await;
-    assert!(body["error"].as_str().unwrap().contains("export your holdings by symbol"));
+async fn kotak_style_isin_upload_resolves_skips_and_renormalizes() {
+    let url = yahoo_stub(|isin| match isin {
+        "INE263A01024" => (200, vec![("BEL.NS", "NSI", "EQUITY")]),
+        "INF000000012" => (200, vec![("0P0001.BO", "BSE", "MUTUALFUND")]),
+        _ => NO_QUOTES, // INE999X99999: unknown
+    });
+    let csv = "Stock Name,ISIN,Quantity,Average buy price\n\
+               RELIANCE INDUSTRIES,INE002A01018,10,1000\n\
+               HDFC BANK,INE040A01034,10,1000\n\
+               BHARAT ELECTRONICS LTD,INE263A01024,10,1000\n\
+               SOME FUND,INF000000012,10,1000\n\
+               GONE CO,INE999X99999,10,1000\n";
+    let response = upload(app_with_isin_url(url), "holdings.csv", "text/csv", csv.as_bytes()).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["layout_detected"], "value");
+    assert_eq!(
+        body["isins_resolved"],
+        serde_json::json!({"INE002A01018": "RELIANCE.NS", "INE040A01034": "HDFCBANK.NS", "INE263A01024": "BEL.NS"})
+    );
+    let skipped = body["isins_skipped"].as_array().unwrap();
+    assert_eq!(skipped.len(), 2);
+    assert_eq!(skipped[0]["isin"], "INF000000012");
+    assert_eq!(skipped[0]["category"], "non_equity");
+    assert!(skipped[0]["reason"].as_str().unwrap().starts_with("Mutual funds cannot be analysed"));
+    assert_eq!(skipped[1]["isin"], "INE999X99999");
+    assert_eq!(skipped[1]["category"], "not_found");
+
+    assert_eq!(body["weights_renormalized"], true);
+    assert_eq!(body["original_holding_count"], 5);
+    assert_eq!(body["retained_holding_count"], 3);
+    assert_eq!(body["row_count"], 5);
+    let holdings = body["portfolio"]["holdings"].as_array().unwrap();
+    let tickers: Vec<&str> = holdings.iter().map(|h| h["ticker"].as_str().unwrap()).collect();
+    assert_eq!(tickers, vec!["RELIANCE.NS", "HDFCBANK.NS", "BEL.NS"]);
+    // Equal values, so equal weights; the total is the retained value only.
+    assert_eq!(body["portfolio"]["total_value_inr"], 30000.0);
+    let weight_sum: f64 = holdings.iter().map(|h| h["weight"].as_f64().unwrap()).sum();
+    assert!((weight_sum - 1.0).abs() < 1e-5, "{weight_sum}");
 }
 
 #[tokio::test]
-async fn upload_with_a_minority_of_isins_is_not_rejected_as_isin_file() {
-    let csv = "ticker,weight\nINE672A01026,0.2\nRELIANCE.NS,0.4\nTCS.NS,0.4\n";
+async fn an_all_isin_file_resolves_without_skips() {
+    let url = yahoo_stub(|_| NO_QUOTES); // both ISINs are cached: must not matter
+    let csv = "ISIN,Quantity,Average buy price\nINE002A01018,10,1000\nINE040A01034,30,1000\n";
+    let response = upload(app_with_isin_url(url), "k.csv", "text/csv", csv.as_bytes()).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["isins_resolved"].as_object().unwrap().len(), 2);
+    assert_eq!(body["isins_skipped"], serde_json::json!([]));
+    assert_eq!(body["weights_renormalized"], false);
+    assert_eq!(body["original_holding_count"], 2);
+    assert_eq!(body["retained_holding_count"], 2);
+    assert_eq!(body["portfolio"]["total_value_inr"], 40000.0);
+    assert_eq!(body["portfolio"]["holdings"][1]["weight"], 0.75);
+}
+
+#[tokio::test]
+async fn upload_mixing_isins_and_nse_symbols_resolves_both() {
+    let url = yahoo_stub(|_| NO_QUOTES);
+    let csv = "ticker,weight\nINE002A01018,0.5\nTCS,0.3\nINFY.NS,0.2\n";
+    let response = upload(app_with_isin_url(url), "p.csv", "text/csv", csv.as_bytes()).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    let tickers: Vec<&str> = body["portfolio"]["holdings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["ticker"].as_str().unwrap())
+        .collect();
+    assert_eq!(tickers, vec!["RELIANCE.NS", "TCS.NS", "INFY.NS"]);
+    assert_eq!(body["isins_resolved"], serde_json::json!({"INE002A01018": "RELIANCE.NS"}));
+    assert_eq!(body["isins_skipped"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn a_symbol_file_has_empty_isin_fields_and_never_calls_yahoo() {
+    // The URL is unreachable: any lookup attempt would fail the upload.
+    let csv = "ticker,weight\nRELIANCE.NS,0.6\nTCS.NS,0.4\n";
     let response = upload(empty_backend_app(), "p.csv", "text/csv", csv.as_bytes()).await;
     assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["isins_resolved"], serde_json::json!({}));
+    assert_eq!(body["isins_skipped"], serde_json::json!([]));
+    assert_eq!(body["weights_renormalized"], false);
+    assert_eq!(body["retained_holding_count"], 2);
+}
+
+#[tokio::test]
+async fn only_one_resolving_isin_is_422_insufficient_holdings_with_reasons() {
+    let url = yahoo_stub(|isin| match isin {
+        "INE342T07379" => NO_QUOTES, // debenture by ISIN structure
+        _ => NO_QUOTES,
+    });
+    let csv = "ticker,weight\nINE002A01018,0.5\nINE342T07379,0.3\nINE999X99999,0.2\n";
+    let response = upload(app_with_isin_url(url), "p.csv", "text/csv", csv.as_bytes()).await;
+
+    let body = assert_error_body(response, StatusCode::UNPROCESSABLE_ENTITY, "insufficient_holdings").await;
+    assert!(body["error"].as_str().unwrap().contains("Bonds and debentures"), "{body}");
+    assert_eq!(body["isins_skipped"].as_array().unwrap().len(), 2);
+    assert_eq!(body["isins_skipped"][0]["category"], "non_equity");
+}
+
+#[tokio::test]
+async fn an_upload_where_every_isin_fails_is_a_descriptive_422() {
+    let url = yahoo_stub(|_| NO_QUOTES);
+    let csv = "ticker,weight\nINE999X99991,0.5\nINE999X99992,0.5\n";
+    let response = upload(app_with_isin_url(url), "p.csv", "text/csv", csv.as_bytes()).await;
+    let body = assert_error_body(response, StatusCode::UNPROCESSABLE_ENTITY, "insufficient_holdings").await;
+    assert!(body["error"].as_str().unwrap().contains("Could not identify this security"), "{body}");
+}
+
+#[tokio::test]
+async fn yahoo_being_down_is_503_data_unavailable_not_a_blame_the_file_error() {
+    let url = yahoo_stub(|_| (503, Vec::new()));
+    let csv = "ticker,weight\nINE999X99991,0.5\nINE999X99992,0.5\n";
+    let response = upload(app_with_isin_url(url), "p.csv", "text/csv", csv.as_bytes()).await;
+    assert_error_body(response, StatusCode::SERVICE_UNAVAILABLE, "data_unavailable").await;
 }
 
 #[tokio::test]
