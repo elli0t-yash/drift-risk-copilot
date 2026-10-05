@@ -196,6 +196,10 @@ fn app_with_backend_and_store(backend: MockBackend) -> (axum::Router, Arc<store:
         upstox_config: unconfigured_upstox_config(),
         upstox_client: Arc::new(MockUpstoxClient::unused()),
         upstox_state_map: Arc::new(Mutex::new(HashMap::new())),
+        semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+        capacity: 8,
+        ask_queue_timeout: std::time::Duration::from_millis(200),
+        gemini_configured: true,
     });
     (app, store)
 }
@@ -272,6 +276,10 @@ fn app_with_upstox(
         upstox_config,
         upstox_client,
         upstox_state_map: upstox_state_map.clone(),
+        semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+        capacity: 8,
+        ask_queue_timeout: std::time::Duration::from_millis(200),
+        gemini_configured: true,
     });
     (app, upstox_state_map)
 }
@@ -504,6 +512,10 @@ async fn ask_with_non_empty_conversation_history_forwards_it_to_the_backend() {
         upstox_config: unconfigured_upstox_config(),
         upstox_client: Arc::new(MockUpstoxClient::unused()),
         upstox_state_map: Arc::new(Mutex::new(HashMap::new())),
+        semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+        capacity: 8,
+        ask_queue_timeout: std::time::Duration::from_millis(200),
+        gemini_configured: true,
     });
 
     let req_body = serde_json::json!({
@@ -1876,4 +1888,312 @@ async fn upstox_callback_surfaces_token_exchange_failure_as_502() {
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let body = body_json(response).await;
     assert_eq!(body["error"], "invalid_grant: authorization code has expired");
+}
+
+// ---------------------------------------------------------------------
+// Production-hardening tests: concurrency limiter, error mapping/shape,
+// health, ISIN upload rejection.
+// ---------------------------------------------------------------------
+
+fn empty_mock() -> MockBackend {
+    MockBackend {
+        experiment_result: None,
+        experiment_error: None,
+        ask_result: None,
+        received_conversation_history: Mutex::new(None),
+        received_policy: Mutex::new(None),
+    }
+}
+
+fn experiment_request(app: axum::Router) -> impl std::future::Future<Output = axum::response::Response> {
+    let body = serde_json::json!({
+        "portfolio": sample_portfolio(),
+        "experiment": {"type": "RiskDecomposition"},
+    });
+    async move {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/experiment")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+}
+
+fn is_json(response: &axum::response::Response) -> bool {
+    response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("application/json"))
+}
+
+async fn assert_error_body(response: axum::response::Response, status: StatusCode, code: &str) -> serde_json::Value {
+    assert_eq!(response.status(), status);
+    assert!(is_json(&response), "error response must be JSON");
+    let body = body_json(response).await;
+    assert_eq!(body["code"], code, "{body}");
+    assert!(body["error"].as_str().is_some_and(|m| !m.is_empty()), "{body}");
+    body
+}
+
+/// Answers `/ask` only once `gate` has a permit, counting how many
+/// requests are inside the backend at once.
+struct GatedBackend {
+    inner: MockBackend,
+    gate: Arc<tokio::sync::Semaphore>,
+    entered: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Backend for GatedBackend {
+    async fn run_experiment(
+        &self,
+        e: Experiment,
+        p: Portfolio,
+        policy: Option<compute::policy::RiskPolicy>,
+    ) -> Result<EvidenceTrace, BackendError> {
+        self.inner.run_experiment(e, p, policy).await
+    }
+
+    async fn run_ask(
+        &self,
+        p: Portfolio,
+        m: String,
+        h: Vec<agent::ConversationTurn>,
+        policy: Option<compute::policy::RiskPolicy>,
+    ) -> Result<agent::pipeline::PipelineResult, BackendError> {
+        self.entered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.gate.acquire().await.unwrap().forget();
+        let mut result = self.inner.run_ask(p, m, h, policy).await?;
+        // The store keys snapshots by trace id, so concurrent asks sharing
+        // one canned result need distinct ids to all persist.
+        result.trace.id = uuid::Uuid::new_v4().to_string();
+        result.execution_trace.id = uuid::Uuid::new_v4().to_string();
+        Ok(result)
+    }
+}
+
+fn sample_pipeline_result() -> agent::pipeline::PipelineResult {
+    agent::pipeline::PipelineResult {
+        experiment: Experiment::RiskDecomposition(RiskDecompositionInput {
+            portfolio: sample_portfolio(),
+            frequency: Frequency::Daily,
+            window: None,
+        }),
+        trace: sample_trace(),
+        traces: vec![sample_trace()],
+        tool_plans: vec![],
+        narration: agent::grounding::GroundedNarration {
+            narration: "Vol is 15.5% annualised.".to_string(),
+            grounding_warnings: vec![],
+        },
+        assistant_turn: agent::ConversationTurn::assistant("Vol is 15.5% annualised."),
+        suggestion: "Reduce turnover?".to_string(),
+        execution_trace: sample_execution_trace(),
+    }
+}
+
+#[tokio::test]
+async fn nine_concurrent_asks_eight_proceed_and_one_gets_503_service_busy() {
+    use std::sync::atomic::Ordering;
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let backend = GatedBackend {
+        inner: MockBackend { ask_result: Some(sample_pipeline_result()), ..empty_mock() },
+        gate: gate.clone(),
+        entered: entered.clone(),
+    };
+    let app = build_router(AppState {
+        backend: Arc::new(backend),
+        store: Arc::new(store::SnapshotStore::open(":memory:").unwrap()),
+        upstox_config: unconfigured_upstox_config(),
+        upstox_client: Arc::new(MockUpstoxClient::unused()),
+        upstox_state_map: Arc::new(Mutex::new(HashMap::new())),
+        semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+        capacity: 8,
+        ask_queue_timeout: std::time::Duration::from_millis(300),
+        gemini_configured: true,
+    });
+    let ask = |app: axum::Router| {
+        let body = serde_json::json!({"portfolio": sample_portfolio(), "message": "risk?"});
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/ask")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    let mut handles: Vec<_> = (0..8).map(|_| tokio::spawn(ask(app.clone()))).collect();
+    while entered.load(Ordering::SeqCst) < 8 {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // All 8 permits are held, so the 9th waits out the queue timeout.
+    let health = app
+        .clone()
+        .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(body_json(health).await["active_requests"], 8);
+    let ninth = ask(app.clone()).await;
+    let retry_after = ninth.headers().get("retry-after").cloned();
+    let body = assert_error_body(ninth, StatusCode::SERVICE_UNAVAILABLE, "service_busy").await;
+    assert_eq!(body["retry_after_seconds"], 30);
+    assert_eq!(body["error"], crate::error::MSG_SERVICE_BUSY);
+    assert_eq!(retry_after.unwrap(), "30");
+    assert_eq!(entered.load(Ordering::SeqCst), 8, "the 9th must never reach the backend");
+
+    gate.add_permits(8);
+    for h in handles.drain(..) {
+        assert_eq!(h.await.unwrap().status(), StatusCode::OK);
+    }
+    // Permits are released: a new ask goes through, and health is idle again.
+    gate.add_permits(1);
+    assert_eq!(ask(app.clone()).await.status(), StatusCode::OK);
+    let health = app
+        .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(body_json(health).await["active_requests"], 0);
+}
+
+#[tokio::test]
+async fn health_reports_capacity_activity_and_integration_status() {
+    let response = app_with_backend(empty_mock())
+        .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let body = body_json(response).await;
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["gemini"], "configured");
+    assert_eq!(body["upstox"], "not_configured");
+    assert_eq!(body["active_requests"], 0);
+    assert_eq!(body["capacity"], 8);
+}
+
+#[tokio::test]
+async fn data_unavailable_maps_to_503_with_the_user_message() {
+    let app = app_with_backend(MockBackend {
+        experiment_error: Some(BackendError::DataUnavailable(
+            "Market data temporarily unavailable. Please try again in a moment.".to_string(),
+        )),
+        ..empty_mock()
+    });
+    let body = assert_error_body(experiment_request(app).await, StatusCode::SERVICE_UNAVAILABLE, "data_unavailable").await;
+    assert_eq!(body["error"], "Market data is temporarily unavailable. Please try again in a moment.");
+}
+
+#[tokio::test]
+async fn gemini_unavailable_maps_to_503_ai_unavailable_without_leaking_detail() {
+    let app = app_with_backend(MockBackend {
+        experiment_error: Some(BackendError::GeminiUnavailable("status 503 body {secret}".to_string())),
+        ..empty_mock()
+    });
+    let body = assert_error_body(experiment_request(app).await, StatusCode::SERVICE_UNAVAILABLE, "ai_unavailable").await;
+    assert_eq!(body["error"], "The AI service is temporarily busy. Please try again in a moment.");
+}
+
+#[tokio::test]
+async fn internal_and_compute_errors_return_a_generic_500_message() {
+    for err in [
+        BackendError::Internal("thread 'x' panicked at src/foo.rs:1".to_string()),
+        BackendError::Compute("nalgebra: singular matrix".to_string()),
+    ] {
+        let app = app_with_backend(MockBackend { experiment_error: Some(err), ..empty_mock() });
+        let response = experiment_request(app).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_json(response).await;
+        assert_eq!(body["error"], "Something went wrong on our end. Please try again.");
+    }
+}
+
+#[tokio::test]
+async fn an_isin_holding_surfaces_as_422_unresolved_ticker_with_the_isin_message() {
+    let err: BackendError = compute::ticker_map::isin_error("INE672A01026").into();
+    let app = app_with_backend(MockBackend { experiment_error: Some(err), ..empty_mock() });
+    let body = assert_error_body(experiment_request(app).await, StatusCode::UNPROCESSABLE_ENTITY, "unresolved_ticker").await;
+    let msg = body["error"].as_str().unwrap();
+    assert!(msg.contains("ISIN codes (INE672A01026)") && msg.contains("RELIANCE.NS"), "{msg}");
+}
+
+#[tokio::test]
+async fn insufficient_data_maps_to_422_insufficient_data() {
+    let err: BackendError = compute::ComputeError::InsufficientData("FOO.NS has only 20 observations".to_string()).into();
+    let app = app_with_backend(MockBackend { experiment_error: Some(err), ..empty_mock() });
+    assert_error_body(experiment_request(app).await, StatusCode::UNPROCESSABLE_ENTITY, "insufficient_data").await;
+}
+
+#[tokio::test]
+async fn upload_with_mostly_isins_is_rejected_with_isin_not_supported() {
+    let csv = "ticker,weight\nINE672A01026,0.4\nINE002A01018,0.4\nTCS.NS,0.2\n";
+    let response = upload(empty_backend_app(), "p.csv", "text/csv", csv.as_bytes()).await;
+    let body = assert_error_body(response, StatusCode::BAD_REQUEST, "isin_not_supported").await;
+    assert!(body["error"].as_str().unwrap().contains("export your holdings by symbol"));
+}
+
+#[tokio::test]
+async fn upload_with_a_minority_of_isins_is_not_rejected_as_isin_file() {
+    let csv = "ticker,weight\nINE672A01026,0.2\nRELIANCE.NS,0.4\nTCS.NS,0.4\n";
+    let response = upload(empty_backend_app(), "p.csv", "text/csv", csv.as_bytes()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn framework_level_errors_still_return_json_bodies() {
+    let app = app_with_backend(empty_mock());
+    // 405: wrong method on a real route (axum's own response has no body).
+    let r = app
+        .clone()
+        .oneshot(Request::builder().method("GET").uri("/ask").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_error_body(r, StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed").await;
+    // Malformed JSON.
+    let r = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ask")
+                .header("content-type", "application/json")
+                .body(Body::from("{not json"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(is_json(&r));
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    // Missing content type.
+    let r = app
+        .clone()
+        .oneshot(Request::builder().method("POST").uri("/ask").body(Body::from("{}")).unwrap())
+        .await
+        .unwrap();
+    assert!(is_json(&r));
+    // Query-string extractor rejection (a non-JSON plain-text axum body).
+    let r = app
+        .clone()
+        .oneshot(Request::builder().uri("/drift").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert!(r.status().is_client_error());
+    assert!(is_json(&r));
+    // Unknown report id.
+    let r = app
+        .oneshot(Request::builder().uri("/report/nope").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_error_body(r, StatusCode::NOT_FOUND, "result_not_found").await;
 }

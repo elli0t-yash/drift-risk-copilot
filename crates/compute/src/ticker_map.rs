@@ -26,7 +26,39 @@ const STATIC_MAPPINGS: &[(&str, &str)] = &[
     // Yahoo accepts this hyphenated form directly -- do NOT de-hyphenate.
     ("BAJAJ-AUTO", "BAJAJ-AUTO.NS"),
     ("HDFCAMC", "HDFCAMC.NS"),
+    ("RATNAVEER", "RATNAVEERP.NS"),
+    ("RATNAVEERP", "RATNAVEERP.NS"),
+    // Hyphenated symbols Yahoo only knows in hyphenated form (the generic
+    // de-hyphenation step would otherwise break them).
+    ("MCDOWELL-N", "MCDOWELL-N.NS"),
+    ("HDFCLIFE", "HDFCLIFE.NS"),
+    ("SBILIFE", "SBILIFE.NS"),
+    ("ICICIGI", "ICICIGI.NS"),
+    ("ICICIPRULI", "ICICIPRULI.NS"),
+    ("NAUKRI", "NAUKRI.NS"),
+    ("PIIND", "PIIND.NS"),
+    ("TATACOMM", "TATACOMM.NS"),
+    ("TATAELXSI", "TATAELXSI.NS"),
+    ("TATAMTRDVR", "TATAMTRDVR.NS"),
 ];
+
+/// Whether `raw` looks like an ISIN (12 alphanumeric characters starting
+/// with "IN", e.g. `INE672A01026`) rather than an NSE trading symbol.
+pub fn is_isin(raw: &str) -> bool {
+    let t = raw.trim();
+    t.len() == 12 && t.to_uppercase().starts_with("IN") && t.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// The user-facing error for a holding given as an ISIN. Callers check
+/// `is_isin` *before* `resolve_ticker`, which would otherwise happily turn
+/// an ISIN into a nonexistent "INE672A01026.NS" symbol.
+pub fn isin_error(raw: &str) -> crate::ComputeError {
+    crate::ComputeError::UnresolvedTicker(format!(
+        "Your portfolio contains ISIN codes ({raw}) instead of NSE ticker symbols. \
+         Please re-upload using NSE symbols like RELIANCE.NS, TATAMOTORS.NS. \
+         Most brokers let you export by symbol instead of ISIN."
+    ))
+}
 
 fn lookup(symbol: &str) -> Option<&'static str> {
     STATIC_MAPPINGS
@@ -104,6 +136,41 @@ fn finish(ticker: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn isin_detection() {
+        assert!(is_isin("INE672A01026"));
+        assert!(is_isin("ine672a01026"));
+        assert!(!is_isin("INFY"));
+        assert!(!is_isin("INE672A0102")); // 11 chars
+        assert!(!is_isin("INE672A01026.NS"));
+        assert!(!is_isin("RELIANCE.NS"));
+    }
+
+    #[test]
+    fn isin_error_names_the_code_and_the_fix() {
+        match isin_error("INE672A01026") {
+            crate::ComputeError::UnresolvedTicker(m) => {
+                assert!(m.contains("INE672A01026") && m.contains("RELIANCE.NS"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn added_mappings_resolve() {
+        for (raw, want) in [
+            ("RATNAVEER", "RATNAVEERP.NS"),
+            ("RATNAVEERP", "RATNAVEERP.NS"),
+            ("MCDOWELL-N", "MCDOWELL-N.NS"),
+            ("TATAMTRDVR", "TATAMTRDVR.NS"),
+            ("HDFCLIFE", "HDFCLIFE.NS"),
+            ("L&T", "LT.NS"),
+            ("L&TFH", "LTFH.NS"),
+        ] {
+            assert_eq!(resolve_ticker(raw), want, "{raw}");
+        }
+    }
 
     #[test]
     fn dil_bz_resolves_to_dalbharat() {

@@ -15,7 +15,8 @@ use crate::model::Frequency;
 use crate::trace::{DataWindow, EvidenceTrace};
 use crate::Result;
 
-const CACHE_DIR: &str = "data/cache";
+/// Where fetched price series are cached on disk.
+pub const CACHE_DIR: &str = "data/cache";
 
 fn build_data_window(data: &MarketData, window: usize, frequency: Frequency) -> DataWindow {
     DataWindow {

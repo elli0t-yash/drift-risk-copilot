@@ -190,10 +190,41 @@ pub fn fetch_yahoo_chart(ticker: &str) -> Result<PriceSeries> {
         "https://query1.finance.yahoo.com/v8/finance/chart/{}?range=5y&interval=1d",
         urlencode_ticker(ticker)
     );
+    fetch_chart_from(&url, ticker, YAHOO_TIMEOUT)
+}
+
+/// Per-request timeout for every Yahoo Finance call.
+const YAHOO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+const DATA_UNAVAILABLE_MESSAGE: &str = "Market data temporarily unavailable. Please try again in a moment.";
+
+/// Timeouts, connection failures and 429/5xx responses are Yahoo being
+/// unreachable (transient, our upstream's problem); everything else
+/// (notably a 404, which `load_series_resolved` turns into
+/// `UnresolvedTicker`) keeps its `Http` form.
+fn classify_http_error(err: reqwest::Error) -> ComputeError {
+    let transient_status = err
+        .status()
+        .map(|s| s == reqwest::StatusCode::TOO_MANY_REQUESTS || s.is_server_error())
+        .unwrap_or(false);
+    if err.is_timeout() || err.is_connect() || transient_status {
+        ComputeError::DataUnavailable(DATA_UNAVAILABLE_MESSAGE.to_string())
+    } else {
+        ComputeError::Http(err)
+    }
+}
+
+fn fetch_chart_from(url: &str, ticker: &str, timeout: std::time::Duration) -> Result<PriceSeries> {
     let client = reqwest::blocking::Client::builder()
         .user_agent("drift-risk-copilot/0.1 (+compute-data-layer)")
+        .timeout(timeout)
         .build()?;
-    let resp: YahooChartResponse = client.get(&url).send()?.error_for_status()?.json()?;
+    let resp: YahooChartResponse = client
+        .get(url)
+        .send()
+        .and_then(|r| r.error_for_status())
+        .and_then(|r| r.json())
+        .map_err(classify_http_error)?;
 
     if let Some(err) = resp.chart.error {
         if !err.is_null() {
@@ -283,6 +314,9 @@ fn is_http_404(err: &ComputeError) -> bool {
 /// naming both the original and resolved ticker so the caller can surface a
 /// clear, actionable 422 instead of a generic 500.
 fn load_series_resolved(cache_dir: &Path, raw_ticker: &str, refresh: bool) -> Result<PriceSeries> {
+    if crate::ticker_map::is_isin(raw_ticker) {
+        return Err(crate::ticker_map::isin_error(raw_ticker));
+    }
     let resolved = crate::ticker_map::resolve_ticker(raw_ticker);
     match load_series(cache_dir, &resolved, refresh) {
         Ok(series) => Ok(series),
@@ -599,6 +633,30 @@ pub fn load_market_data(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_yahoo_request_that_times_out_is_data_unavailable() {
+        // A server that accepts the connection and never answers.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/chart", listener.local_addr().unwrap());
+        let _hold = std::thread::spawn(move || {
+            let conn = listener.accept();
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            drop(conn);
+        });
+        let err = fetch_chart_from(&url, "X.NS", std::time::Duration::from_millis(200)).unwrap_err();
+        match err {
+            ComputeError::DataUnavailable(msg) => assert_eq!(msg, DATA_UNAVAILABLE_MESSAGE),
+            other => panic!("expected DataUnavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_isin_never_reaches_yahoo() {
+        let dir = std::env::temp_dir().join("isin-no-fetch");
+        let err = load_series_resolved(&dir, "INE672A01026", false).unwrap_err();
+        assert!(matches!(err, ComputeError::UnresolvedTicker(m) if m.contains("ISIN codes")));
+    }
 
     #[test]
     fn weekly_resample_keeps_last_trading_day_of_each_week() {

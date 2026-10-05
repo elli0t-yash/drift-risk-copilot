@@ -58,6 +58,12 @@ pub enum ComputeError {
     /// portfolio/time window), not an internal failure -- maps to 422.
     #[error("{0}")]
     InsufficientData(String),
+
+    /// Yahoo Finance couldn't be reached in time (timeout, connection
+    /// failure, or a 429/5xx response) -- transient, and this service's
+    /// upstream problem rather than the caller's. Maps to 503.
+    #[error("{0}")]
+    DataUnavailable(String),
 }
 
 pub type Result<T> = std::result::Result<T, ComputeError>;

@@ -8,8 +8,8 @@ spec:
   template:
     metadata:
       annotations:
-        autoscaling.knative.dev/minScale: "0"
-        autoscaling.knative.dev/maxScale: "3"
+        autoscaling.knative.dev/minScale: "1"
+        autoscaling.knative.dev/maxScale: "10"
     spec:
       containerConcurrency: 80
       # 60s (the checkpoint spec's original value, sized for the compute
@@ -27,8 +27,8 @@ spec:
             - containerPort: 8080
           resources:
             limits:
-              memory: 512Mi
-              cpu: "1"
+              memory: 1Gi
+              cpu: "2"
           env:
             - name: GEMINI_API_KEY
               valueFrom:
@@ -47,8 +47,9 @@ spec:
                   key: latest
             # /data is the container's own ephemeral local disk: it survives
             # requests on a single warm instance but is never shared across
-            # instances/revisions and is lost on cold start or scale-to-zero
-            # (minScale: "0" above). Acceptable for a hackathon-scale demo;
+            # instances/revisions and is lost on a new revision or when an
+            # instance is recycled (minScale: "1" above keeps one warm, so
+            # scale-to-zero cold starts no longer apply). Acceptable for a hackathon-scale demo;
             # see the README's "Persistence" section for the tradeoff.
             - name: SNAPSHOT_DB_PATH
               value: /data/snapshots.db

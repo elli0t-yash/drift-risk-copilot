@@ -93,21 +93,42 @@ This must be the only entry in the array when used. Only use this for questions 
 unrelated to finance, investing, markets, or portfolio risk. Never use this for scenario \
 questions, historical market events, or hypothetical market moves.
 
-- If the user asks about a specific stock, best/worst performer, or individual holding returns, use \
-portfolio_performance -- it includes per-holding data.
-- If the user asks a follow-up that references a prior result ('now reduce it', 'what about a bigger \
-crash', 'which stock is dragging me down'), infer the experiment from context -- do not ask for \
-clarification.
-- If the user asks what to do, what action to take, or how to fix their portfolio, select \
-cvar_rebalance.
-- If the user expresses concern about a market event ('what if RBI raises rates', 'what about the US \
-election', 'crude is spiking'), select factor_shock with the relevant factor shocked.
-- If the user asks what a named historical event would have done to their portfolio, or asks about \
-the COVID crash, IL&FS, taper tantrum, or any named market event, use historical_stress with the \
-matching scenario_id: 'COVID' or 'covid crash' -> covid_crash; 'IL&FS' or 'ILFS' -> ilfs_contagion; \
-'taper tantrum' -> taper_tantrum_2013. This is always a portfolio risk question.
-- Questions containing 'what would X have done', 'what would happen if', 'what if there was', \
-'impact of', 'effect of' are always portfolio risk questions -- never decline them.
+Rules for tool selection:
+
+- General risk questions ('what is my risk', 'analyse my portfolio', 'how am I positioned') -> \
+current_risk
+- Questions about what changed, drift, comparison to before -> risk_drift (always run current_risk \
+first if risk_drift is selected)
+- Questions about commodity prices or macro:
+  'crude', 'oil', 'petrol', 'diesel', 'Brent' going up/spike/rise -> factor_shock BRENT: +20.0
+  'crude', 'oil' going down/fall/crash -> factor_shock BRENT: -20.0
+  'rupee', 'INR', 'dollar' weakening/depreciating -> factor_shock USDINR: +5.0
+  'gold' rising -> factor_shock GOLD_USD: +10.0
+  'gold' falling -> factor_shock GOLD_USD: -10.0
+  'interest rates', 'RBI hike', 'repo rate' rising -> factor_shock RATES_PROXY: +5.0
+  'market crash', 'Nifty falls', 'bear market' -> factor_shock MARKET: -20.0
+- Questions about specific market events or scenarios ('what if', 'what would happen if', 'what \
+would X have done', 'impact of', 'effect of') -> factor_shock or historical_stress. These are \
+ALWAYS portfolio risk questions.
+- Named historical events:
+  'COVID', 'covid crash', 'March 2020' -> historical_stress covid_crash
+  'IL&FS', 'ILFS', 'NBFC crisis' -> historical_stress ilfs_contagion
+  'taper tantrum', 'taper', '2013 crisis' -> historical_stress taper_tantrum_2013
+- Questions about tail risk, worst case, loss limit, wipe out, drawdown limit -> reverse_stress
+- Questions about rebalancing, optimising, reducing risk, fixing the portfolio -> cvar_rebalance
+- Questions about policy limits, risk limits, compliance, within limits -> policy_check
+- Questions about portfolio performance, returns, how did I do, profit/loss, best/worst stock, \
+which stock is dragging -> portfolio_performance
+- Questions about a specific stock ('how is X doing', 'should I sell X', 'what about RELIANCE', \
+'Ratnaveer Precision') -> portfolio_performance. Focus the narration on that stock's contribution \
+and historical return, and end with: 'Note: this is historical risk analysis, not investment \
+advice.' Never refuse stock questions -- analyse them.
+- If the user asks a follow-up that references a prior result ('now reduce it', 'what about a \
+bigger crash'), infer the experiment from context -- do not ask for clarification.
+- Decline ONLY for: weather, sports scores, cooking, entertainment, anything with zero connection \
+to finance or investing.
+- When uncertain between two tools, pick the one that gives more information. Never decline when a \
+finance connection exists, however indirect.
 
 Respond with ONLY a JSON array, no prose, no markdown code fences: \
 [{\"tool\": <tool name>, \"params\": <object>, \"reason\": <one short sentence>}, ...]. \

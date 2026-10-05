@@ -552,10 +552,22 @@ with `{"error": "...", "code": "invalid_portfolio"}`.
 | Backend error | HTTP status | `code` |
 |---|---|---|
 | `ParseError::Unrecognised` (the model's one-sentence explanation) | 422 | `unrecognised_request` |
-| any `compute::ComputeError` | 500 | `compute_error` |
-| any Gemini error other than a missing API key (already refused at startup) | 503 | `gemini_unavailable` |
+| `ComputeError::UnresolvedTicker` (unknown/delisted symbol, or an ISIN) | 422 | `unresolved_ticker` |
+| `ComputeError::InsufficientData` | 422 | `insufficient_data` |
+| `ComputeError::DataUnavailable` (Yahoo timeout / 429 / 5xx) | 503 | `data_unavailable` |
+| any Gemini error other than a missing API key, incl. exhausted retries | 503 | `ai_unavailable` |
+| `/ask` concurrency queue timed out (see below) | 503 | `service_busy` (+ `retry_after_seconds`, `Retry-After`) |
+| any other `compute::ComputeError` | 500 | `compute_error` (generic message; detail only logged) |
 | malformed/missing-field JSON body (`AppJson`'s rejection) | 400 | `invalid_json` |
-| anything else unexpected | 500 | `internal_error` |
+| anything else unexpected | 500 | `internal_error` (generic message; detail only logged) |
+
+Any other non-JSON error (a bare 405, an extractor rejection, ...) is
+rewritten into the same `{error, code}` shape by `error::ensure_json_errors`.
+
+**Concurrency limit:** `POST /ask` holds one of 8 permits (a
+`tokio::sync::Semaphore` on `AppState`) for the whole request; a request
+that can't get one within 30s gets the 503 `service_busy` above.
+`GET /health` reports `active_requests`/`capacity`.
 
 **Testability:** routes depend on a `Backend` trait (`run_experiment`,
 `run_ask`), not on `compute`/`agent` directly. `RealBackend` wraps live
