@@ -302,6 +302,7 @@ pub fn compute_risk_drift(
         parent_trace_ids: vec![baseline_snapshot.id.clone()],
         baseline_model_params,
         policy_result: None,
+        portfolio_history: None,
     };
 
     Ok((output, trace))

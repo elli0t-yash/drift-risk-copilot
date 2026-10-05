@@ -319,6 +319,40 @@ Details" expandable panel below the narration, above the Evidence Trace.
 }
 
 visualization is null for POST /experiment responses — only /ask returns it.
+(The example above omits the portfolio_history chart for brevity.)
+
+### portfolio_history chart (always first)
+
+Every /ask response includes a timeseries chart as the first chart in
+charts[] (omitted only if market data or a regime path was unavailable).
+
+  id: "portfolio_history"
+  chart_kind: "timeseries"
+
+  data fields:
+    dates[]                ISO-8601 date strings
+    portfolio_value[]      INR value per day
+    portfolio_return_pct[] cumulative return %
+    regime_sequence[]      "Bull"|"Bear"|"Crisis"
+    drawdown_pct[]         drawdown from peak % (always <= 0)
+    total_return_pct       summary: total return
+    max_drawdown_pct       summary: max drawdown
+    window_days            length of all arrays
+
+All arrays are the same length (window_days). The default window is 252
+periods; it is shorter when the regime fit or price history covers fewer
+(e.g. a custom shorter analysis window), capped at 1260. The same series
+is also on the trace as `portfolio_history`.
+
+Recommended rendering:
+- Line chart: dates[] on x-axis, portfolio_return_pct[] on y-axis
+- Color the background by regime_sequence[]
+  (green for Bull, amber for Bear, red for Crisis)
+- Show drawdown as a shaded area below zero
+- Add a hover tooltip showing date, value in ₹, return %, and regime
+
+For candlestick/OHLC views of individual holdings, fetch Yahoo Finance
+directly in the frontend (the backend does not return OHLC data).
 
 ### chart_kind values and how to render each
 

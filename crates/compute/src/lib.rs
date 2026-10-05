@@ -11,6 +11,7 @@ pub mod model;
 pub mod performance;
 pub mod policy;
 pub mod portfolio;
+pub mod portfolio_history;
 pub mod regime;
 pub mod reverse_stress;
 pub mod scenarios;

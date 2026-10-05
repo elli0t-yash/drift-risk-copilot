@@ -623,6 +623,7 @@ pub fn run_factor_shock(
         parent_trace_ids: Vec::new(),
         baseline_model_params: None,
         policy_result: None,
+        portfolio_history: None,
     };
 
     Ok((output, trace))
@@ -865,6 +866,7 @@ pub fn run_risk_decomposition(
         parent_trace_ids: Vec::new(),
         baseline_model_params: None,
         policy_result: None,
+        portfolio_history: None,
     };
 
     Ok((output, trace))
