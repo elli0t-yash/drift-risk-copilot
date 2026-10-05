@@ -26,8 +26,10 @@ const STATIC_MAPPINGS: &[(&str, &str)] = &[
     // Yahoo accepts this hyphenated form directly -- do NOT de-hyphenate.
     ("BAJAJ-AUTO", "BAJAJ-AUTO.NS"),
     ("HDFCAMC", "HDFCAMC.NS"),
-    ("RATNAVEER", "RATNAVEERP.NS"),
-    ("RATNAVEERP", "RATNAVEERP.NS"),
+    // Yahoo's symbol is RATNAVEER.NS (RATNAVEERP.NS 404s -- checked live);
+    // the "P" spelling is a common mistaken variant, so map it too.
+    ("RATNAVEER", "RATNAVEER.NS"),
+    ("RATNAVEERP", "RATNAVEER.NS"),
     // Hyphenated symbols Yahoo only knows in hyphenated form (the generic
     // de-hyphenation step would otherwise break them).
     ("MCDOWELL-N", "MCDOWELL-N.NS"),
@@ -160,8 +162,9 @@ mod tests {
     #[test]
     fn added_mappings_resolve() {
         for (raw, want) in [
-            ("RATNAVEER", "RATNAVEERP.NS"),
-            ("RATNAVEERP", "RATNAVEERP.NS"),
+            ("RATNAVEER", "RATNAVEER.NS"),
+            ("RATNAVEER.NS", "RATNAVEER.NS"),
+            ("RATNAVEERP", "RATNAVEER.NS"),
             ("MCDOWELL-N", "MCDOWELL-N.NS"),
             ("TATAMTRDVR", "TATAMTRDVR.NS"),
             ("HDFCLIFE", "HDFCLIFE.NS"),

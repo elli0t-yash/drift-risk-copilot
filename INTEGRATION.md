@@ -510,6 +510,61 @@ For Recharts:
 
 ---
 
+## ISIN support
+
+Brokers that export ISINs (Kotak Securities, HDFC Securities, ICICI Direct)
+are supported. `POST /portfolio/upload` resolves each ISIN to an NSE (or,
+failing that, BSE `.BO`) symbol via Yahoo Finance and never returns
+`isin_not_supported` any more. Common large caps are answered from a
+built-in cache without a network call.
+
+Upload response fields added:
+
+  isins_resolved          { "INE002A01018": "RELIANCE.NS", ... }
+  isins_skipped           [ { isin, reason, category } ]   // [] if none
+  weights_renormalized    true if skipped holdings forced a rescale
+  original_holding_count  holdings in the file
+  retained_holding_count  holdings in portfolio.holdings
+  row_count               same as original_holding_count
+
+`portfolio` contains only the retained holdings: weights sum to 1 over
+them, and for value-based files total_value_inr is the retained value.
+
+## ISIN resolution warnings
+
+After a successful upload, check response.isins_skipped.
+
+If isins_skipped.length > 0, show a yellow warning banner above the
+portfolio:
+  "X holding(s) were skipped:
+   • [reason for each]
+   Weights have been adjusted accordingly."
+
+Categories and icons:
+  delisted   → ⚠ yellow
+  non_equity → ℹ blue     (mutual funds, bonds/debentures, SGBs)
+  sme        → ⚠ yellow
+  not_found  → ⚠ yellow
+  timeout    → 🔄 grey (show retry button)
+
+When nothing usable remains, the upload fails instead of succeeding:
+  422 insufficient_holdings   fewer than 2 holdings could be analysed.
+                              error.error lists every reason, and
+                              isins_skipped is included in the body —
+                              show it as a red error: "None of your
+                              holdings could be resolved. Please check
+                              your export format."
+  503 data_unavailable        the lookups themselves failed (Yahoo
+                              timed out / rate-limited). Show a retry
+                              button; the file is not at fault.
+
+Notes:
+- A symbol may end in `.BO` (BSE) when Yahoo lists the stock only there.
+- ETFs resolve like stocks. Mutual funds, bonds and gold bonds are skipped
+  with category non_equity.
+- `delisted` is reserved: Yahoo gives no delisting signal, so an unknown
+  ISIN is reported as not_found ("recently listed or non-standard").
+
 ## Error handling for users
 
 Every error response is JSON: `{ "error": "...", "code": "..." }`. Show
@@ -527,8 +582,8 @@ ai_unavailable (503):
   Show: "AI service is busy. Please try again in a moment."
   Add a retry button.
 
-isin_not_supported (400, on upload):
-  Show the error.error field directly — it explains exactly what to do.
+isin_not_supported: no longer returned (ISINs are resolved automatically;
+  see "ISIN support").
 
 unresolved_ticker (422, on ask/experiment):
   Show the error.error field directly — it names the ticker and explains

@@ -21,12 +21,13 @@
 use std::collections::BTreeMap;
 use std::io::Cursor;
 
-use axum::extract::Multipart;
+use axum::extract::{Multipart, State};
 use calamine::{open_workbook_from_rs, Data, DataType, Reader, Xlsx};
 use compute::experiments::{Holding, Portfolio};
 use serde::Serialize;
 
 use crate::error::ApiError;
+use crate::routes::AppState;
 use crate::validate::validate_portfolio;
 
 /// Weight-based CSV/XLSX uploads carry no portfolio value at all (only
@@ -56,6 +57,7 @@ const TICKER_ALIASES: &[&str] = &[
     "scrip",
     "script",
     "isin",
+    "isin code",
     "stock name",
     "company name",
     "name",
@@ -177,6 +179,20 @@ pub struct UploadResponse {
     /// Holdings dropped because their computed weight was 0.0 or below
     /// 1e-6 after normalisation -- not returned in `portfolio.holdings`.
     pub skipped_zero_weight: usize,
+    /// `ISIN -> resolved symbol` for every ISIN in the file that was
+    /// converted to an NSE/BSE symbol; empty for a symbol-based file.
+    pub isins_resolved: BTreeMap<String, String>,
+    /// Holdings left out of `portfolio`, each with a user-facing reason and
+    /// a category (`delisted`/`non_equity`/`sme`/`not_found`/`timeout`).
+    pub isins_skipped: Vec<compute::isin::IsinSkipReason>,
+    /// True when skipped holdings forced the remaining weights to be
+    /// rescaled to sum to 1 (and, for value-based files, the total value
+    /// to shrink to the retained holdings' value).
+    pub weights_renormalized: bool,
+    /// Holdings in the file (after dropping zero-weight rows), before any
+    /// ISIN was skipped.
+    pub original_holding_count: usize,
+    pub retained_holding_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -199,7 +215,10 @@ struct ColumnMap {
     layout: Layout,
 }
 
-pub async fn post_portfolio_upload(mut multipart: Multipart) -> Result<axum::Json<UploadResponse>, ApiError> {
+pub async fn post_portfolio_upload(
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> Result<axum::Json<UploadResponse>, ApiError> {
     let mut filename: Option<String> = None;
     let mut bytes: Option<Vec<u8>> = None;
 
@@ -263,19 +282,59 @@ pub async fn post_portfolio_upload(mut multipart: Multipart) -> Result<axum::Jso
     let holdings: Vec<Holding> = holdings.into_iter().filter(|h| h.weight.abs() > 1e-6).collect();
     let skipped_zero_weight = holdings_before - holdings.len();
 
-    // A file keyed by ISIN instead of NSE symbol can't be priced: no ISIN
-    // resolves on Yahoo Finance, and `normalise_ticker` can't map one to a
-    // symbol. Reject it up front with instructions rather than let the
-    // first analysis fail on a market-data fetch.
-    let isin_count = holdings.iter().filter(|h| is_isin(&h.ticker)).count();
-    if isin_count * 2 > holdings.len() {
-        return Err(ApiError::bad_request(
-            "isin_not_supported",
-            "Your file contains ISIN codes instead of NSE ticker symbols. Please export your \
-             holdings by symbol (e.g. RELIANCE.NS) rather than ISIN. Most brokers offer both \
-             options.",
-        ));
-    }
+    let original_holding_count = holdings.len();
+    let mut total_value_inr = total_value_inr;
+    let mut isins_resolved = BTreeMap::new();
+    let mut isins_skipped = Vec::new();
+    let mut weights_renormalized = false;
+
+    let isin_holdings: Vec<(String, f64)> = holdings
+        .iter()
+        .filter(|h| is_isin(&h.ticker))
+        .map(|h| (h.ticker.clone(), h.weight * total_value_inr))
+        .collect();
+    let holdings = if isin_holdings.is_empty() {
+        holdings
+    } else {
+        let batch = compute::isin::resolve_isins_batch_with(&state.isin_config, &isin_holdings, &state.isin_client).await;
+        isins_resolved = batch.resolved.iter().map(|(i, s, _)| (i.clone(), s.clone())).collect();
+        isins_skipped = batch.skipped;
+
+        let kept = apply_isin_resolution(holdings, &isins_resolved);
+        let kept_fraction: f64 = kept.iter().map(|h| h.weight).sum();
+        if kept.len() < 2 {
+            // Nothing (or one holding) usable. If the cause was transient
+            // lookups failing, say "try again" instead of blaming the file.
+            if isins_skipped.iter().any(|s| s.category == "timeout") {
+                return Err(ApiError::new(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "data_unavailable",
+                    crate::error::MSG_DATA_UNAVAILABLE,
+                ));
+            }
+            let reasons: Vec<String> = isins_skipped.iter().map(|s| s.reason.clone()).collect();
+            return Err(ApiError {
+                status: axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                code: "insufficient_holdings",
+                message: format!(
+                    "Fewer than 2 of your holdings could be analysed after resolving ISINs ({} of {} kept). {}",
+                    kept.len(),
+                    original_holding_count,
+                    reasons.join(" ")
+                ),
+                extra: Some(serde_json::json!({ "isins_skipped": isins_skipped })),
+            });
+        }
+        if !isins_skipped.is_empty() {
+            weights_renormalized = true;
+            // A value-based file's total is the sum of its holdings' values,
+            // so it shrinks with them; a weight-based file's is a placeholder.
+            if matches!(columns.layout, Layout::Value) {
+                total_value_inr *= kept_fraction;
+            }
+        }
+        renormalize(kept)
+    };
 
     if holdings.len() < 2 {
         return Err(ApiError::new(
@@ -285,7 +344,7 @@ pub async fn post_portfolio_upload(mut multipart: Multipart) -> Result<axum::Jso
         ));
     }
 
-    let row_count = holdings.len();
+    let retained_holding_count = holdings.len();
     let round2 = |x: f64| (x * 100.0).round() / 100.0;
     let portfolio = Portfolio { holdings, total_value_inr: round2(total_value_inr) };
     validate_portfolio(&portfolio)?;
@@ -297,9 +356,47 @@ pub async fn post_portfolio_upload(mut multipart: Multipart) -> Result<axum::Jso
             Layout::Value => "value",
         },
         tickers_normalised,
-        row_count,
+        row_count: original_holding_count,
         skipped_zero_weight,
+        isins_resolved,
+        isins_skipped,
+        weights_renormalized,
+        original_holding_count,
+        retained_holding_count,
     }))
+}
+
+/// Replaces each ISIN holding with its resolved symbol and drops the ones
+/// with none; if two rows end up on the same symbol their weights are
+/// merged. Other holdings pass through untouched, in order.
+fn apply_isin_resolution(holdings: Vec<Holding>, resolved: &BTreeMap<String, String>) -> Vec<Holding> {
+    let mut out: Vec<Holding> = Vec::with_capacity(holdings.len());
+    for h in holdings {
+        let ticker = if is_isin(&h.ticker) {
+            match resolved.get(&h.ticker) {
+                Some(symbol) => symbol.clone(),
+                None => continue,
+            }
+        } else {
+            h.ticker
+        };
+        match out.iter_mut().find(|e| e.ticker == ticker) {
+            Some(existing) => existing.weight += h.weight,
+            None => out.push(Holding { ticker, weight: h.weight }),
+        }
+    }
+    out
+}
+
+/// Rescales weights to sum to exactly 1 over the holdings kept.
+fn renormalize(mut holdings: Vec<Holding>) -> Vec<Holding> {
+    let sum: f64 = holdings.iter().map(|h| h.weight).sum();
+    if sum > 0.0 {
+        for h in &mut holdings {
+            h.weight /= sum;
+        }
+    }
+    holdings
 }
 
 /// Case-insensitive header lookup: `field()` on a `Record` (whose keys are
@@ -591,5 +688,40 @@ fn cell_to_string(cell: &Data) -> String {
         }
         Data::Int(i) => i.to_string(),
         _ => cell.as_string().unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod isin_unit_tests {
+    use super::*;
+
+    fn h(t: &str, w: f64) -> Holding {
+        Holding { ticker: t.to_string(), weight: w }
+    }
+
+    #[test]
+    fn skipping_holdings_renormalizes_weights_to_one() {
+        let resolved = BTreeMap::from([("INE002A01018".to_string(), "RELIANCE.NS".to_string())]);
+        let kept = apply_isin_resolution(
+            vec![h("INE002A01018", 0.3), h("TCS.NS", 0.2), h("INE999X99999", 0.4), h("INFY.NS", 0.1)],
+            &resolved,
+        );
+        let tickers: Vec<&str> = kept.iter().map(|x| x.ticker.as_str()).collect();
+        assert_eq!(tickers, vec!["RELIANCE.NS", "TCS.NS", "INFY.NS"]);
+        let kept = renormalize(kept);
+        let sum: f64 = kept.iter().map(|x| x.weight).sum();
+        assert!((sum - 1.0).abs() < 1e-6, "{sum}");
+        assert!((kept[0].weight - 0.5).abs() < 1e-12); // 0.3 / 0.6
+    }
+
+    #[test]
+    fn two_isins_resolving_to_one_symbol_merge_their_weights() {
+        let resolved = BTreeMap::from([
+            ("INE000000001".to_string(), "AAA.NS".to_string()),
+            ("INE000000002".to_string(), "AAA.NS".to_string()),
+        ]);
+        let kept = apply_isin_resolution(vec![h("INE000000001", 0.25), h("INE000000002", 0.25), h("TCS.NS", 0.5)], &resolved);
+        assert_eq!(kept.len(), 2);
+        assert!((kept[0].weight - 0.5).abs() < 1e-12);
     }
 }
