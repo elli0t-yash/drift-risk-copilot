@@ -2228,7 +2228,7 @@ async fn kotak_style_isin_upload_resolves_skips_and_renormalizes() {
     assert_eq!(skipped.len(), 2);
     assert_eq!(skipped[0]["isin"], "INF000000012");
     assert_eq!(skipped[0]["category"], "non_equity");
-    assert!(skipped[0]["reason"].as_str().unwrap().starts_with("Mutual funds cannot be analysed"));
+    assert!(skipped[0]["reason"].as_str().unwrap().starts_with("Mutual fund units cannot be analysed"));
     assert_eq!(skipped[1]["isin"], "INE999X99999");
     assert_eq!(skipped[1]["category"], "not_found");
 

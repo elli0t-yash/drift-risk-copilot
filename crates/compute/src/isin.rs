@@ -228,6 +228,9 @@ fn classify_by_isin_structure(isin: &str) -> Option<IsinResolutionResult> {
     if b.len() != 12 {
         return None;
     }
+    if isin.starts_with("INF") {
+        return Some(IsinResolutionResult::NonEquity("Mutual fund".to_string()));
+    }
     if isin.starts_with("INE") && &isin[7..9] == "07" {
         return Some(IsinResolutionResult::NonEquity("Bond/Debenture".to_string()));
     }
@@ -293,7 +296,9 @@ pub fn skip_reason(isin: &str, result: &IsinResolutionResult) -> Option<IsinSkip
         ),
         IsinResolutionResult::NonEquity(kind) if kind == "Mutual fund" => (
             "non_equity",
-            format!("Mutual funds cannot be analysed with equity risk models. Skipped: {isin}. Use only equity stock holdings."),
+            "Mutual fund units cannot be analysed with equity risk models. Remove this from your portfolio or \
+             replace it with the underlying equity ETF equivalent."
+                .to_string(),
         ),
         IsinResolutionResult::NonEquity(kind) if kind.starts_with("Bond") => (
             "non_equity",
@@ -498,6 +503,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_inf_isin_that_yahoo_lists_as_an_etf_still_resolves() {
+        let (url, _) = stub(|_, _| reply(200, quotes_body(&[("METALIETF.NS", "NSI", "EQUITY")])));
+        assert_eq!(resolve(url, "INF109KC19W1").await, IsinResolutionResult::Resolved("METALIETF.NS".into()));
+    }
+
+    #[tokio::test]
     async fn bond_fund_and_currency_quotes_are_non_equity() {
         for (kind, label) in [("BOND", "Bond/Debenture"), ("MUTUALFUND", "Mutual fund"), ("CURRENCY", "Currency/SGB")] {
             let (url, _) = stub(move |_, _| reply(200, quotes_body(&[("X123", "NMS", kind)])));
@@ -577,9 +588,9 @@ mod tests {
         // INE + type digits "07" = debenture; IN0 prefix = government security.
         assert_eq!(resolve(url.clone(), "INE342T07379").await, IsinResolutionResult::NonEquity("Bond/Debenture".into()));
         assert_eq!(resolve(url.clone(), "IN0020220011").await, IsinResolutionResult::NonEquity("Currency/SGB".into()));
-        // An unknown equity or fund stays NotFound (an INF code may be an ETF Yahoo lacks).
+        // An unknown equity stays NotFound; an unmatched INF code is a mutual fund.
         assert!(matches!(resolve(url.clone(), "INE2WKE01011").await, IsinResolutionResult::NotFound(_)));
-        assert!(matches!(resolve(url, "INF179KC1DI2").await, IsinResolutionResult::NotFound(_)));
+        assert_eq!(resolve(url, "INF179KC1DI2").await, IsinResolutionResult::NonEquity("Mutual fund".into()));
     }
 
     #[tokio::test]
@@ -631,7 +642,8 @@ mod tests {
         let msg = |r: IsinResolutionResult| skip_reason("INE1", &r).unwrap();
         assert_eq!(
             msg(IsinResolutionResult::NonEquity("Mutual fund".into())).reason,
-            "Mutual funds cannot be analysed with equity risk models. Skipped: INE1. Use only equity stock holdings."
+            "Mutual fund units cannot be analysed with equity risk models. Remove this from your portfolio or \
+             replace it with the underlying equity ETF equivalent."
         );
         assert_eq!(
             msg(IsinResolutionResult::NonEquity("Bond/Debenture".into())).reason,

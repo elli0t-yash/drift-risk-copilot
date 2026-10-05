@@ -536,7 +536,8 @@ After a successful upload, check response.isins_skipped.
 
 If isins_skipped.length > 0, show a yellow warning banner above the
 portfolio:
-  "X holding(s) were skipped:
+  "1 holding was skipped:" (when exactly one) or
+  "X holdings were skipped:" (when more than one)
    • [reason for each]
    Weights have been adjusted accordingly."
 
