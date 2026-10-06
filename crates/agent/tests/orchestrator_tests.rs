@@ -104,10 +104,10 @@ async fn an_off_topic_message_declines_instead_of_running_a_fallback_experiment(
     let err = plan_tools(&client, "What is the weather in Mumbai?", &[]).await.unwrap_err();
 
     match err {
-        agent::orchestrator::OrchestratorError::Unrecognised(text) => {
+        agent::orchestrator::OrchestratorError::Declined(text) => {
             assert_eq!(text, "I can only help with questions about your portfolio's risk and performance.");
         }
-        other => panic!("expected Unrecognised, got {other:?}"),
+        other => panic!("expected Declined, got {other:?}"),
     }
 }
 
@@ -126,12 +126,11 @@ fn planning_prompt_maps_commodity_questions_to_factor_shocks() {
 }
 
 #[test]
-fn planning_prompt_analyses_stock_questions_and_declines_only_unrelated_topics() {
+fn planning_prompt_analyses_held_stock_questions_and_scopes_what_it_declines() {
     use agent::orchestrator::PLANNING_SYSTEM_PROMPT as P;
-    assert!(P.contains("'Ratnaveer Precision') -> portfolio_performance"));
-    assert!(P.contains("Never refuse stock questions"));
-    assert!(P.contains("Decline ONLY for: weather, sports scores, cooking, entertainment"));
-    assert!(P.contains("Never decline when a finance connection exists"));
+    assert!(P.contains("select portfolio_performance AND include"));
+    assert!(P.contains("'focus_holding'"));
+    assert!(P.contains("Never decline a question about portfolio risk, returns, macro factors or a named historical event"));
 }
 
 #[tokio::test]

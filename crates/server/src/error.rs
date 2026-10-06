@@ -122,6 +122,14 @@ impl From<BackendError> for ApiError {
                 message,
                 extra: None,
             },
+            // `/ask` intercepts `Redirect` and answers 200 itself; this arm
+            // only exists for any other route that might surface one.
+            BackendError::Redirect(message) => ApiError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "unrecognised_request",
+                message,
+                extra: None,
+            },
             BackendError::UnresolvedTicker(message) => ApiError {
                 status: StatusCode::UNPROCESSABLE_ENTITY,
                 code: "unresolved_ticker",

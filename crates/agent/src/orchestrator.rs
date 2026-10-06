@@ -93,6 +93,23 @@ This must be the only entry in the array when used. Only use this for questions 
 unrelated to finance, investing, markets, or portfolio risk. Never use this for scenario \
 questions, historical market events, or hypothetical market moves.
 
+ROUTING RULE 0 -- Stock vs Macro distinction (applies before every other rule):
+- Macro factors (route to factor_shock): Market/Nifty/index, crude oil/Brent/petrol, rupee/INR/\
+dollar/currency, gold, interest rates/RBI/repo rate, inflation, bond yields.
+- Individual stocks (NEVER route to factor_shock or historical_stress): any company name, brand \
+name, or NSE/BSE ticker symbol that is not a macro factor. Examples: Ratnaveer, NSIL, TCS, \
+Reliance, Zydus, Infosys, HDFC, any stock ticker.
+- If the user asks 'what if [STOCK] goes up/down by X%' where STOCK is an individual company, use \
+decline with this exact reason (substituting the company name for [STOCK]): 'I cannot model \
+individual stock price movements -- the system analyses macro factor risks, not individual stock \
+forecasts. What I can do instead: 1. Show how [STOCK] has historically performed in your \
+portfolio. 2. Show what a broader market drop would do to your entire portfolio. 3. Identify \
+which macro factors affect your portfolio most. Which would be most useful?'
+- NEVER use historical_stress unless the CURRENT user message explicitly names a historical event \
+(COVID, IL&FS, taper tantrum, 2008 crisis). Do not infer a historical scenario from earlier \
+conversation turns: a question about crude oil after an IL&FS question is a factor_shock, not \
+historical_stress.
+
 Rules for tool selection:
 
 - General risk questions ('what is my risk', 'analyse my portfolio', 'how am I positioned') -> \
@@ -106,29 +123,49 @@ first if risk_drift is selected)
   'gold' rising -> factor_shock GOLD_USD: +10.0
   'gold' falling -> factor_shock GOLD_USD: -10.0
   'interest rates', 'RBI hike', 'repo rate' rising -> factor_shock RATES_PROXY: +5.0
-  'market crash', 'Nifty falls', 'bear market' -> factor_shock MARKET: -20.0
-- Questions about specific market events or scenarios ('what if', 'what would happen if', 'what \
-would X have done', 'impact of', 'effect of') -> factor_shock or historical_stress. These are \
-ALWAYS portfolio risk questions.
-- Named historical events:
+  'market crash', 'Nifty falls', 'bear market' -> factor_shock MARKET: -20.0 (use the user's own \
+percentage when they give one, e.g. 'Nifty falls 15%' -> MARKET: -15.0)
+- Questions about market-wide events or scenarios ('what if', 'what would happen if', 'what would \
+X have done', 'impact of', 'effect of') where the subject is a macro factor or a named historical \
+event -> factor_shock or historical_stress. These are ALWAYS portfolio risk questions.
+- Named historical events (only when the current message names them):
   'COVID', 'covid crash', 'March 2020' -> historical_stress covid_crash
   'IL&FS', 'ILFS', 'NBFC crisis' -> historical_stress ilfs_contagion
   'taper tantrum', 'taper', '2013 crisis' -> historical_stress taper_tantrum_2013
+  '2008 crisis' (no preset exists) -> factor_shock MARKET: -20.0
 - Questions about tail risk, worst case, loss limit, wipe out, drawdown limit -> reverse_stress
 - Questions about rebalancing, optimising, reducing risk, fixing the portfolio -> cvar_rebalance
 - Questions about policy limits, risk limits, compliance, within limits -> policy_check
 - Questions about portfolio performance, returns, how did I do, profit/loss, best/worst stock, \
 which stock is dragging -> portfolio_performance
-- Questions about a specific stock ('how is X doing', 'should I sell X', 'what about RELIANCE', \
-'Ratnaveer Precision') -> portfolio_performance. Focus the narration on that stock's contribution \
-and historical return, and end with: 'Note: this is historical risk analysis, not investment \
-advice.' Never refuse stock questions -- analyse them.
+- When the user asks about a specific stock in their portfolio ('how is X doing', 'what about X', \
+'tell me about X in my portfolio', 'should I sell X'): select portfolio_performance AND include \
+{'focus_holding': '[TICKER]'} in its params. Extract the company name or ticker from the user \
+message and give it as an NSE symbol (add .NS if missing). Examples: 'Zydus Wellness' -> \
+'ZYDUSWELL.NS', 'Ratnaveer' -> 'RATNAVEER.NS', 'NSIL' -> 'NSIL.NS'. The focus_holding tells the \
+narration step to answer specifically about that stock. End the narration with: 'Note: this is \
+historical risk analysis, not investment advice.'
 - If the user asks a follow-up that references a prior result ('now reduce it', 'what about a \
 bigger crash'), infer the experiment from context -- do not ask for clarification.
-- Decline ONLY for: weather, sports scores, cooking, entertainment, anything with zero connection \
-to finance or investing.
-- When uncertain between two tools, pick the one that gives more information. Never decline when a \
-finance connection exists, however indirect.
+
+SCOPE BOUNDARIES. In scope (run a tool): portfolio risk, volatility, factor exposure; macro shock \
+impact; historical scenario impact; CVaR rebalancing; policy checks; portfolio performance and \
+returns; a specific holding's performance (portfolio_performance + focus_holding).
+Out of scope (use decline; its reason is shown to the user, so write exactly the message below, \
+substituting the company name for X):
+- Valuation ('Is X overvalued?', 'What is the P/E of X?', 'Is X a good buy?'): 'I analyse \
+portfolio risk using price data, not fundamental valuation. For P/E ratios and valuation, check \
+Screener.in or Tickertape.'
+- Stock price predictions ('Will X reach Y?', 'Where will X be in 6 months?'): 'I cannot forecast \
+stock prices. I can show you how X has contributed to your portfolio risk historically, or what a \
+broader market move would do to you.'
+- Individual stock price impact ('What if X goes up/down by Y%?'): the ROUTING RULE 0 message.
+- News and current events ('Why did X fall today?', 'What happened to X?'): 'I don't have \
+real-time news. I can show you X's historical return in your portfolio or run a stress test.'
+- Anything with no connection to finance or investing (weather, sports, cooking, entertainment): \
+'I can only help with portfolio risk analysis.'
+- When uncertain between two tools, pick the one that gives more information. Never decline a \
+question about portfolio risk, returns, macro factors or a named historical event.
 
 Respond with ONLY a JSON array, no prose, no markdown code fences: \
 [{\"tool\": <tool name>, \"params\": <object>, \"reason\": <one short sentence>}, ...]. \
@@ -153,6 +190,13 @@ pub enum OrchestratorError {
     /// see `server::backend`'s `From` impl).
     #[error("{0}")]
     Unrecognised(String),
+    /// The planner chose `decline`: the message is out of scope (an
+    /// individual-stock price question, valuation, prediction, news, or
+    /// non-finance). The payload is the redirect text to show the user. Not
+    /// an error from the caller's point of view -- `server` returns it as a
+    /// 200 with `is_redirect: true`.
+    #[error("{0}")]
+    Declined(String),
 }
 
 /// Runs the planning call and parses its response into `Vec<ToolPlan>`,
@@ -160,7 +204,7 @@ pub enum OrchestratorError {
 /// response either way) if the response isn't valid JSON, isn't an array,
 /// or is empty. Returns `(plans, raw_response_text)` -- except when the
 /// plan is a single `decline` entry (see `PLANNING_SYSTEM_PROMPT`), which
-/// returns `Err(OrchestratorError::Unrecognised)` instead: an off-topic
+/// returns `Err(OrchestratorError::Declined)` instead: an off-topic
 /// message runs no tool at all, rather than falling back to one.
 pub async fn plan_tools<C: GeminiClient>(
     client: &C,
@@ -190,7 +234,7 @@ pub async fn plan_tools<C: GeminiClient>(
     let plans = parse_plan_response(&raw);
     match plans {
         Some(plans) if plans.len() == 1 && plans[0].tool == "decline" => {
-            Err(OrchestratorError::Unrecognised(plans[0].reason.clone()))
+            Err(OrchestratorError::Declined(plans[0].reason.clone()))
         }
         Some(plans) if !plans.is_empty() => Ok((plans, raw)),
         _ => Ok((
@@ -215,6 +259,57 @@ fn parse_plan_response(raw: &str) -> Option<Vec<ToolPlan>> {
         .unwrap_or(trimmed);
     let trimmed = trimmed.strip_suffix("```").unwrap_or(trimmed).trim();
     serde_json::from_str::<Vec<ToolPlan>>(trimmed).ok()
+}
+
+/// Maps the planner's `focus_holding` guess (a company name or symbol the
+/// model extracted from the user's message, e.g. `RATNAVEERP.NS`) onto an
+/// actual holding of `portfolio`: exact symbol match first, then a prefix
+/// match in either direction on the bare symbol (at least 4 characters, so
+/// `RATNAVEERP` still finds `RATNAVEER.NS`). `None` if nothing matches --
+/// the caller then drops the focus rather than narrate about a stock the
+/// user doesn't hold.
+pub fn resolve_focus_holding(raw: &str, portfolio: &Portfolio) -> Option<String> {
+    let bare = |t: &str| -> String {
+        let up = t.trim().to_uppercase();
+        up.strip_suffix(".NS").or_else(|| up.strip_suffix(".BO")).unwrap_or(&up).to_string()
+    };
+    let want = bare(raw);
+    if want.is_empty() {
+        return None;
+    }
+    let held: Vec<(&String, String)> = portfolio.holdings.iter().map(|h| (&h.ticker, bare(&h.ticker))).collect();
+    if let Some((t, _)) = held.iter().find(|(_, b)| *b == want) {
+        return Some((*t).clone());
+    }
+    let prefix = |a: &str, b: &str| a.len() >= 4 && b.starts_with(a);
+    let mut near = held.iter().filter(|(_, b)| prefix(&want, b) || prefix(b, &want));
+    match (near.next(), near.next()) {
+        (Some((t, _)), None) => Some((*t).clone()),
+        _ => None,
+    }
+}
+
+/// The first plan's `focus_holding` (if any), resolved against `portfolio`
+/// and written back into that plan's params (or removed when it matches no
+/// holding). Returns the resolved ticker.
+pub fn apply_focus_holding(plans: &mut [ToolPlan], portfolio: &Portfolio) -> Option<String> {
+    let mut resolved = None;
+    for plan in plans.iter_mut() {
+        let Some(raw) = plan.params.get("focus_holding").and_then(Value::as_str).map(str::to_string) else {
+            continue;
+        };
+        let found = resolve_focus_holding(&raw, portfolio);
+        if let Value::Object(map) = &mut plan.params {
+            match &found {
+                Some(t) => map.insert("focus_holding".to_string(), Value::String(t.clone())),
+                None => map.remove("focus_holding"),
+            };
+        }
+        if resolved.is_none() {
+            resolved = found;
+        }
+    }
+    resolved
 }
 
 fn inject_portfolio(params: &Value, portfolio: &Portfolio) -> Value {

@@ -13,7 +13,8 @@ use crate::execution_trace::{AgentExecutionTrace, GroundingStatus};
 use crate::gemini::GeminiClient;
 use crate::grounding::GroundedNarration;
 use crate::narrate::NarrateError;
-use crate::orchestrator::{plan_tools, run_tool_plans, ToolPlan};
+use crate::narrate::NarrationOptions;
+use crate::orchestrator::{apply_focus_holding, plan_tools, run_tool_plans, ToolPlan};
 use crate::suggest::suggest_follow_up;
 
 #[derive(Debug, Error)]
@@ -77,8 +78,11 @@ pub async fn run<C: GeminiClient>(
     let total_started = std::time::Instant::now();
     let mut gemini_calls: u32 = 0;
 
-    let (tool_plans, planning_response_raw) =
+    let (mut tool_plans, planning_response_raw) =
         plan_tools(client, user_message, conversation_history).await?;
+    // The planner's guess at which holding the user means (if any), pinned
+    // to a real holding or dropped.
+    let focus_holding = apply_focus_holding(&mut tool_plans, &portfolio);
     gemini_calls += 1;
 
     let portfolio_for_tools = portfolio.clone();
@@ -95,8 +99,14 @@ pub async fn run<C: GeminiClient>(
     }
 
     let summary = traces.iter().map(experiment_summary).collect::<Vec<_>>().join(" ");
+    let narration_options = NarrationOptions { focus_holding };
     let (narration_result, suggestion_result) = tokio::join!(
-        crate::grounding::grounded_narrate_many(client, &traces, conversation_history),
+        crate::grounding::grounded_narrate_many_with(
+            client,
+            &traces,
+            conversation_history,
+            &narration_options,
+        ),
         suggest_follow_up(client, &summary),
     );
     let (narration, narration_retries) = narration_result?;
@@ -109,6 +119,8 @@ pub async fn run<C: GeminiClient>(
         passed: narration.grounding_warnings.is_empty(),
         warnings: narration.grounding_warnings.clone(),
         retry_count: narration_retries,
+        directional_checks: narration.directional_checks.clone(),
+        directional_warnings: narration.directional_warnings.clone(),
     };
     let execution_trace = AgentExecutionTrace {
         id: compute::trace::new_trace_id(),

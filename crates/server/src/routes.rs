@@ -209,8 +209,10 @@ pub struct AskRequest {
 
 #[derive(Serialize)]
 pub struct AskResponse {
-    pub experiment: Experiment,
-    pub trace: EvidenceTrace,
+    /// `None` only when `is_redirect` is true (no experiment ran).
+    pub experiment: Option<Experiment>,
+    /// `None` only when `is_redirect` is true.
+    pub trace: Option<EvidenceTrace>,
     pub narration: String,
     pub grounding_warnings: Vec<String>,
     /// This turn's narration as an `assistant` turn, ready for the caller
@@ -220,18 +222,51 @@ pub struct AskResponse {
     pub suggestion: String,
     /// Stored under this id in the persistent `SnapshotStore`;
     /// `GET /report/{result_id}` renders it as a PDF.
-    pub result_id: String,
+    /// `None` only when `is_redirect` is true (nothing was stored).
+    pub result_id: Option<String>,
     /// A record of the orchestration itself (the planning call, each
     /// tool's execution, the combined narration/grounding outcome) --
     /// distinct from `trace`, which records the *experiment's* evidence.
     /// Also independently retrievable via
     /// `GET /execution-trace/{agent_execution_trace.id}`.
-    pub agent_execution_trace: agent::AgentExecutionTrace,
+    /// `None` only when `is_redirect` is true.
+    pub agent_execution_trace: Option<agent::AgentExecutionTrace>,
     /// Chart-ready data derived from `trace`, for the frontend to render
     /// without re-deriving it from the raw trace itself. `None` if
     /// `trace.experiment` isn't one of the seven recognised types (see
     /// `visualization::build_visualization`).
     pub visualization: Option<crate::visualization::VisualizationData>,
+    /// True when the question was out of scope (an individual stock's
+    /// price scenario, valuation, a price forecast, news, or not finance)
+    /// and `narration` is a redirect explaining what the system can do
+    /// instead. No experiment ran: `experiment`, `trace`, `result_id`,
+    /// `agent_execution_trace` and `visualization` are all null. The HTTP
+    /// status is 200 -- render `narration` as a normal (soft) assistant
+    /// message, not an error.
+    pub is_redirect: bool,
+}
+
+/// The follow-up chip shown under a redirect (there's no experiment to
+/// derive one from).
+const REDIRECT_SUGGESTION: &str = "Which macro factors drive my portfolio's risk most?";
+const DEFAULT_REDIRECT: &str = "I can only help with portfolio risk analysis.";
+
+impl AskResponse {
+    fn redirect(message: String) -> Self {
+        let message = if message.trim().is_empty() { DEFAULT_REDIRECT.to_string() } else { message };
+        AskResponse {
+            experiment: None,
+            trace: None,
+            assistant_turn: agent::ConversationTurn::assistant(message.clone()),
+            narration: message,
+            grounding_warnings: Vec::new(),
+            suggestion: REDIRECT_SUGGESTION.to_string(),
+            result_id: None,
+            agent_execution_trace: None,
+            visualization: None,
+            is_redirect: true,
+        }
+    }
 }
 
 pub async fn post_ask(
@@ -249,10 +284,15 @@ pub async fn post_ask(
     };
 
     let portfolio = req.portfolio.clone();
-    let result = state
+    let result = match state
         .backend
         .run_ask(req.portfolio, req.message, req.conversation_history, req.policy)
-        .await?;
+        .await
+    {
+        Ok(result) => result,
+        Err(crate::backend::BackendError::Redirect(message)) => return Ok(Json(AskResponse::redirect(message))),
+        Err(other) => return Err(other.into()),
+    };
 
     let mut snapshot = snapshot_from_trace(&result.trace, &portfolio)?;
     snapshot.narration = Some(result.narration.narration.clone());
@@ -281,15 +321,16 @@ pub async fn post_ask(
     let visualization = crate::visualization::build_visualization(&result.trace);
 
     Ok(Json(AskResponse {
-        experiment: result.experiment,
-        trace: result.trace,
+        experiment: Some(result.experiment),
+        trace: Some(result.trace),
         narration: result.narration.narration,
         grounding_warnings: result.narration.grounding_warnings,
         assistant_turn: result.assistant_turn,
         suggestion: result.suggestion,
-        result_id,
-        agent_execution_trace: result.execution_trace,
+        result_id: Some(result_id),
+        agent_execution_trace: Some(result.execution_trace),
         visualization,
+        is_redirect: false,
     }))
 }
 

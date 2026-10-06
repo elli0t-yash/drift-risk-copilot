@@ -114,7 +114,7 @@ fn sample_execution_trace() -> agent::AgentExecutionTrace {
             error: None,
         }],
         narration: "Vol is 15.5% annualised.".to_string(),
-        grounding_status: agent::GroundingStatus { passed: true, warnings: vec![], retry_count: 0 },
+        grounding_status: agent::GroundingStatus { passed: true, warnings: vec![], retry_count: 0, ..Default::default() },
         suggestion: "What if I reduce my turnover to 20%?".to_string(),
         total_latency_ms: 10,
         gemini_calls: 3,
@@ -171,7 +171,8 @@ impl Backend for MockBackend {
                 narration: agent::grounding::GroundedNarration {
                     narration: r.narration.narration.clone(),
                     grounding_warnings: r.narration.grounding_warnings.clone(),
-                },
+            ..Default::default()
+        },
                 assistant_turn: r.assistant_turn.clone(),
                 suggestion: r.suggestion.clone(),
                 execution_trace: r.execution_trace.clone(),
@@ -444,6 +445,7 @@ async fn ask_with_mocked_pipeline_returns_grounding_warnings() {
             grounding_warnings: vec![
                 "unverified number '99%' at byte position 7 in the narration".to_string(),
             ],
+            ..Default::default()
         },
         assistant_turn: agent::ConversationTurn::assistant("Vol is 99% (unverified)."),
         suggestion: "What if I reduce my turnover to 20%?".to_string(),
@@ -498,6 +500,7 @@ async fn ask_with_non_empty_conversation_history_forwards_it_to_the_backend() {
         narration: agent::grounding::GroundedNarration {
             narration: "Vol is 15.5% annualised.".to_string(),
             grounding_warnings: vec![],
+            ..Default::default()
         },
         assistant_turn: agent::ConversationTurn::assistant("Vol is 15.5% annualised."),
         suggestion: "Now reduce my tail risk with 20% turnover?".to_string(),
@@ -567,6 +570,7 @@ async fn report_route_returns_pdf_for_a_result_stored_by_a_prior_ask() {
         narration: agent::grounding::GroundedNarration {
             narration: "Vol is 15.5% annualised.".to_string(),
             grounding_warnings: vec![],
+            ..Default::default()
         },
         assistant_turn: agent::ConversationTurn::assistant("Vol is 15.5% annualised."),
         suggestion: "Now reduce my tail risk?".to_string(),
@@ -687,6 +691,7 @@ async fn execution_trace_route_returns_the_trace_stored_by_a_prior_ask() {
         narration: agent::grounding::GroundedNarration {
             narration: "Vol is 15.5% annualised.".to_string(),
             grounding_warnings: vec![],
+            ..Default::default()
         },
         assistant_turn: agent::ConversationTurn::assistant("Vol is 15.5% annualised."),
         suggestion: "What if I reduce my turnover to 20%?".to_string(),
@@ -1996,6 +2001,7 @@ fn sample_pipeline_result() -> agent::pipeline::PipelineResult {
         narration: agent::grounding::GroundedNarration {
             narration: "Vol is 15.5% annualised.".to_string(),
             grounding_warnings: vec![],
+            ..Default::default()
         },
         assistant_turn: agent::ConversationTurn::assistant("Vol is 15.5% annualised."),
         suggestion: "Reduce turnover?".to_string(),
@@ -2372,4 +2378,91 @@ async fn framework_level_errors_still_return_json_bodies() {
         .await
         .unwrap();
     assert_error_body(r, StatusCode::NOT_FOUND, "result_not_found").await;
+}
+
+
+// ---------------------------------------------------------------------
+// is_redirect: out-of-scope questions answer 200, not 422
+// ---------------------------------------------------------------------
+
+/// A backend whose `/ask` is always declined by the planner.
+struct DecliningBackend(String);
+
+#[async_trait::async_trait]
+impl Backend for DecliningBackend {
+    async fn run_experiment(
+        &self,
+        _e: Experiment,
+        _p: Portfolio,
+        _policy: Option<compute::policy::RiskPolicy>,
+    ) -> Result<EvidenceTrace, BackendError> {
+        Err(BackendError::Internal("unused".to_string()))
+    }
+
+    async fn run_ask(
+        &self,
+        _p: Portfolio,
+        _m: String,
+        _h: Vec<agent::ConversationTurn>,
+        _policy: Option<compute::policy::RiskPolicy>,
+    ) -> Result<agent::pipeline::PipelineResult, BackendError> {
+        Err(BackendError::Redirect(self.0.clone()))
+    }
+}
+
+fn ask_request(app: axum::Router, message: &str) -> impl std::future::Future<Output = axum::response::Response> {
+    let body = serde_json::json!({"portfolio": sample_portfolio(), "message": message});
+    async move {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ask")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn a_declined_question_is_http_200_with_is_redirect_true_and_nulls_for_the_experiment_fields() {
+    let redirect = "I cannot model individual stock price movements. Which would be most useful?";
+    let app = build_router(AppState {
+        backend: Arc::new(DecliningBackend(redirect.to_string())),
+        store: Arc::new(store::SnapshotStore::open(":memory:").unwrap()),
+        upstox_config: unconfigured_upstox_config(),
+        upstox_client: Arc::new(MockUpstoxClient::unused()),
+        upstox_state_map: Arc::new(Mutex::new(HashMap::new())),
+        semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+        capacity: 8,
+        ask_queue_timeout: std::time::Duration::from_millis(200),
+        gemini_configured: true,
+        isin_client: reqwest::Client::new(),
+        isin_config: compute::isin::ResolverConfig::default(),
+    });
+    let response = ask_request(app, "What if Ratnaveer increases 10%?").await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["is_redirect"], true);
+    assert_eq!(body["narration"], redirect);
+    assert_eq!(body["assistant_turn"]["role"], "assistant");
+    assert_eq!(body["assistant_turn"]["content"], redirect);
+    assert!(body["suggestion"].as_str().is_some_and(|s| !s.is_empty()), "the chip is still offered");
+    assert_eq!(body["grounding_warnings"], serde_json::json!([]));
+    for null_field in ["experiment", "trace", "result_id", "agent_execution_trace", "visualization"] {
+        assert!(body[null_field].is_null(), "{null_field} should be null: {body}");
+    }
+}
+
+#[tokio::test]
+async fn a_normal_ask_has_is_redirect_false() {
+    let app = app_with_backend(MockBackend { ask_result: Some(sample_pipeline_result()), ..empty_mock() });
+    let response = ask_request(app, "risk?").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["is_redirect"], false);
+    assert!(body["trace"].is_object() && body["result_id"].is_string());
 }
