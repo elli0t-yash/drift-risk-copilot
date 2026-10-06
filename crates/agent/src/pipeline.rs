@@ -14,7 +14,7 @@ use crate::gemini::GeminiClient;
 use crate::grounding::GroundedNarration;
 use crate::narrate::NarrateError;
 use crate::narrate::NarrationOptions;
-use crate::orchestrator::{apply_focus_holding, plan_tools, run_tool_plans, ToolPlan};
+use crate::orchestrator::{apply_focus_holding, apply_realtime_caveat, plan_tools_for, run_tool_plans, ToolPlan};
 use crate::suggest::suggest_follow_up;
 
 #[derive(Debug, Error)]
@@ -79,10 +79,11 @@ pub async fn run<C: GeminiClient>(
     let mut gemini_calls: u32 = 0;
 
     let (mut tool_plans, planning_response_raw) =
-        plan_tools(client, user_message, conversation_history).await?;
+        plan_tools_for(client, user_message, conversation_history, Some(&portfolio)).await?;
     // The planner's guess at which holding the user means (if any), pinned
     // to a real holding or dropped.
     let focus_holding = apply_focus_holding(&mut tool_plans, &portfolio);
+    let realtime_caveat = apply_realtime_caveat(&mut tool_plans, user_message);
     gemini_calls += 1;
 
     let portfolio_for_tools = portfolio.clone();
@@ -99,7 +100,12 @@ pub async fn run<C: GeminiClient>(
     }
 
     let summary = traces.iter().map(experiment_summary).collect::<Vec<_>>().join(" ");
-    let narration_options = NarrationOptions { focus_holding };
+    let realtime_note = realtime_caveat.then(|| {
+        let as_of = traces[0].data_as_of.get(..10).unwrap_or(&traces[0].data_as_of);
+        format!("Note: I use historical daily data up to {as_of}. I don't have today's intraday prices.")
+    });
+    let narration_options =
+        NarrationOptions { focus_holding, user_question: Some(user_message.to_string()), realtime_note };
     let (narration_result, suggestion_result) = tokio::join!(
         crate::grounding::grounded_narrate_many_with(
             client,

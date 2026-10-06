@@ -182,7 +182,7 @@ async fn how_is_zydus_doing_plans_portfolio_performance_with_the_focus_holding_p
 async fn the_focus_holding_is_prepended_to_the_trace_sent_for_narration() {
     let client = MockGeminiClient::new(vec![text_response("Zyduswell is up.")]);
     let t = trace("PortfolioPerformance", serde_json::json!({"holding_returns": {}}));
-    let opts = NarrationOptions { focus_holding: Some("ZYDUSWELL.NS".to_string()) };
+    let opts = NarrationOptions { focus_holding: Some("ZYDUSWELL.NS".to_string()), ..Default::default() };
     narrate_tools_with_options(&client, &[t], None, &[], &opts).await.unwrap();
     let req = client.last_request();
     let payload = content_text(&req, req.contents.len() - 1);
@@ -194,7 +194,9 @@ async fn the_focus_holding_is_prepended_to_the_trace_sent_for_narration() {
     let client = MockGeminiClient::new(vec![text_response("ok")]);
     narrate_tools_with_options(&client, &[shock_trace()], None, &[], &NarrationOptions::default()).await.unwrap();
     let req = client.last_request();
-    assert!(content_text(&req, req.contents.len() - 1).starts_with('['));
+    let payload = content_text(&req, req.contents.len() - 1);
+    assert!(!payload.contains("SPECIFICALLY ABOUT"));
+    assert!(payload.contains("TRACE:\n["));
 }
 
 // ---- Bug 2: entity isolation -------------------------------------------
@@ -215,7 +217,8 @@ async fn prior_turns_are_followed_by_a_separator_exchange_before_the_current_tra
     assert!(content_text(&req, 2).starts_with("--- PRIOR CONVERSATION ENDS HERE ---"));
     assert!(content_text(&req, 2).contains("Narrate ONLY this."));
     assert_eq!(content_text(&req, 3), "Understood. I will narrate only the current experiment result.");
-    assert!(content_text(&req, 4).starts_with('['), "the trace comes last");
+    assert!(content_text(&req, 4).contains("TRACE:\n["), "the trace comes last");
+    assert!(content_text(&req, 4).starts_with("ENTITY ISOLATION"));
 }
 
 #[tokio::test]
@@ -226,14 +229,109 @@ async fn no_history_means_no_separator() {
 }
 
 #[test]
-fn the_narration_prompt_opens_with_rule_0_and_carries_the_recommendation_rule() {
-    assert!(NARRATE_SYSTEM_PROMPT.starts_with("RULE 0 \u{2014} ENTITY ISOLATION"));
-    assert!(NARRATE_SYSTEM_PROMPT.contains("ZERO mentions of Ratnaveer"));
-    assert!(NARRATE_SYSTEM_PROMPT.contains("The CURRENT EXPERIMENT TRACE is the only source of truth"));
-    assert!(NARRATE_SYSTEM_PROMPT.contains("RECOMMENDATION RULE:"));
-    assert!(NARRATE_SYSTEM_PROMPT.contains("Reduce KIOCL.NS"));
-    // The old instruction to reference prior findings would contradict Rule 0.
-    assert!(!NARRATE_SYSTEM_PROMPT.contains("Reference prior findings naturally"));
+fn the_narration_prompt_is_the_strict_seven_rule_version() {
+    let p = NARRATE_SYSTEM_PROMPT;
+    assert!(p.starts_with("You are a narrator."));
+    assert!(p.contains("You have NO independent knowledge"));
+    for rule in 1..=7 {
+        assert!(p.contains(&format!("RULE {rule} \u{2014}")), "rule {rule}");
+    }
+    assert!(p.contains("You do not decide direction. The trace decides."));
+    assert!(p.contains("NEVER recommend action on a holding based on"));
+    assert!(p.contains("The user's current question is provided at"));
+    // The old experiment-specific rules moved out of the prompt.
+    for gone in ["Factor shock:", "Risk decomposition:", "Reverse stress:", "Multi-tool:", "volunteer one insight"] {
+        assert!(!p.contains(gone), "{gone}");
+    }
+}
+
+#[tokio::test]
+async fn the_context_leads_with_the_question_then_constraints_hints_and_the_trace() {
+    let client = MockGeminiClient::new(vec![text_response("ok")]);
+    let opts = NarrationOptions { user_question: Some("What happened to GOLDCASE?".to_string()), ..Default::default() };
+    narrate_tools_with_options(&client, &[shock_trace()], None, &[], &opts).await.unwrap();
+    let req = client.last_request();
+    let ctx = content_text(&req, req.contents.len() - 1);
+    assert!(ctx.starts_with("CURRENT USER QUESTION: What happened to GOLDCASE?\n\n"));
+    // Direction constraints come from the trace's signs.
+    assert!(ctx.contains("MANDATORY DIRECTION CONSTRAINTS"));
+    assert!(ctx.contains("GOLDCASE.NS: NEGATIVE contributor"));
+    assert!(ctx.contains("RELIANCE.NS: POSITIVE contributor"));
+    // Reduce recommendations are limited to the worst contributors (KIOCL/BLS/GOLDCASE), never RELIANCE.
+    let rec = ctx.lines().find(|l| l.starts_with("RECOMMENDATION CONSTRAINT")).unwrap();
+    assert!(rec.contains("GOLDCASE.NS") && rec.contains("KIOCL.NS") && rec.contains("BLS.NS"));
+    assert!(!rec.contains("RELIANCE"));
+    assert!(ctx.contains("Key fields to narrate: portfolio_pnl_inr"));
+    assert!(ctx.find("MANDATORY DIRECTION").unwrap() < ctx.find("TRACE:").unwrap());
+    // None of this is in the system prompt.
+    assert!(!system_prompt(&req).contains("MANDATORY DIRECTION"));
+}
+
+#[tokio::test]
+async fn a_trace_with_no_losers_forbids_any_reduce_recommendation() {
+    let client = MockGeminiClient::new(vec![text_response("ok")]);
+    let t = trace("FactorShock", serde_json::json!({"per_holding": [{"ticker": "RELIANCE.NS", "pnl_inr": 100.0}]}));
+    narrate_tools_with_options(&client, &[t], None, &[], &NarrationOptions::default()).await.unwrap();
+    let req = client.last_request();
+    assert!(content_text(&req, req.contents.len() - 1).contains("no holding in this trace qualifies for a reduce recommendation"));
+}
+
+#[tokio::test]
+async fn reverse_stress_holding_pnl_feeds_the_direction_constraints() {
+    let client = MockGeminiClient::new(vec![text_response("ok")]);
+    let t = trace(
+        "ReverseStress",
+        serde_json::json!({"holding_pnl": {"GOLDCASE.NS": -9000.0, "RELIANCE.NS": 500.0},
+                           "factor_attribution": {"MARKET": -8000.0, "GOLD_USD": 200.0}}),
+    );
+    narrate_tools_with_options(&client, &[t], None, &[], &NarrationOptions::default()).await.unwrap();
+    let req = client.last_request();
+    let ctx = content_text(&req, req.contents.len() - 1);
+    assert!(ctx.contains("GOLDCASE.NS: NEGATIVE contributor"));
+    assert!(ctx.contains("MARKET factor: NEGATIVE attribution"));
+    assert!(ctx.contains("GOLD_USD factor: POSITIVE attribution"));
+}
+
+#[tokio::test]
+async fn a_realtime_question_gets_the_data_caveat_in_the_context() {
+    let client = MockGeminiClient::new(vec![text_response("ok")]);
+    let note = "Note: I use historical daily data up to 2026-09-24. I don't have today's intraday prices.";
+    let opts = NarrationOptions { realtime_note: Some(note.to_string()), ..Default::default() };
+    narrate_tools_with_options(&client, &[shock_trace()], None, &[], &opts).await.unwrap();
+    let req = client.last_request();
+    assert!(content_text(&req, req.contents.len() - 1).contains(&format!("EXACTLY THIS SENTENCE, THEN ANSWER: \"{note}\"")));
+}
+
+#[test]
+fn realtime_phrases_mark_the_first_plan_and_others_do_not() {
+    use agent::orchestrator::apply_realtime_caveat;
+    let plan = || vec![agent::ToolPlan { tool: "portfolio_performance".into(), params: serde_json::json!({}), reason: String::new() }];
+    for msg in ["Why did my portfolio fall today?", "how am I doing right now", "what happened this week", "is it currently falling?"] {
+        let mut p = plan();
+        assert!(apply_realtime_caveat(&mut p, msg), "{msg}");
+        assert_eq!(p[0].params["realtime_caveat"], true);
+    }
+    let mut p = plan();
+    assert!(!apply_realtime_caveat(&mut p, "How is my portfolio performing?"));
+    assert!(p[0].params.get("realtime_caveat").is_none());
+}
+
+#[tokio::test]
+async fn the_planner_is_shown_the_holdings_and_told_how_to_handle_a_missing_stock() {
+    use agent::orchestrator::plan_tools_for;
+    let client = MockGeminiClient::new(vec![text_response(
+        r#"[{"tool": "decline", "params": {}, "reason": "IRFC is not in your current portfolio."}]"#,
+    )]);
+    let p = portfolio();
+    let err = plan_tools_for(&client, "How is IRFC doing in my portfolio?", &[], Some(&p)).await.unwrap_err();
+    match err {
+        OrchestratorError::Declined(t) => assert_eq!(t, "IRFC is not in your current portfolio."),
+        other => panic!("{other:?}"),
+    }
+    let sys = system_prompt(&client.last_request());
+    assert!(sys.starts_with("PORTFOLIO HOLDINGS: RELIANCE.NS (30.0%), RATNAVEER.NS (10.0%)"));
+    assert!(sys.contains("'[STOCK] is not in your current portfolio.'"));
+    assert!(sys.contains("ROUTING RULE 0"), "the normal prompt still follows the holdings block");
 }
 
 #[tokio::test]
@@ -269,7 +367,7 @@ async fn a_prior_turn_stock_that_is_a_current_top_mover_may_be_mentioned() {
 async fn the_stock_the_user_asks_about_now_is_always_allowed() {
     let history = vec![ConversationTurn::user("How is Ratnaveer doing?"), ConversationTurn::assistant("Ratnaveer is down.")];
     let client = MockGeminiClient::new(vec![text_response("Ratnaveer is barely moving.")]);
-    let opts = NarrationOptions { focus_holding: Some("RATNAVEER.NS".to_string()) };
+    let opts = NarrationOptions { focus_holding: Some("RATNAVEER.NS".to_string()), ..Default::default() };
     let (_, retries) = grounded_narrate_many_with(&client, &[shock_trace()], &history, &opts).await.unwrap();
     assert_eq!(retries, 0);
 }
@@ -362,4 +460,32 @@ async fn the_pipeline_surfaces_a_decline_before_running_any_experiment() {
         other => panic!("unexpected {other:?}"),
     }
     assert_eq!(client.call_count(), 1, "only the planning call ran");
+}
+
+/// Prints the exact request one narration call sends to Gemini (system
+/// prompt + context message). Run with:
+/// `cargo test -p agent --test bugfix_tests print_example_context -- --ignored --nocapture`
+#[tokio::test]
+#[ignore]
+async fn print_example_context() {
+    let client = MockGeminiClient::new(vec![text_response("ok")]);
+    let history = vec![
+        ConversationTurn::user("How is Ratnaveer doing?"),
+        ConversationTurn::assistant("RATNAVEER.NS is up strongly."),
+    ];
+    let opts = NarrationOptions {
+        user_question: Some("What happened to GOLDCASE in the IL&FS scenario?".to_string()),
+        ..Default::default()
+    };
+    let mut t = shock_trace();
+    t.outputs = serde_json::json!({"result": {"portfolio_pnl_inr": -9500.0, "per_holding": [
+        {"ticker": "GOLDCASE.NS", "pnl_inr": -9000.0}, {"ticker": "KIOCL.NS", "pnl_inr": -5000.0},
+        {"ticker": "BLS.NS", "pnl_inr": -4000.0}, {"ticker": "RELIANCE.NS", "pnl_inr": 2000.0}],
+        "factor_attribution_log_inr": {"GOLD_USD": -8000.0, "MARKET": -3000.0}}});
+    narrate_tools_with_options(&client, &[t], None, &history, &opts).await.unwrap();
+    let req = client.last_request();
+    println!("===== SYSTEM PROMPT =====\n{}\n", system_prompt(&req));
+    for (i, c) in req.contents.iter().enumerate() {
+        println!("===== CONTENT {i} (role: {}) =====\n{}\n", c.role.as_deref().unwrap_or("?"), content_text(&req, i));
+    }
 }

@@ -273,6 +273,11 @@ pub async fn post_ask(
     State(state): State<AppState>,
     AppJson(req): AppJson<AskRequest>,
 ) -> Result<Json<AskResponse>, ApiError> {
+    // Before any Gemini call: an empty message would only come back from
+    // Gemini as a confusing "AI unavailable".
+    if req.message.trim().is_empty() {
+        return Err(ApiError::bad_request("empty_message", "Message cannot be empty."));
+    }
     validate_portfolio(&req.portfolio)?;
 
     // Held until the handler returns. Cheap validation above runs first so
