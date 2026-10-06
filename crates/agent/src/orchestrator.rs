@@ -211,6 +211,37 @@ pub async fn plan_tools<C: GeminiClient>(
     user_message: &str,
     conversation_history: &[ConversationTurn],
 ) -> Result<(Vec<ToolPlan>, String), OrchestratorError> {
+    plan_tools_for(client, user_message, conversation_history, None).await
+}
+
+/// The holdings block prepended to the planning prompt: lets the planner
+/// tell "a stock in your portfolio" from "a stock you don't hold".
+fn holdings_block(portfolio: &Portfolio) -> String {
+    let list: Vec<String> =
+        portfolio.holdings.iter().map(|h| format!("{} ({:.1}%)", h.ticker, h.weight * 100.0)).collect();
+    format!(
+        "PORTFOLIO HOLDINGS: {}\n\
+         If the user asks about a specific stock that is NOT in this list, use the decline tool with this reason \
+         (substituting the stock's name): '[STOCK] is not in your current portfolio.' Match company names to \
+         these tickers loosely ('Zydus Wellness' is ZYDUSWELL, 'Ratnaveer Precision' is RATNAVEER, 'Bank of \
+         Maharashtra' is MAHABANK) before concluding a stock is missing. This applies only to questions about one \
+         named company, never to macro factors, the market, or the portfolio as a whole.\n\n",
+        list.join(", ")
+    )
+}
+
+/// `plan_tools` with the portfolio's holdings shown to the planner (see
+/// `holdings_block`); `None` plans without them.
+pub async fn plan_tools_for<C: GeminiClient>(
+    client: &C,
+    user_message: &str,
+    conversation_history: &[ConversationTurn],
+    portfolio: Option<&Portfolio>,
+) -> Result<(Vec<ToolPlan>, String), OrchestratorError> {
+    let system_prompt = match portfolio {
+        Some(p) => format!("{}{}", holdings_block(p), PLANNING_SYSTEM_PROMPT),
+        None => PLANNING_SYSTEM_PROMPT.to_string(),
+    };
     let mut contents: Vec<Content> = conversation_history.iter().map(turn_to_content).collect();
     contents.push(Content {
         role: Some("user".to_string()),
@@ -220,7 +251,7 @@ pub async fn plan_tools<C: GeminiClient>(
         contents,
         system_instruction: Some(Content {
             role: None,
-            parts: vec![Part::text(PLANNING_SYSTEM_PROMPT)],
+            parts: vec![Part::text(system_prompt)],
         }),
         tools: None,
     };
@@ -287,6 +318,28 @@ pub fn resolve_focus_holding(raw: &str, portfolio: &Portfolio) -> Option<String>
         (Some((t, _)), None) => Some((*t).clone()),
         _ => None,
     }
+}
+
+const REALTIME_PHRASES: &[&str] =
+    &["today", "right now", "this week", "currently falling", "currently rising", "currently fall", "currently ris", "currently drop"];
+
+/// Marks the first plan `realtime_caveat: true` when the message asks about
+/// "today"/"right now"/etc. -- the data is daily history, so the narration
+/// must say it can't speak to intraday moves. Returns whether it did.
+pub fn apply_realtime_caveat(plans: &mut [ToolPlan], user_message: &str) -> bool {
+    let lower = user_message.to_lowercase();
+    if !REALTIME_PHRASES.iter().any(|p| lower.contains(p)) {
+        return false;
+    }
+    let Some(plan) = plans.first_mut() else { return false };
+    if let Value::Object(map) = &mut plan.params {
+        map.insert("realtime_caveat".to_string(), Value::Bool(true));
+    } else if plan.params.is_null() {
+        plan.params = serde_json::json!({ "realtime_caveat": true });
+    } else {
+        return false;
+    }
+    true
 }
 
 /// The first plan's `focus_holding` (if any), resolved against `portfolio`

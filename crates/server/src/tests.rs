@@ -2466,3 +2466,33 @@ async fn a_normal_ask_has_is_redirect_false() {
     assert_eq!(body["is_redirect"], false);
     assert!(body["trace"].is_object() && body["result_id"].is_string());
 }
+
+#[tokio::test]
+async fn empty_or_whitespace_message_is_400_empty_message_before_the_backend_runs() {
+    for msg in ["", "   ", "\n\t"] {
+        let backend = MockBackend { ask_result: Some(sample_pipeline_result()), ..empty_mock() };
+        let response = ask_request(app_with_backend(backend), msg).await;
+        let body = assert_error_body(response, StatusCode::BAD_REQUEST, "empty_message").await;
+        assert_eq!(body["error"], "Message cannot be empty.");
+    }
+}
+
+#[tokio::test]
+async fn the_backend_is_never_called_for_an_empty_message() {
+    let backend = Arc::new(MockBackend { ask_result: Some(sample_pipeline_result()), ..empty_mock() });
+    let app = build_router(AppState {
+        backend: backend.clone(),
+        store: Arc::new(store::SnapshotStore::open(":memory:").unwrap()),
+        upstox_config: unconfigured_upstox_config(),
+        upstox_client: Arc::new(MockUpstoxClient::unused()),
+        upstox_state_map: Arc::new(Mutex::new(HashMap::new())),
+        semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+        capacity: 8,
+        ask_queue_timeout: std::time::Duration::from_millis(200),
+        gemini_configured: true,
+        isin_client: reqwest::Client::new(),
+        isin_config: compute::isin::ResolverConfig::default(),
+    });
+    let _ = ask_request(app, "").await;
+    assert!(backend.received_conversation_history.lock().unwrap().is_none(), "run_ask must not have been called");
+}

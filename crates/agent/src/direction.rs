@@ -71,6 +71,12 @@ struct Evidence {
     top_contributors: BTreeSet<String>,
     /// Every holding of the portfolio the trace was run on.
     portfolio_tickers: BTreeSet<String>,
+    /// The three biggest gainers by P&L / return, so the narration is also
+    /// told which holdings *helped*.
+    top_gainers: BTreeSet<String>,
+    /// Every factor's sign (not just the distinctive ones that get
+    /// sentence-checked), for the narration's direction constraints.
+    factor_signs: BTreeMap<String, i8>,
     has_holding_data: bool,
 }
 
@@ -93,6 +99,13 @@ fn sign(v: f64) -> Option<i8> {
 fn top_abs(items: &[(String, f64)], n: usize) -> Vec<String> {
     let mut v: Vec<&(String, f64)> = items.iter().collect();
     v.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap_or(std::cmp::Ordering::Equal));
+    v.into_iter().take(n).map(|(t, _)| bare(t)).collect()
+}
+
+/// Largest `n` values, only those above zero.
+fn top_positive(items: &[(String, f64)], n: usize) -> Vec<String> {
+    let mut v: Vec<&(String, f64)> = items.iter().filter(|(_, x)| *x > 0.0).collect();
+    v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     v.into_iter().take(n).map(|(t, _)| bare(t)).collect()
 }
 
@@ -141,6 +154,7 @@ fn collect(traces: &[EvidenceTrace]) -> Evidence {
             }
             ev.recommendable.extend(worst_negative(&pnl, 3));
             ev.top_contributors.extend(top_abs(&pnl, 3));
+            ev.top_gainers.extend(top_positive(&pnl, 3));
         }
         // PortfolioPerformance: holding_returns{ticker: {total_return_pct, max_drawdown_pct}}
         if let Some(map) = result.get("holding_returns").and_then(Value::as_object) {
@@ -158,6 +172,7 @@ fn collect(traces: &[EvidenceTrace]) -> Evidence {
             ev.recommendable.extend(worst_negative(&returns, 3));
             ev.recommendable.extend(worst_negative(&drawdowns, 3));
             ev.top_contributors.extend(top_abs(&returns, 3));
+            ev.top_gainers.extend(top_positive(&returns, 3));
             // Realised vol is this experiment's "vol contribution": the two
             // most volatile holdings count as legitimate reduce targets.
             let vols: Vec<(String, f64)> = map
@@ -182,9 +197,25 @@ fn collect(traces: &[EvidenceTrace]) -> Evidence {
             ev.recommendable.extend(vol.iter().take(2).map(|(t, _)| bare(t)));
             ev.top_contributors.extend(vol.iter().take(2).map(|(t, _)| bare(t)));
         }
-        // FactorShock: factor_attribution_log_inr{factor: inr}
-        if let Some(map) = result.get("factor_attribution_log_inr").and_then(Value::as_object) {
+        // ReverseStress: holding_pnl{ticker: inr}
+        if let Some(map) = result.get("holding_pnl").and_then(Value::as_object) {
+            let pnl: Vec<(String, f64)> =
+                map.iter().filter_map(|(t, v)| Some((t.clone(), v.as_f64()?))).collect();
+            for (t, v) in &pnl {
+                note(&mut ev, t, *v);
+            }
+            ev.recommendable.extend(worst_negative(&pnl, 3));
+            ev.top_contributors.extend(top_abs(&pnl, 3));
+            ev.top_gainers.extend(top_positive(&pnl, 3));
+        }
+        // FactorShock: factor_attribution_log_inr{factor: inr};
+        // ReverseStress: factor_attribution{factor: inr}
+        for key in ["factor_attribution_log_inr", "factor_attribution"] {
+            let Some(map) = result.get(key).and_then(Value::as_object) else { continue };
             for (factor, v) in map {
+                if let Some(sg) = v.as_f64().and_then(sign) {
+                    ev.factor_signs.insert(factor.clone(), sg);
+                }
                 if let (Some(v), Some((_, words))) = (v.as_f64(), factor_words.iter().find(|(f, _)| f == factor)) {
                     if let Some(s) = sign(v) {
                         let key = format!("factor:{factor}");
@@ -198,6 +229,50 @@ fn collect(traces: &[EvidenceTrace]) -> Evidence {
         }
     }
     ev
+}
+
+/// "Mandatory direction constraints" for the narration context: one line per
+/// holding the trace singles out (top movers, worst contributors) and per
+/// factor, stating which way the trace says it moved the portfolio.
+pub fn direction_lines(traces: &[EvidenceTrace]) -> Vec<String> {
+    let ev = collect(traces);
+    let mut out = Vec::new();
+    for (base, original) in &ev.holdings {
+        if !(ev.top_contributors.contains(base) || ev.recommendable.contains(base) || ev.top_gainers.contains(base)) {
+            continue;
+        }
+        let Some(dirs) = ev.directions.get(base) else { continue };
+        if dirs.len() != 1 {
+            continue;
+        }
+        out.push(if dirs.contains(&-1) {
+            format!("{original}: NEGATIVE contributor \u{2014} it HURT the portfolio (describe it as a drag or a loss; never a hedge, stabiliser, buffer or offset)")
+        } else {
+            format!("{original}: POSITIVE contributor \u{2014} it HELPED the portfolio (describe it as a gain; never a drag or a loss)")
+        });
+        if out.len() >= 12 {
+            break;
+        }
+    }
+    for (factor, sg) in &ev.factor_signs {
+        out.push(if *sg < 0 {
+            format!("{factor} factor: NEGATIVE attribution \u{2014} it HURT the portfolio")
+        } else {
+            format!("{factor} factor: POSITIVE attribution \u{2014} it HELPED the portfolio")
+        });
+    }
+    out
+}
+
+/// The holdings a "reduce" recommendation may name (the trace's worst
+/// contributors), or `None` when the trace has no per-holding data to judge
+/// by (so no constraint should be stated).
+pub fn reduce_candidates(traces: &[EvidenceTrace]) -> Option<Vec<String>> {
+    let ev = collect(traces);
+    if !ev.has_holding_data {
+        return None;
+    }
+    Some(ev.recommendable.iter().map(|b| ev.holdings.get(b).cloned().unwrap_or_else(|| b.to_uppercase())).collect())
 }
 
 /// Splits on sentence-ending punctuation followed by whitespace (so
