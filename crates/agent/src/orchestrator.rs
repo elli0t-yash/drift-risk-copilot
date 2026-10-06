@@ -145,6 +145,16 @@ message and give it as an NSE symbol (add .NS if missing). Examples: 'Zydus Well
 'ZYDUSWELL.NS', 'Ratnaveer' -> 'RATNAVEER.NS', 'NSIL' -> 'NSIL.NS'. The focus_holding tells the \
 narration step to answer specifically about that stock. End the narration with: 'Note: this is \
 historical risk analysis, not investment advice.'
+- If the user asks which stocks in a sector (PSU, banking, IT, pharma) are riskiest, best or worst: \
+select portfolio_performance with NO focus_holding and include {'sector_question': true} in its \
+params. The system has no sector classification data; never guess which holdings belong to a sector.
+- If the user asks what their CVaR is, their tail risk, or their 95%/99% loss estimate: select \
+cvar_rebalance with {'turnover_limit': 0.0, 'per_name_cap': 1.0, 'confidence_level': 0.95} (use 0.99 \
+when they ask for 99%). turnover_limit 0.0 means the portfolio is not changed (and per_name_cap 1.0 \
+removes the position cap that would otherwise force trades), so this only reports the current CVaR. \
+Do NOT select current_risk for CVaR questions.
+- The 'window' parameter must always be an integer (number of days), never a date string or date \
+range. Valid: 252. Invalid: '2020-03-01:2020-04-01'.
 - If the user asks a follow-up that references a prior result ('now reduce it', 'what about a \
 bigger crash'), infer the experiment from context -- do not ask for clarification.
 
@@ -320,15 +330,32 @@ pub fn resolve_focus_holding(raw: &str, portfolio: &Portfolio) -> Option<String>
     }
 }
 
-const REALTIME_PHRASES: &[&str] =
-    &["today", "right now", "this week", "currently falling", "currently rising", "currently fall", "currently ris", "currently drop"];
+/// Phrases that unambiguously ask about intraday movement.
+const INTRADAY_PHRASES: &[&str] = &["today", "this morning", "this afternoon", "intraday"];
+/// Price-movement words (whole words: a prefix like "ris" would match
+/// "risk"). "right now" only counts as an intraday question next to one of
+/// these ("what is my risk right now" is just "currently").
+const MOVEMENT_WORDS: &[&str] = &[
+    "fell", "fall", "falls", "falling", "fallen", "drop", "dropped", "dropping", "crash", "crashed", "crashing",
+    "surge", "surged", "surging", "rose", "rise", "rises", "rising", "up", "down",
+];
+
+fn is_intraday_question(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    if INTRADAY_PHRASES.iter().any(|p| lower.contains(p)) {
+        return true;
+    }
+    lower.contains("right now")
+        && lower
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|w| MOVEMENT_WORDS.contains(&w))
+}
 
 /// Marks the first plan `realtime_caveat: true` when the message asks about
-/// "today"/"right now"/etc. -- the data is daily history, so the narration
-/// must say it can't speak to intraday moves. Returns whether it did.
+/// an intraday move -- the data is daily history, so the narration must say
+/// it can't speak to today's prices. Returns whether it did.
 pub fn apply_realtime_caveat(plans: &mut [ToolPlan], user_message: &str) -> bool {
-    let lower = user_message.to_lowercase();
-    if !REALTIME_PHRASES.iter().any(|p| lower.contains(p)) {
+    if !is_intraday_question(user_message) {
         return false;
     }
     let Some(plan) = plans.first_mut() else { return false };
@@ -340,6 +367,12 @@ pub fn apply_realtime_caveat(plans: &mut [ToolPlan], user_message: &str) -> bool
         return false;
     }
     true
+}
+
+/// Whether the planner flagged this as a "which PSU/banking/IT stock..."
+/// question (see the prompt's sector rule).
+pub fn is_sector_question(plans: &[ToolPlan]) -> bool {
+    plans.iter().any(|p| p.params.get("sector_question").and_then(Value::as_bool) == Some(true))
 }
 
 /// The first plan's `focus_holding` (if any), resolved against `portfolio`
@@ -456,6 +489,35 @@ fn build_experiment(
     })
 }
 
+/// `build_experiment`, but a planner response whose params don't deserialize
+/// (e.g. `window: "2020-03-01:2020-04-01"`) never fails the request: the tool
+/// is retried with empty params, i.e. every default. Only `scenario_id` is
+/// kept for `historical_stress`, since without it the run would silently be
+/// a zero-loss no-op. If even the defaults can't build (a tool with required
+/// params, such as `factor_shock`'s shocks), the original error stands.
+pub fn build_experiment_or_defaults(
+    tool: RiskTool,
+    tool_name: &str,
+    params: &Value,
+    portfolio: &Portfolio,
+    ctx: &ExperimentContext,
+    baseline_override: Option<String>,
+) -> Result<Experiment, OrchestratorError> {
+    match build_experiment(tool, params, portfolio, ctx, baseline_override.clone()) {
+        Ok(e) => Ok(e),
+        Err(first) => {
+            tracing::warn!("Tool params deserialization failed for {tool_name}, retrying with defaults: {first}");
+            let mut defaults = serde_json::Map::new();
+            if tool == RiskTool::HistoricalStress {
+                if let Some(id) = params.get("scenario_id") {
+                    defaults.insert("scenario_id".to_string(), id.clone());
+                }
+            }
+            build_experiment(tool, &Value::Object(defaults), portfolio, ctx, baseline_override).map_err(|_| first)
+        }
+    }
+}
+
 /// Builds the minimal `store::RiskSnapshot` needed to persist `trace` mid-
 /// plan purely so a later `risk_drift` in the same plan can chain against
 /// it via a real snapshot id (see `run_tool_plans`). Deliberately a
@@ -531,7 +593,7 @@ fn execute_one(
     let Some(tool) = RiskTool::parse(&plan.tool) else {
         return ToolOutcome::Error(ToolError::Other(format!("unknown tool {:?}", plan.tool)));
     };
-    let experiment = match build_experiment(tool, &plan.params, portfolio, ctx, baseline_override) {
+    let experiment = match build_experiment_or_defaults(tool, &plan.tool, &plan.params, portfolio, ctx, baseline_override) {
         Ok(e) => e,
         Err(e) => return ToolOutcome::Error(ToolError::Other(e.to_string())),
     };

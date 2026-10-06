@@ -73,6 +73,12 @@ If they asked about a macro shock, describe
 the shock impact.
 Do not give a generic portfolio summary when 
 a specific question was asked.
+If sector_question is true in the context:
+Do NOT classify any holding into a sector.
+State that sector data is not available and
+list all holdings by the relevant metric 
+(vol contribution or return) so the user 
+can identify their sector holdings.
 
 RULE 5 — Format.
 All rupee amounts: Indian notation 
@@ -128,6 +134,8 @@ pub struct NarrationOptions {
     /// When the user asked about "today"/"right now": the sentence the
     /// narration must open with (data is daily, not intraday).
     pub realtime_note: Option<String>,
+    /// The user asked which stocks in a sector are riskiest/best/worst.
+    pub sector_question: bool,
 }
 
 /// One-line hint on which fields carry the answer, per experiment type.
@@ -144,6 +152,38 @@ fn field_hint(experiment: &str) -> Option<&'static str> {
         "PortfolioPerformance" => "Key fields to narrate: total_return_pct, annualized_return_pct, annualized_vol_pct, max_drawdown_pct, the worst and best performer from holding_returns (ticker + total_return_pct), the current regime",
         _ => return None,
     })
+}
+
+/// Context for a sector question: there is no sector data, so the narration
+/// must say so and show rankings from the trace instead of guessing which
+/// holdings are PSU/banking/IT. Rankings are capped at 8 per list to keep
+/// the answer readable for a large portfolio.
+fn sector_context(traces: &[EvidenceTrace]) -> String {
+    let mut out = String::from(
+        "sector_question: true\n\
+         I don't have sector classification data, so do NOT classify any holding as PSU, banking, IT, pharma or any other sector, and do not name any holding as belonging to one. \
+         Say plainly that sector data is not available, show the rankings below so the user can pick out their own sector holdings, and end with one recommendation based only on the trace.\n",
+    );
+    for t in traces {
+        let Some(map) = t.outputs.get("result").and_then(|r| r.get("holding_returns")).and_then(|h| h.as_object()) else {
+            continue;
+        };
+        let rows: Vec<(&String, f64, f64)> = map
+            .iter()
+            .filter_map(|(k, v)| Some((k, v.get("annualized_vol_pct")?.as_f64()?, v.get("total_return_pct")?.as_f64()?)))
+            .collect();
+        let mut by_vol = rows.clone();
+        by_vol.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        out.push_str("Holdings by annualized volatility (highest first, top 8): ");
+        out.push_str(&by_vol.iter().take(8).map(|(k, v, _)| format!("{k} {v:.1}%")).collect::<Vec<_>>().join(", "));
+        out.push('\n');
+        let mut by_ret = rows;
+        by_ret.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+        out.push_str("Holdings by total return (lowest first, bottom 8): ");
+        out.push_str(&by_ret.iter().take(8).map(|(k, _, r)| format!("{k} {r:.1}%")).collect::<Vec<_>>().join(", "));
+        out.push_str("\n\n");
+    }
+    out
 }
 
 /// The user-role message sent for narration: the question, then the
@@ -164,6 +204,9 @@ pub(crate) fn build_context(
         out.push_str(&format!(
             "BEGIN YOUR RESPONSE WITH EXACTLY THIS SENTENCE, THEN ANSWER: \"{note}\"\n\n"
         ));
+    }
+    if options.sector_question {
+        out.push_str(&sector_context(traces));
     }
     if let Some(holding) = &options.focus_holding {
         out.push_str(&format!(
