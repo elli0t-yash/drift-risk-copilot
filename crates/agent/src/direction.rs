@@ -27,6 +27,17 @@ const NEGATIVE_WORDS: &[&str] = &[
     "drag", "loss", "lost", "hurt", "negative", "worst", "fell", "declin", "weak", "underperform", "drawdown",
     "damag",
 ];
+/// Words that clearly *assert* a direction about the entity. A sentence is
+/// only flagged when it uses one of these and none of the opposite tone's
+/// broad words above -- "drawdown", "gains", "loss" etc. also appear in
+/// perfectly correct sentences ("reduce it to limit drawdown", "locking in
+/// gains", "offset the loss") and caused false alarms in live use.
+const STRONG_POSITIVE: &[&str] = &["stabilis", "stabiliz", "hedg", "protect", "cushion", "buffer", "outperform", "resilient", "defensive"];
+const STRONG_POSITIVE_PHRASES: &[&str] = &["safe haven", "contributed positively", "strong performance"];
+const STRONG_NEGATIVE: &[&str] = &["drag", "hurt", "underperform", "damag", "worst", "weak", "laggard"];
+/// A negation anywhere in the sentence ("failing to contribute positively")
+/// makes the tone ambiguous, so the sentence is not judged.
+const NEGATIONS: &[&str] = &["not", "no", "never", "fail", "fails", "failing", "failed", "without", "neither", "nor", "isn", "wasn", "doesn", "didn"];
 const REDUCE_WORDS: &[&str] = &["reduc", "trim", "cut", "sell", "exit", "lighten", "offload"];
 const REDUCE_PHRASES: &[&str] = &["scale back", "scaling back", "pare back"];
 
@@ -147,6 +158,13 @@ fn collect(traces: &[EvidenceTrace]) -> Evidence {
             ev.recommendable.extend(worst_negative(&returns, 3));
             ev.recommendable.extend(worst_negative(&drawdowns, 3));
             ev.top_contributors.extend(top_abs(&returns, 3));
+            // Realised vol is this experiment's "vol contribution": the two
+            // most volatile holdings count as legitimate reduce targets.
+            let vols: Vec<(String, f64)> = map
+                .iter()
+                .filter_map(|(t, p)| Some((t.clone(), p.get("annualized_vol_pct")?.as_f64()?)))
+                .collect();
+            ev.recommendable.extend(top_abs(&vols, 2));
         }
         // RiskDecomposition: by_stock[{ticker, contribution}] -- a vol
         // contribution has no good/bad direction, but names the top-2
@@ -256,11 +274,16 @@ pub fn check_directions(narration: &str, traces: &[EvidenceTrace]) -> Vec<Direct
             continue; // opposite movers in one sentence, or a holding both up and down across tools
         }
         let trace_dir = *dirs.iter().next().unwrap();
+        if toks.iter().any(|t| NEGATIONS.contains(t)) {
+            continue;
+        }
         let pos = has_word(&toks, &lower, POSITIVE_WORDS, POSITIVE_PHRASES);
         let neg = has_word(&toks, &lower, NEGATIVE_WORDS, &[]);
-        let (bad, trace_word, narr_word) = match (trace_dir, pos, neg) {
-            (-1, true, false) => (true, "negative", "positively"),
-            (1, false, true) => (true, "positive", "negatively"),
+        let strong_pos = has_word(&toks, &lower, STRONG_POSITIVE, STRONG_POSITIVE_PHRASES);
+        let strong_neg = has_word(&toks, &lower, STRONG_NEGATIVE, &[]);
+        let (bad, trace_word, narr_word) = match trace_dir {
+            -1 if strong_pos && !neg => (true, "negative", "positively"),
+            1 if strong_neg && !pos => (true, "positive", "negatively"),
             _ => (false, "", ""),
         };
         if bad {
@@ -444,6 +467,25 @@ mod tests {
         assert!(check_directions("Reliance offset part of the loss.", std::slice::from_ref(&t)).is_empty());
         // Reliance (up) and KIOCL (down) in one sentence.
         assert!(check_directions("KIOCL dragged while Reliance helped.", &[t]).is_empty());
+    }
+
+    #[test]
+    fn live_false_alarms_are_not_flagged() {
+        // Seen in production: correct sentences the first heuristic flagged.
+        let perf = trace_with(json!({"holding_returns": {
+            "RATNAVEER.NS": {"total_return_pct": 115.0, "max_drawdown_pct": -21.0, "annualized_vol_pct": 60.0},
+            "KIOCL.NS": {"total_return_pct": -27.0, "max_drawdown_pct": -40.0, "annualized_vol_pct": 45.0},
+            "ZYDUSWELL.NS": {"total_return_pct": -0.1, "max_drawdown_pct": -18.0, "annualized_vol_pct": 38.0},
+        }}));
+        let ts = std::slice::from_ref(&perf);
+        // drawdown is not a negative description of a winner
+        assert!(check_directions("I recommend you reduce RATNAVEER.NS to limit its drawdown potential.", ts).is_empty());
+        // "gains" belongs to another holding
+        assert!(check_directions("Alongside KIOCL.NS you should consider locking in some of your gains.", ts).is_empty());
+        // negation
+        assert!(check_directions("ZYDUSWELL.NS is failing to contribute positively to returns.", ts).is_empty());
+        // the highest-vol holding is a legitimate reduce target
+        assert!(check_recommendations("I recommend you reduce RATNAVEER.NS to lower volatility.", ts).is_empty());
     }
 
     #[test]
