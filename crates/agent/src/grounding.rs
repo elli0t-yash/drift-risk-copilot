@@ -390,7 +390,17 @@ pub async fn grounded_narrate_many_with<C: GeminiClient>(
             })
             .collect()
     };
-    grounding_warnings.extend(directional_warnings.iter().cloned());
+    // A direction contradiction is a factual error in the narration and is
+    // surfaced like an ungrounded number. A recommendation or earlier-turn
+    // entity that survived the retries is a policy slip, not a false
+    // statement: it stays in `directional_checks`/`directional_warnings`
+    // only, so it doesn't raise the user-facing caution banner.
+    grounding_warnings.extend(
+        violations
+            .iter()
+            .filter(|v| matches!(v.trace_direction.as_str(), "positive" | "negative"))
+            .map(|v| v.message.clone()),
+    );
 
     Ok((
         GroundedNarration {
