@@ -16,6 +16,13 @@ pub enum BackendError {
     /// one-sentence explanation. Maps to 422.
     #[error("{0}")]
     Unrecognised(String),
+    /// The planner declined the question as out of scope (an individual
+    /// stock price scenario, valuation, prediction, news, or non-finance);
+    /// the text is the redirect to show the user. `POST /ask` returns it as
+    /// a 200 with `is_redirect: true` (see `routes::post_ask`), never as an
+    /// error status.
+    #[error("{0}")]
+    Redirect(String),
     /// A ticker Yahoo Finance doesn't know even after resolution (or an
     /// ISIN given in place of a symbol); the message names it. Maps to 422.
     #[error("{0}")]
@@ -69,6 +76,7 @@ impl From<agent::orchestrator::OrchestratorError> for BackendError {
             agent::orchestrator::OrchestratorError::Unrecognised(text) => {
                 BackendError::Unrecognised(text)
             }
+            agent::orchestrator::OrchestratorError::Declined(text) => BackendError::Redirect(text),
             other => BackendError::Internal(other.to_string()),
         }
     }

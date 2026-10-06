@@ -510,6 +510,29 @@ For Recharts:
 
 ---
 
+## Redirects (is_redirect)
+
+Some questions are out of scope: a price scenario for an individual stock
+("what if Ratnaveer goes up 10%?"), valuation ("is TCS a good buy?"),
+price predictions, "why did X fall today?", or anything not about
+finance. They are not errors. `POST /ask` answers HTTP 200 with:
+
+  is_redirect: true
+  narration:   the redirect text (what the system can do instead)
+  suggestion:  a follow-up chip, as usual
+  assistant_turn: the same text as an assistant turn
+
+and `experiment`, `trace`, `result_id`, `agent_execution_trace` and
+`visualization` are all null. Every normal response has
+`is_redirect: false`.
+
+When is_redirect is true: render narration as a soft grey AI message, not
+an error banner (no red, no retry button). Still show the suggestion chip,
+and append assistant_turn to conversation_history as normal. Never read
+`trace`/`result_id` without checking for null first (no PDF report exists
+for a redirect). Questions about *macro* factors ("what if Nifty falls
+15%?", "what if crude spikes?") are NOT redirected; they run a shock.
+
 ## ISIN support
 
 Brokers that export ISINs (Kotak Securities, HDFC Securities, ICICI Direct)

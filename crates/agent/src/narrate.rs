@@ -9,15 +9,42 @@ use crate::conversation::{turn_to_content, ConversationTurn};
 use crate::gemini::{Content, GeminiClient, GeminiError, GeminiRequest, Part, MODEL_NARRATE};
 
 /// Verbatim per spec; do not paraphrase or reorder.
-pub const NARRATE_SYSTEM_PROMPT: &str = "You are a senior quantitative analyst having a real conversation with a portfolio manager. You have just run deterministic risk computations on their portfolio. Your job is to help them make better decisions \u{2014} not to narrate experiment outputs.
+pub const NARRATE_SYSTEM_PROMPT: &str = "RULE 0 \u{2014} ENTITY ISOLATION (mandatory, overrides everything else):
+
+You are narrating ONLY the current experiment result. The conversation history is provided for continuity context ONLY.
+
+You MUST NOT:
+- Mention any stock, company, or ticker from a prior turn unless it appears in the CURRENT experiment trace as a top-3 contributor by P&L or vol contribution
+- Use phrases like 'while you are fixated on X', 'as we discussed', 'unlike the previous scenario' unless directly relevant
+- Carry over conclusions, recommendations, or entity references from prior turns
+
+If the prior turn was about Ratnaveer and the current experiment is a crude oil shock, your response must contain ZERO mentions of Ratnaveer unless Ratnaveer appears in the current trace's top contributors.
+
+The CURRENT EXPERIMENT TRACE is the only source of truth for your response.
+
+You are a senior quantitative analyst having a real conversation with a portfolio manager. You have just run deterministic risk computations on their portfolio. Your job is to help them make better decisions \u{2014} not to narrate experiment outputs.
 
 Core principles:
 - Speak like an expert talking to a peer, not like a report generator. No bullet points, no headers, flowing prose only.
 - Answer the question they actually asked, not the experiment you ran.
 - Always volunteer one insight they didn't ask for but need to know \u{2014} something that would change how they think about their portfolio.
 - Always end with one concrete, actionable recommendation. Not a question, not a suggestion \u{2014} a recommendation.
-- Use the conversation history to build on what was discussed before. Reference prior findings naturally ('as we saw when we stress-tested for COVID...').
+- Use the conversation history only for continuity (what 'it' or 'that' refers to), never as a source of facts or entities \u{2014} Rule 0 governs.
 - Never mention experiment names (RiskDecomposition, FactorShock, etc.) \u{2014} these are internal. Describe what you computed, not what it's called.
+
+RECOMMENDATION RULE:
+Any recommendation to reduce, increase, or rebalance a specific holding MUST be based on that holding appearing in the current trace as a top contributor to loss, vol, or drawdown.
+
+NEVER recommend action on a holding based on general market knowledge or prior conversation context.
+
+If recommending to reduce a position, name only holdings that appear in:
+- Top 3 of the per-holding P&L (most negative)
+- Top 3 of the deepest drawdowns
+- Top 2 of the vol contributions
+
+Example of WRONG recommendation: 'Reduce Reliance' when Reliance does not appear in the trace's worst performers.
+Example of CORRECT recommendation: 'Reduce KIOCL.NS' when KIOCL appears as the deepest drawdown in the trace.
+
 
 Formatting (non-negotiable):
 - All rupee amounts in Indian notation: \u{20b9}X,XXX below \u{20b9}1L, \u{20b9}X.XL up to \u{20b9}1Cr, \u{20b9}X.XCr above.
@@ -90,46 +117,86 @@ pub enum NarrateError {
     NoText,
 }
 
-/// Narrates `trace`, optionally appending `extra_instructions` to the
-/// system prompt (used by `grounding::grounded_narrate` to ask for a
-/// grounding-corrected rewrite). `conversation_history` (if any) is
-/// included as prior turns before the trace-injection turn, so the
-/// narration can refer back to earlier results ("compared to the previous
-/// scenario..."); the grounding check itself still only validates this
-/// turn's narration against this call's trace. The trace is injected as a
-/// JSON user-turn message after the system prompt and any prior turns, per
-/// spec.
-pub async fn narrate_with_instructions<C: GeminiClient>(
+/// Marks where the prior conversation ends, so entities discussed earlier
+/// are not carried into this narration (see `NARRATE_SYSTEM_PROMPT` Rule 0).
+const HISTORY_SEPARATOR: &str = "--- PRIOR CONVERSATION ENDS HERE ---\nWhat follows is the CURRENT experiment result. Narrate ONLY this. Do not reference entities from the prior conversation unless they appear in this trace.";
+const HISTORY_SEPARATOR_ACK: &str = "Understood. I will narrate only the current experiment result.";
+
+/// Per-call narration inputs beyond the traces themselves.
+#[derive(Debug, Clone, Default)]
+pub struct NarrationOptions {
+    /// The holding the user asked about specifically (already resolved
+    /// against their portfolio, see `orchestrator::apply_focus_holding`).
+    pub focus_holding: Option<String>,
+}
+
+/// The `contents` for a narration call: prior turns, then (if there were
+/// any) a separator exchange, then the evidence as the final user turn,
+/// prefixed with the focus instruction when the user asked about one stock.
+fn build_contents(
+    conversation_history: &[ConversationTurn],
+    evidence_json: String,
+    options: &NarrationOptions,
+) -> Vec<Content> {
+    let mut contents: Vec<Content> = conversation_history.iter().map(turn_to_content).collect();
+    if !conversation_history.is_empty() {
+        contents.push(Content { role: Some("user".to_string()), parts: vec![Part::text(HISTORY_SEPARATOR)] });
+        contents.push(Content { role: Some("model".to_string()), parts: vec![Part::text(HISTORY_SEPARATOR_ACK)] });
+    }
+    let payload = match &options.focus_holding {
+        Some(holding) => format!(
+            "USER QUESTION IS SPECIFICALLY ABOUT: {holding}\n\
+             Focus your ENTIRE response on this holding.\n\
+             - How has it performed (total return %)?\n\
+             - What % of portfolio risk does it contribute?\n\
+             - How does it compare to your other holdings?\n\
+             Do NOT give a generic portfolio summary.\n\
+             Answer the question about this specific stock.\n\n\
+             TRACE:\n{evidence_json}"
+        ),
+        None => evidence_json,
+    };
+    contents.push(Content { role: Some("user".to_string()), parts: vec![Part::text(payload)] });
+    contents
+}
+
+async fn call_narrate<C: GeminiClient>(
     client: &C,
-    trace: &EvidenceTrace,
+    evidence_json: String,
     extra_instructions: Option<&str>,
     conversation_history: &[ConversationTurn],
+    options: &NarrationOptions,
 ) -> Result<String, NarrateError> {
     let mut system_prompt = NARRATE_SYSTEM_PROMPT.to_string();
     if let Some(extra) = extra_instructions {
         system_prompt.push_str("\n\n");
         system_prompt.push_str(extra);
     }
-    let trace_json = serde_json::to_string(trace)?;
-
-    let mut contents: Vec<Content> = conversation_history.iter().map(turn_to_content).collect();
-    contents.push(Content {
-        role: Some("user".to_string()),
-        parts: vec![Part::text(trace_json)],
-    });
-
     let request = GeminiRequest {
-        contents,
-        system_instruction: Some(Content {
-            role: None,
-            parts: vec![Part::text(system_prompt)],
-        }),
+        contents: build_contents(conversation_history, evidence_json, options),
+        system_instruction: Some(Content { role: None, parts: vec![Part::text(system_prompt)] }),
         tools: None,
     };
-
     let response = client.generate(MODEL_NARRATE, &request).await?;
     let part = response.first_part().ok_or(NarrateError::NoCandidates)?;
     part.text.clone().ok_or(NarrateError::NoText)
+}
+
+/// Narrates `trace`, optionally appending `extra_instructions` to the
+/// system prompt (used by `grounding::grounded_narrate` to ask for a
+/// grounding-corrected rewrite). `conversation_history` (if any) is
+/// included as prior turns -- followed by a separator so earlier entities
+/// don't bleed in -- before the trace-injection turn. The grounding check
+/// itself still only validates this turn's narration against this call's
+/// trace.
+pub async fn narrate_with_instructions<C: GeminiClient>(
+    client: &C,
+    trace: &EvidenceTrace,
+    extra_instructions: Option<&str>,
+    conversation_history: &[ConversationTurn],
+) -> Result<String, NarrateError> {
+    let trace_json = serde_json::to_string(trace)?;
+    call_narrate(client, trace_json, extra_instructions, conversation_history, &NarrationOptions::default()).await
 }
 
 /// Narrates `trace` with the base system prompt only (no grounding retry,
@@ -142,43 +209,28 @@ pub async fn narrate<C: GeminiClient>(
 }
 
 /// Multi-tool variant of `narrate_with_instructions`: injects every trace
-/// in `traces` as a single JSON array user-turn message (rule 8 in
-/// `NARRATE_SYSTEM_PROMPT` covers this shape), rather than one trace
-/// object. Used by the orchestrator whenever more than one tool ran for a
-/// single `/ask` request; a one-trace slice produces the same prose a
-/// direct `narrate_with_instructions` call would, since rule 8 only
-/// changes behaviour when "several experiments were run".
+/// in `traces` as a single JSON array user-turn message, rather than one
+/// trace object.
 pub async fn narrate_tools_with_instructions<C: GeminiClient>(
     client: &C,
     traces: &[EvidenceTrace],
     extra_instructions: Option<&str>,
     conversation_history: &[ConversationTurn],
 ) -> Result<String, NarrateError> {
-    let mut system_prompt = NARRATE_SYSTEM_PROMPT.to_string();
-    if let Some(extra) = extra_instructions {
-        system_prompt.push_str("\n\n");
-        system_prompt.push_str(extra);
-    }
+    narrate_tools_with_options(client, traces, extra_instructions, conversation_history, &NarrationOptions::default()).await
+}
+
+/// `narrate_tools_with_instructions` plus `NarrationOptions` (the focus
+/// holding for "how is X doing" questions).
+pub async fn narrate_tools_with_options<C: GeminiClient>(
+    client: &C,
+    traces: &[EvidenceTrace],
+    extra_instructions: Option<&str>,
+    conversation_history: &[ConversationTurn],
+    options: &NarrationOptions,
+) -> Result<String, NarrateError> {
     let traces_json = serde_json::to_string(traces)?;
-
-    let mut contents: Vec<Content> = conversation_history.iter().map(turn_to_content).collect();
-    contents.push(Content {
-        role: Some("user".to_string()),
-        parts: vec![Part::text(traces_json)],
-    });
-
-    let request = GeminiRequest {
-        contents,
-        system_instruction: Some(Content {
-            role: None,
-            parts: vec![Part::text(system_prompt)],
-        }),
-        tools: None,
-    };
-
-    let response = client.generate(MODEL_NARRATE, &request).await?;
-    let part = response.first_part().ok_or(NarrateError::NoCandidates)?;
-    part.text.clone().ok_or(NarrateError::NoText)
+    call_narrate(client, traces_json, extra_instructions, conversation_history, options).await
 }
 
 /// Multi-tool variant of `narrate` (base system prompt only, no grounding

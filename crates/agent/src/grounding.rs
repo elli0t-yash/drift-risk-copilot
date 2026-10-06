@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 
 use crate::conversation::ConversationTurn;
 use crate::gemini::GeminiClient;
-use crate::narrate::{narrate_with_instructions, NarrateError};
+use crate::narrate::{narrate_tools_with_options, narrate_with_instructions, NarrateError, NarrationOptions};
 
 /// Relative tolerance for matching a narration number against a trace
 /// number, to allow for Gemini's own minor rounding in prose (spec value).
@@ -38,7 +38,7 @@ impl GroundingCheck {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct GroundedNarration {
     pub narration: String,
     /// Empty if the narration passed grounding (on the first attempt or
@@ -46,6 +46,11 @@ pub struct GroundedNarration {
     /// after `MAX_RETRIES` retries. The narration is returned either way —
     /// this field surfaces the warning rather than suppressing the answer.
     pub grounding_warnings: Vec<String>,
+    /// Direction/recommendation contradictions still present in the final
+    /// narration after retries (see `crate::direction`); empty if none, or
+    /// if a retry corrected them. Also rendered into `grounding_warnings`.
+    pub directional_checks: Vec<crate::direction::DirectionalViolation>,
+    pub directional_warnings: Vec<String>,
 }
 
 // --- Number extraction ---------------------------------------------------
@@ -303,6 +308,7 @@ pub async fn grounded_narrate<C: GeminiClient>(
     Ok(GroundedNarration {
         narration,
         grounding_warnings,
+        ..Default::default()
     })
 }
 
@@ -318,6 +324,23 @@ pub async fn grounded_narrate_many<C: GeminiClient>(
     traces: &[EvidenceTrace],
     conversation_history: &[ConversationTurn],
 ) -> Result<(GroundedNarration, u32), NarrateError> {
+    grounded_narrate_many_with(client, traces, conversation_history, &NarrationOptions::default()).await
+}
+
+/// `grounded_narrate_many` plus `NarrationOptions` (the focus holding).
+///
+/// Each attempt is checked twice: every number must appear in the traces
+/// (`check_grounding`), and no sentence may contradict a trace's direction
+/// or recommend cutting a holding the trace doesn't single out
+/// (`crate::direction`). Either failure triggers a retry (up to
+/// `MAX_RETRIES` in total) whose extra instructions name what to correct;
+/// whatever is still wrong afterwards is returned as warnings.
+pub async fn grounded_narrate_many_with<C: GeminiClient>(
+    client: &C,
+    traces: &[EvidenceTrace],
+    conversation_history: &[ConversationTurn],
+    options: &NarrationOptions,
+) -> Result<(GroundedNarration, u32), NarrateError> {
     let trace_numbers: Vec<f64> = traces
         .iter()
         .map(serde_json::to_value)
@@ -327,19 +350,33 @@ pub async fn grounded_narrate_many<C: GeminiClient>(
         .collect();
 
     let mut narration =
-        crate::narrate::narrate_tools_with_instructions(client, traces, None, conversation_history).await?;
+        narrate_tools_with_options(client, traces, None, conversation_history, options).await?;
     let mut check = check_grounding(&narration, &trace_numbers);
+    let mut violations = crate::direction::check_all(&narration, traces, conversation_history, options.focus_holding.as_deref());
     let mut retries = 0;
-    while !check.passed() && retries < MAX_RETRIES {
-        let extra = retry_instructions(&check.unmatched);
-        narration =
-            crate::narrate::narrate_tools_with_instructions(client, traces, Some(&extra), conversation_history)
-                .await?;
+    while (!check.passed() || !violations.is_empty()) && retries < MAX_RETRIES {
+        let mut extra = Vec::new();
+        if !check.passed() {
+            extra.push(retry_instructions(&check.unmatched));
+        }
+        if !violations.is_empty() {
+            extra.push(crate::direction::correction_instructions(&violations));
+        }
+        narration = narrate_tools_with_options(
+            client,
+            traces,
+            Some(&extra.join("\n\n")),
+            conversation_history,
+            options,
+        )
+        .await?;
         check = check_grounding(&narration, &trace_numbers);
+        violations = crate::direction::check_all(&narration, traces, conversation_history, options.focus_holding.as_deref());
         retries += 1;
     }
 
-    let grounding_warnings = if check.passed() {
+    let directional_warnings: Vec<String> = violations.iter().map(|v| v.message.clone()).collect();
+    let mut grounding_warnings: Vec<String> = if check.passed() {
         Vec::new()
     } else {
         check
@@ -353,11 +390,14 @@ pub async fn grounded_narrate_many<C: GeminiClient>(
             })
             .collect()
     };
+    grounding_warnings.extend(directional_warnings.iter().cloned());
 
     Ok((
         GroundedNarration {
             narration,
             grounding_warnings,
+            directional_checks: violations,
+            directional_warnings,
         },
         retries,
     ))
