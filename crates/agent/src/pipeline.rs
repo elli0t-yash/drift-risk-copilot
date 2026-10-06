@@ -14,7 +14,7 @@ use crate::gemini::GeminiClient;
 use crate::grounding::GroundedNarration;
 use crate::narrate::NarrateError;
 use crate::narrate::NarrationOptions;
-use crate::orchestrator::{apply_focus_holding, apply_realtime_caveat, plan_tools_for, run_tool_plans, ToolPlan};
+use crate::orchestrator::{apply_focus_holding, apply_realtime_caveat, is_sector_question, plan_tools_for, run_tool_plans, ToolPlan};
 use crate::suggest::suggest_follow_up;
 
 #[derive(Debug, Error)]
@@ -105,7 +105,12 @@ pub async fn run<C: GeminiClient>(
         format!("Note: I use historical daily data up to {as_of}. I don't have today's intraday prices.")
     });
     let narration_options =
-        NarrationOptions { focus_holding, user_question: Some(user_message.to_string()), realtime_note };
+        NarrationOptions {
+            focus_holding,
+            user_question: Some(user_message.to_string()),
+            realtime_note,
+            sector_question: is_sector_question(&tool_plans),
+        };
     let (narration_result, suggestion_result) = tokio::join!(
         crate::grounding::grounded_narrate_many_with(
             client,

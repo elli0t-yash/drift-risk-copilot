@@ -303,17 +303,33 @@ async fn a_realtime_question_gets_the_data_caveat_in_the_context() {
 }
 
 #[test]
-fn realtime_phrases_mark_the_first_plan_and_others_do_not() {
+fn only_intraday_phrasing_gets_the_realtime_caveat() {
     use agent::orchestrator::apply_realtime_caveat;
     let plan = || vec![agent::ToolPlan { tool: "portfolio_performance".into(), params: serde_json::json!({}), reason: String::new() }];
-    for msg in ["Why did my portfolio fall today?", "how am I doing right now", "what happened this week", "is it currently falling?"] {
+    for msg in [
+        "Why did my portfolio fall today?",
+        "what is my portfolio doing this morning",
+        "any intraday moves?",
+        "Is my portfolio up today",
+        "why is my portfolio down right now",
+        "has it crashed right now?",
+    ] {
         let mut p = plan();
         assert!(apply_realtime_caveat(&mut p, msg), "{msg}");
         assert_eq!(p[0].params["realtime_caveat"], true);
     }
-    let mut p = plan();
-    assert!(!apply_realtime_caveat(&mut p, "How is my portfolio performing?"));
-    assert!(p[0].params.get("realtime_caveat").is_none());
+    for msg in [
+        "What is my biggest risk right now?",
+        "What is my risk right now?",
+        "how am I positioned right now",
+        "What happened this week",
+        "is it currently falling?",
+        "How is my portfolio performing?",
+    ] {
+        let mut p = plan();
+        assert!(!apply_realtime_caveat(&mut p, msg), "{msg}");
+        assert!(p[0].params.get("realtime_caveat").is_none(), "{msg}");
+    }
 }
 
 #[tokio::test]
@@ -488,4 +504,143 @@ async fn print_example_context() {
     for (i, c) in req.contents.iter().enumerate() {
         println!("===== CONTENT {i} (role: {}) =====\n{}\n", c.role.as_deref().unwrap_or("?"), content_text(&req, i));
     }
+}
+
+
+// ---- final fixes ---------------------------------------------------------
+
+fn ctx() -> compute::context::ExperimentContext {
+    compute::context::ExperimentContext {
+        store: std::sync::Arc::new(store::SnapshotStore::open(":memory:").unwrap()),
+        portfolio_hash: String::new(),
+        policy: None,
+    }
+}
+
+#[test]
+fn a_planner_param_that_does_not_deserialize_falls_back_to_defaults_instead_of_failing() {
+    use agent::orchestrator::{build_experiment_or_defaults, RiskTool};
+    use compute::experiments::Experiment;
+    // The live bug: a date range where an integer window belongs.
+    let bad = serde_json::json!({"window": "2020-03-01:2020-04-01"});
+    let e = build_experiment_or_defaults(RiskTool::PortfolioPerformance, "portfolio_performance", &bad, &portfolio(), &ctx(), None)
+        .expect("must fall back, not fail");
+    match e {
+        Experiment::PortfolioPerformance(i) => assert_eq!(i.window, None, "defaults, not the bad value"),
+        other => panic!("{other:?}"),
+    }
+    for (tool, name) in [(RiskTool::CurrentRisk, "current_risk"), (RiskTool::CvarRebalance, "cvar_rebalance")] {
+        let bad = serde_json::json!({"window": "bad-string", "turnover_limit": 0.0});
+        // current_risk has no required params; cvar still needs turnover_limit, which is
+        // dropped with the rest -- so only the first must succeed.
+        let r = build_experiment_or_defaults(tool, name, &bad, &portfolio(), &ctx(), None);
+        if name == "current_risk" {
+            assert!(r.is_ok());
+        }
+    }
+}
+
+#[test]
+fn a_historical_stress_fallback_keeps_its_scenario_and_a_tool_with_required_params_still_errors() {
+    use agent::orchestrator::{build_experiment_or_defaults, RiskTool};
+    use compute::experiments::Experiment;
+    let e = build_experiment_or_defaults(
+        RiskTool::HistoricalStress,
+        "historical_stress",
+        &serde_json::json!({"scenario_id": "covid_crash", "window": "bad"}),
+        &portfolio(),
+        &ctx(),
+        None,
+    )
+    .unwrap();
+    match e {
+        Experiment::FactorShock(i) => assert!(!i.shocks_pct.is_empty(), "covid shocks kept"),
+        other => panic!("{other:?}"),
+    }
+    // factor_shock has no defaults for its shocks: the original error is returned.
+    let r = build_experiment_or_defaults(
+        RiskTool::FactorShock,
+        "factor_shock",
+        &serde_json::json!({"shocks_pct": "not-a-map"}),
+        &portfolio(),
+        &ctx(),
+        None,
+    );
+    assert!(r.is_err());
+}
+
+#[test]
+fn the_planning_prompt_has_the_window_cvar_and_sector_rules() {
+    assert!(P.contains("The 'window' parameter must always be an integer"));
+    assert!(P.contains("Invalid: '2020-03-01:2020-04-01'"));
+    assert!(P.contains("select \
+") || P.contains("cvar_rebalance with {'turnover_limit': 0.0, 'per_name_cap': 1.0, 'confidence_level': 0.95}"));
+    assert!(P.contains("Do NOT select current_risk for CVaR questions."));
+    assert!(P.contains("{'sector_question': true}"));
+    assert!(P.contains("never guess which holdings belong to a sector"));
+}
+
+#[tokio::test]
+async fn a_cvar_question_plans_a_read_only_cvar_rebalance() {
+    let client = MockGeminiClient::new(vec![text_response(
+        r#"[{"tool": "cvar_rebalance", "params": {"turnover_limit": 0.0, "per_name_cap": 1.0, "confidence_level": 0.95}, "reason": "report CVaR"}]"#,
+    )]);
+    let (plans, _) = plan_tools(&client, "What is my CVaR at 95% confidence?", &[]).await.unwrap();
+    assert_eq!(plans[0].tool, "cvar_rebalance");
+    assert_eq!(plans[0].params["turnover_limit"], 0.0);
+    // ...and those params build a real CvarRebalance experiment.
+    let e = agent::orchestrator::build_experiment_or_defaults(
+        agent::orchestrator::RiskTool::CvarRebalance,
+        "cvar_rebalance",
+        &plans[0].params,
+        &portfolio(),
+        &ctx(),
+        None,
+    )
+    .unwrap();
+    match e {
+        compute::experiments::Experiment::CvarRebalance(i) => {
+            assert_eq!(i.turnover_limit, 0.0);
+            assert_eq!(i.per_name_cap, Some(1.0));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_sector_question_context_forbids_classifying_holdings_and_supplies_rankings() {
+    let perf = trace(
+        "PortfolioPerformance",
+        serde_json::json!({"holding_returns": {
+            "DATAPATTNS.NS": {"total_return_pct": 10.0, "max_drawdown_pct": -20.0, "annualized_vol_pct": 55.0},
+            "BEL.NS": {"total_return_pct": 30.0, "max_drawdown_pct": -10.0, "annualized_vol_pct": 30.0},
+            "KIOCL.NS": {"total_return_pct": -27.0, "max_drawdown_pct": -40.0, "annualized_vol_pct": 45.0},
+        }}),
+    );
+    let client = MockGeminiClient::new(vec![text_response("ok")]);
+    let opts = NarrationOptions {
+        user_question: Some("Which of my PSU stocks is riskiest?".to_string()),
+        sector_question: true,
+        ..Default::default()
+    };
+    narrate_tools_with_options(&client, &[perf], None, &[], &opts).await.unwrap();
+    let req = client.last_request();
+    let ctx = content_text(&req, req.contents.len() - 1);
+    assert!(ctx.contains("sector_question: true"));
+    assert!(ctx.contains("I don't have sector classification data"));
+    assert!(ctx.contains("do NOT classify any holding as PSU"));
+    assert!(ctx.contains("Holdings by annualized volatility (highest first, top 8): DATAPATTNS.NS 55.0%, KIOCL.NS 45.0%, BEL.NS 30.0%"));
+    assert!(ctx.contains("Holdings by total return (lowest first, bottom 8): KIOCL.NS -27.0%"));
+    // The system prompt carries the rule too (Rule 4).
+    assert!(system_prompt(&req).contains("If sector_question is true in the context:"));
+    assert!(system_prompt(&req).contains("Do NOT classify any holding into a sector."));
+}
+
+#[test]
+fn the_sector_flag_is_read_from_the_plan_params() {
+    use agent::orchestrator::is_sector_question;
+    let plan = |p: serde_json::Value| vec![agent::ToolPlan { tool: "portfolio_performance".into(), params: p, reason: String::new() }];
+    assert!(is_sector_question(&plan(serde_json::json!({"sector_question": true}))));
+    assert!(!is_sector_question(&plan(serde_json::json!({}))));
+    assert!(!is_sector_question(&plan(serde_json::json!({"sector_question": false}))));
 }
